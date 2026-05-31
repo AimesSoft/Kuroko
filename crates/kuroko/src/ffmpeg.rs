@@ -7,6 +7,7 @@ use std::slice;
 use std::time::Duration;
 
 use crate::core::{ColorPrimaries, TrackInfo, TrackKind, TransferFunction, VideoParams};
+use crate::renderer::pipeline::{ColorRange, MatrixCoefficients};
 use crate::source::{ByteRange, MediaSource};
 use kuroko_ffmpeg_sys as sys;
 use libc::{EAGAIN, EINVAL, EIO, ESPIPE, SEEK_CUR, SEEK_END, SEEK_SET};
@@ -707,6 +708,14 @@ impl Frame {
         unsafe { transfer_function((*self.ptr).color_trc) }
     }
 
+    pub fn color_range(&self) -> ColorRange {
+        unsafe { color_range((*self.ptr).color_range) }
+    }
+
+    pub fn matrix_coefficients(&self) -> MatrixCoefficients {
+        unsafe { matrix_coefficients((*self.ptr).colorspace) }
+    }
+
     pub fn transfer_to_system_memory(&self) -> Result<Frame> {
         let frame = Frame::alloc(self.time_base)?;
         check(
@@ -717,6 +726,8 @@ impl Frame {
             (*frame.ptr).pts = (*self.ptr).pts;
             (*frame.ptr).color_primaries = (*self.ptr).color_primaries;
             (*frame.ptr).color_trc = (*self.ptr).color_trc;
+            (*frame.ptr).color_range = (*self.ptr).color_range;
+            (*frame.ptr).colorspace = (*self.ptr).colorspace;
         }
         Ok(frame)
     }
@@ -1406,6 +1417,26 @@ unsafe fn transfer_function(value: sys::AVColorTransferCharacteristic) -> Transf
     }
 }
 
+unsafe fn color_range(value: sys::AVColorRange) -> ColorRange {
+    match value {
+        sys::AVColorRange_AVCOL_RANGE_MPEG => ColorRange::Limited,
+        sys::AVColorRange_AVCOL_RANGE_JPEG => ColorRange::Full,
+        _ => ColorRange::Unspecified,
+    }
+}
+
+unsafe fn matrix_coefficients(value: sys::AVColorSpace) -> MatrixCoefficients {
+    match value {
+        sys::AVColorSpace_AVCOL_SPC_RGB => MatrixCoefficients::Identity,
+        sys::AVColorSpace_AVCOL_SPC_BT709 => MatrixCoefficients::Bt709,
+        sys::AVColorSpace_AVCOL_SPC_BT470BG | sys::AVColorSpace_AVCOL_SPC_SMPTE170M => {
+            MatrixCoefficients::Bt601
+        }
+        sys::AVColorSpace_AVCOL_SPC_BT2020_NCL => MatrixCoefficients::Bt2020NonConstantLuminance,
+        _ => MatrixCoefficients::Unspecified,
+    }
+}
+
 fn metadata_value(metadata: *mut sys::AVDictionary, key: &str) -> Option<String> {
     let key = CString::new(key).ok()?;
     unsafe {
@@ -1497,5 +1528,49 @@ mod tests {
         assert!(selection.accepts(0));
         assert!(!selection.accepts(1));
         assert!(selection.accepts(2));
+    }
+
+    #[test]
+    fn maps_ffmpeg_color_ranges() {
+        assert_eq!(
+            unsafe { color_range(sys::AVColorRange_AVCOL_RANGE_MPEG) },
+            ColorRange::Limited
+        );
+        assert_eq!(
+            unsafe { color_range(sys::AVColorRange_AVCOL_RANGE_JPEG) },
+            ColorRange::Full
+        );
+        assert_eq!(
+            unsafe { color_range(sys::AVColorRange_AVCOL_RANGE_UNSPECIFIED) },
+            ColorRange::Unspecified
+        );
+    }
+
+    #[test]
+    fn maps_ffmpeg_matrix_coefficients() {
+        assert_eq!(
+            unsafe { matrix_coefficients(sys::AVColorSpace_AVCOL_SPC_BT709) },
+            MatrixCoefficients::Bt709
+        );
+        assert_eq!(
+            unsafe { matrix_coefficients(sys::AVColorSpace_AVCOL_SPC_SMPTE170M) },
+            MatrixCoefficients::Bt601
+        );
+        assert_eq!(
+            unsafe { matrix_coefficients(sys::AVColorSpace_AVCOL_SPC_BT470BG) },
+            MatrixCoefficients::Bt601
+        );
+        assert_eq!(
+            unsafe { matrix_coefficients(sys::AVColorSpace_AVCOL_SPC_BT2020_NCL) },
+            MatrixCoefficients::Bt2020NonConstantLuminance
+        );
+        assert_eq!(
+            unsafe { matrix_coefficients(sys::AVColorSpace_AVCOL_SPC_RGB) },
+            MatrixCoefficients::Identity
+        );
+        assert_eq!(
+            unsafe { matrix_coefficients(sys::AVColorSpace_AVCOL_SPC_UNSPECIFIED) },
+            MatrixCoefficients::Unspecified
+        );
     }
 }

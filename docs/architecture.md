@@ -17,6 +17,7 @@ Rust Player Core
   -> VideoToolbox hardware frame output
   -> CoreAudio output ring buffer
   -> overlay timeline for subtitles and danmaku
+  -> renderer core: color state + render graph + tone map/scaler policy
   -> Metal renderer first, wgpu fallback boundary next
   -> presenter runtime
   -> CAMetalLayer presenter
@@ -158,11 +159,18 @@ native presenter surfaces, Flutter Texture, and the future wgpu fallback.
 ## Metal Video Draw Milestone
 
 `MetalRenderer::render_video_frame()` draws imported NV12/P010 planes into the attached
-`CAMetalLayer` using a small Metal shader. The shader currently performs a first-pass BT.2020-style
-YCbCr to RGB conversion into `BGRA8Unorm`; this is a visibility milestone, not the final HDR/EDR
-renderer. Subtitle RGBA planes are blended in the same renderer-owned pass. The future HDR compositor
-should switch the drawable and color pipeline to preserve PQ and EDR headroom, then add native
-danmaku glyph batches on top.
+`CAMetalLayer` using a small Metal shader. RendererCore now describes the source/target color state,
+render graph passes, tone mapping policy, and scaler policy in Rust before the Metal backend consumes
+those parameters. The shader performs YCbCr sampling, transfer decode, a first Mobius/Reinhard/clip
+tone-map path, and output encoding into `BGRA8Unorm`; this is an architectural seed, not the final
+HDR/EDR renderer. Subtitle RGBA planes are blended in the same renderer-owned pass. The future HDR
+compositor should switch the drawable and color pipeline to preserve PQ and EDR headroom, then add
+native danmaku glyph batches on top.
+
+Kuroko intentionally does not embed mpv gpu-next or libplacebo as the runtime renderer. Those projects
+are useful design references for render graph shape, color management responsibilities, tone mapping,
+scaling, and shader-chain ergonomics, but Kuroko's renderer is a clean Rust implementation with Metal
+and future wgpu backends.
 
 ## WGPU Fallback Direction
 

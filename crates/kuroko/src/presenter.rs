@@ -236,11 +236,18 @@ fn import_video_frame(renderer: &mut MetalRenderer, frame: &Frame) -> Result<Imp
             "decoded frame is not backed by VideoToolbox CVPixelBuffer".to_string(),
         )
     })?;
-    unsafe {
+    let mut imported = unsafe {
         renderer.import_video_frame_textures(VideoFrameTextureSource::new(
             pixel_buffer.raw(),
             pixel_buffer.width(),
             pixel_buffer.height(),
         ))
-    }
+    }?;
+    imported.set_source_color_metadata(
+        frame.color_primaries(),
+        frame.transfer_function(),
+        frame.color_range(),
+        frame.matrix_coefficients(),
+    );
+    Ok(imported)
 }

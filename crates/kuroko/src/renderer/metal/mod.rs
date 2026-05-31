@@ -1,7 +1,10 @@
 use std::ffi::c_void;
 
-use crate::core::{PlatformSurface, RendererBackend, Result};
+use crate::core::{ColorPrimaries, PlatformSurface, RendererBackend, Result, TransferFunction};
 use crate::overlay::OverlayFrame;
+use crate::renderer::pipeline::{
+    ColorRange, MatrixCoefficients, SourceColorState, VideoRenderPipeline,
+};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -73,13 +76,15 @@ pub struct ImportedVideoFrameInfo {
     pub pixel_format_fourcc: String,
     pub format: ImportedVideoFormat,
     pub full_range: bool,
+    pub color_range: ColorRange,
     pub planes: Vec<ImportedVideoPlaneInfo>,
 }
 
 pub struct ImportedVideoFrame {
     info: ImportedVideoFrameInfo,
+    source_color: SourceColorState,
     #[cfg(target_os = "macos")]
-    inner: macos::ImportedVideoFrameTextures,
+    inner: Option<macos::ImportedVideoFrameTextures>,
     #[cfg(not(target_os = "macos"))]
     _unsupported: (),
 }
@@ -92,31 +97,81 @@ impl ImportedVideoFrame {
     pub fn plane_count(&self) -> usize {
         #[cfg(target_os = "macos")]
         {
-            self.inner.plane_count()
+            self.inner.as_ref().map_or(0, |inner| inner.plane_count())
         }
         #[cfg(not(target_os = "macos"))]
         {
             0
         }
     }
+
+    pub fn source_color(&self) -> SourceColorState {
+        self.source_color
+    }
+
+    pub fn set_source_color(&mut self, source: SourceColorState) {
+        let import_range = self.info.color_range;
+        let fallback = source.range.resolve(ColorRange::Limited);
+        self.source_color = source.range(import_range.resolve(fallback));
+    }
+
+    pub fn set_source_color_metadata(
+        &mut self,
+        primaries: ColorPrimaries,
+        transfer: TransferFunction,
+        range: ColorRange,
+        matrix: MatrixCoefficients,
+    ) {
+        self.set_source_color(
+            SourceColorState::new(primaries, transfer)
+                .range(range)
+                .matrix(matrix),
+        );
+    }
 }
 
 pub struct VideoRenderFrame<'a> {
     pub frame: &'a ImportedVideoFrame,
-    pub full_range: bool,
+    pub pipeline: VideoRenderPipeline,
 }
 
 impl<'a> VideoRenderFrame<'a> {
     pub fn new(frame: &'a ImportedVideoFrame) -> Self {
         Self {
             frame,
-            full_range: frame.info.full_range,
+            pipeline: VideoRenderPipeline::new(frame.source_color(), Default::default()),
         }
     }
 
     pub fn full_range(mut self, full_range: bool) -> Self {
-        self.full_range = full_range;
+        self.pipeline.source.range = color_range_from_import(full_range);
         self
+    }
+
+    pub fn source_color(mut self, primaries: ColorPrimaries, transfer: TransferFunction) -> Self {
+        let range = self.pipeline.source.range;
+        let matrix = self.pipeline.source.matrix;
+        let target = self.pipeline.target;
+        self.pipeline = VideoRenderPipeline::new(
+            SourceColorState::new(primaries, transfer)
+                .range(range)
+                .matrix(matrix),
+            target,
+        );
+        self
+    }
+
+    pub fn pipeline(mut self, pipeline: VideoRenderPipeline) -> Self {
+        self.pipeline = pipeline;
+        self
+    }
+}
+
+fn color_range_from_import(full_range: bool) -> ColorRange {
+    if full_range {
+        ColorRange::Full
+    } else {
+        ColorRange::Limited
     }
 }
 
@@ -191,9 +246,13 @@ impl MetalRenderer {
         #[cfg(target_os = "macos")]
         {
             let imported = unsafe { self.inner.import_video_frame_textures(source) }?;
+            let source_color =
+                SourceColorState::new(ColorPrimaries::Unknown, TransferFunction::Unknown)
+                    .range(imported.info.color_range.resolve(ColorRange::Limited));
             Ok(ImportedVideoFrame {
                 info: imported.info,
-                inner: imported.textures,
+                source_color,
+                inner: Some(imported.textures),
             })
         }
         #[cfg(not(target_os = "macos"))]
@@ -377,7 +436,31 @@ mod tests {
     use super::*;
     use crate::danmaku::DanmakuLayoutBox;
     use crate::overlay::OverlayViewport;
+    use crate::renderer::pipeline::{MatrixCoefficients, SourceColorState};
     use crate::subtitle::SubtitleBitmapPlane;
+
+    fn test_imported_frame(
+        import_range: ColorRange,
+        source_color: SourceColorState,
+    ) -> ImportedVideoFrame {
+        ImportedVideoFrame {
+            info: ImportedVideoFrameInfo {
+                width: 1920,
+                height: 1080,
+                pixel_format: 0,
+                pixel_format_fourcc: "test".to_string(),
+                format: ImportedVideoFormat::P010,
+                full_range: matches!(import_range, ColorRange::Full),
+                color_range: import_range,
+                planes: Vec::new(),
+            },
+            source_color,
+            #[cfg(target_os = "macos")]
+            inner: None,
+            #[cfg(not(target_os = "macos"))]
+            _unsupported: (),
+        }
+    }
 
     #[test]
     fn inspect_overlay_counts_subtitle_bytes_and_danmaku_boxes() {
@@ -426,5 +509,61 @@ mod tests {
         };
 
         assert!(inspect_overlay_frame(&frame).is_err());
+    }
+
+    #[test]
+    fn video_render_frame_uses_imported_source_color() {
+        let source = SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq)
+            .range(ColorRange::Limited)
+            .matrix(MatrixCoefficients::Bt2020NonConstantLuminance);
+        let frame = test_imported_frame(ColorRange::Limited, source);
+
+        let render_frame = VideoRenderFrame::new(&frame);
+
+        assert_eq!(
+            render_frame.pipeline.source.primaries,
+            ColorPrimaries::Bt2020
+        );
+        assert_eq!(render_frame.pipeline.source.transfer, TransferFunction::Pq);
+        assert_eq!(render_frame.pipeline.source.range, ColorRange::Limited);
+        assert_eq!(
+            render_frame.pipeline.source.matrix,
+            MatrixCoefficients::Bt2020NonConstantLuminance
+        );
+    }
+
+    #[test]
+    fn imported_frame_prefers_pixel_buffer_range_over_metadata() {
+        let mut frame = test_imported_frame(
+            ColorRange::Full,
+            SourceColorState::new(ColorPrimaries::Unknown, TransferFunction::Unknown)
+                .range(ColorRange::Full),
+        );
+
+        frame.set_source_color_metadata(
+            ColorPrimaries::Bt709,
+            TransferFunction::Srgb,
+            ColorRange::Limited,
+            MatrixCoefficients::Bt709,
+        );
+
+        assert_eq!(frame.source_color().range, ColorRange::Full);
+        assert_eq!(frame.source_color().matrix, MatrixCoefficients::Bt709);
+    }
+
+    #[test]
+    fn imported_frame_uses_metadata_range_when_import_unspecified() {
+        let mut frame = test_imported_frame(
+            ColorRange::Unspecified,
+            SourceColorState::new(ColorPrimaries::Unknown, TransferFunction::Unknown)
+                .range(ColorRange::Unspecified),
+        );
+
+        frame.set_source_color(
+            SourceColorState::new(ColorPrimaries::Bt709, TransferFunction::Srgb)
+                .range(ColorRange::Full),
+        );
+
+        assert_eq!(frame.source_color().range, ColorRange::Full);
     }
 }

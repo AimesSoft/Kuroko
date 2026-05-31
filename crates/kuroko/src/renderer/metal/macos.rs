@@ -44,6 +44,7 @@ use crate::renderer::metal::{
     MetalRendererStats, OverlayRenderFrame, PreparedOverlayFrameInfo, VideoFrameTextureSource,
     VideoRenderFrame, fourcc_string,
 };
+use crate::renderer::pipeline::{ColorRange, ToneMapOperator};
 
 const CV_PIXEL_FORMAT_420_YP_CB_CR10_BI_PLANAR_VIDEO_RANGE: u32 =
     kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
@@ -297,12 +298,17 @@ impl MetalRendererImpl {
             ));
         };
 
-        let Some(luma) = frame.frame.inner.luma_texture() else {
+        let Some(textures) = frame.frame.inner.as_ref() else {
+            return Err(PlayerError::Renderer(
+                "imported video frame has no Metal textures".to_string(),
+            ));
+        };
+        let Some(luma) = textures.luma_texture() else {
             return Err(PlayerError::Renderer(
                 "imported video frame has no luma plane".to_string(),
             ));
         };
-        let Some(chroma) = frame.frame.inner.chroma_texture() else {
+        let Some(chroma) = textures.chroma_texture() else {
             return Err(PlayerError::Renderer(
                 "imported video frame has no chroma plane".to_string(),
             ));
@@ -347,8 +353,13 @@ impl MetalRendererImpl {
 
             let uniforms = VideoUniforms {
                 is_p010: matches!(frame.frame.info.format, ImportedVideoFormat::P010) as u32,
-                full_range: frame.full_range as u32,
-                _padding: [0; 2],
+                full_range: matches!(frame.pipeline.source.range, ColorRange::Full) as u32,
+                source_transfer: transfer_code(frame.pipeline.source.transfer),
+                target_transfer: transfer_code(frame.pipeline.target.transfer),
+                tone_map: tone_map_code(frame.pipeline.tone_map.operator),
+                source_peak_nits: frame.pipeline.source.nominal_peak_nits,
+                target_peak_nits: frame.pipeline.target.peak_nits,
+                luma_coefficients: luma_coefficients(frame.pipeline.luma_coefficients()),
             };
             encoder.setRenderPipelineState(&pipeline);
             encoder.setFragmentTexture_atIndex(Some(luma), 0);
@@ -549,6 +560,11 @@ impl MetalRendererImpl {
             pixel_format_fourcc: fourcc_string(pixel_format),
             format: mapping.format,
             full_range: mapping.full_range,
+            color_range: if mapping.full_range {
+                ColorRange::Full
+            } else {
+                ColorRange::Limited
+            },
             planes,
         };
 
@@ -718,7 +734,34 @@ impl MetalRendererImpl {
 struct VideoUniforms {
     is_p010: u32,
     full_range: u32,
-    _padding: [u32; 2],
+    source_transfer: u32,
+    target_transfer: u32,
+    tone_map: u32,
+    source_peak_nits: f32,
+    target_peak_nits: f32,
+    luma_coefficients: [f32; 4],
+}
+
+fn transfer_code(transfer: crate::core::TransferFunction) -> u32 {
+    match transfer {
+        crate::core::TransferFunction::Srgb => 1,
+        crate::core::TransferFunction::Bt1886 => 2,
+        crate::core::TransferFunction::Pq => 3,
+        crate::core::TransferFunction::Hlg => 4,
+        crate::core::TransferFunction::Unknown => 0,
+    }
+}
+
+fn tone_map_code(operator: ToneMapOperator) -> u32 {
+    match operator {
+        ToneMapOperator::Clip => 0,
+        ToneMapOperator::Reinhard => 1,
+        ToneMapOperator::Mobius => 2,
+    }
+}
+
+fn luma_coefficients(coeffs: crate::renderer::pipeline::LumaCoefficients) -> [f32; 4] {
+    [coeffs.kr, coeffs.kg, coeffs.kb, 0.0]
 }
 
 #[repr(C)]
@@ -758,8 +801,86 @@ struct VertexOut {
 struct VideoUniforms {
     uint is_p010;
     uint full_range;
-    uint2 padding;
+    uint source_transfer;
+    uint target_transfer;
+    uint tone_map;
+    float source_peak_nits;
+    float target_peak_nits;
+    float4 luma_coefficients;
 };
+
+float pq_eotf(float encoded) {
+    constexpr float m1 = 0.1593017578125;
+    constexpr float m2 = 78.84375;
+    constexpr float c1 = 0.8359375;
+    constexpr float c2 = 18.8515625;
+    constexpr float c3 = 18.6875;
+    float p = pow(max(encoded, 0.0), 1.0 / m2);
+    float num = max(p - c1, 0.0);
+    float den = max(c2 - c3 * p, 0.000001);
+    return pow(num / den, 1.0 / m1);
+}
+
+float3 transfer_to_linear(float3 rgb, constant VideoUniforms& uniforms) {
+    rgb = max(rgb, float3(0.0));
+    if (uniforms.source_transfer == 3) {
+        return float3(pq_eotf(rgb.r), pq_eotf(rgb.g), pq_eotf(rgb.b));
+    }
+    if (uniforms.source_transfer == 1) {
+        return pow(rgb, float3(2.2));
+    }
+    if (uniforms.source_transfer == 2) {
+        return pow(rgb, float3(2.4));
+    }
+    return rgb;
+}
+
+float3 tone_map_rgb(float3 rgb, constant VideoUniforms& uniforms) {
+    float source_peak = max(uniforms.source_peak_nits, 1.0);
+    float target_peak = max(uniforms.target_peak_nits, 1.0);
+    float scale = source_peak / target_peak;
+    float3 scaled = rgb * scale;
+    if (uniforms.tone_map == 1) {
+        return scaled / (float3(1.0) + scaled);
+    }
+    if (uniforms.tone_map == 2) {
+        constexpr float knee = 0.75;
+        float3 high = scaled / (float3(1.0) + scaled);
+        return mix(scaled, high, smoothstep(knee, 1.0, max(max(scaled.r, scaled.g), scaled.b)));
+    }
+    return scaled;
+}
+
+float3 linear_to_output(float3 rgb, constant VideoUniforms& uniforms) {
+    if (uniforms.target_transfer == 1) {
+        return pow(max(rgb, float3(0.0)), float3(1.0 / 2.2));
+    }
+    if (uniforms.target_transfer == 2) {
+        return pow(max(rgb, float3(0.0)), float3(1.0 / 2.4));
+    }
+    return rgb;
+}
+
+struct RangeExpandedYCbCr {
+    float y;
+    float2 cbcr;
+};
+
+RangeExpandedYCbCr expand_ycbcr_range(float y, float2 cbcr, constant VideoUniforms& uniforms) {
+    if (uniforms.full_range != 0) {
+        return RangeExpandedYCbCr { y, cbcr - float2(0.5) };
+    }
+
+    if (uniforms.is_p010 != 0) {
+        y = (y - (64.0 / 1023.0)) * (1023.0 / 876.0);
+        cbcr = (cbcr - float2(512.0 / 1023.0)) * (1023.0 / 896.0);
+        return RangeExpandedYCbCr { y, cbcr };
+    }
+
+    y = (y - (16.0 / 255.0)) * (255.0 / 219.0);
+    cbcr = (cbcr - float2(128.0 / 255.0)) * (255.0 / 224.0);
+    return RangeExpandedYCbCr { y, cbcr };
+}
 
 vertex VertexOut kuroko_video_vertex(uint vertex_id [[vertex_id]]) {
     constexpr float2 positions[3] = {
@@ -786,18 +907,20 @@ fragment float4 kuroko_video_fragment(
     constant VideoUniforms& uniforms [[buffer(0)]]) {
     float y = luma_texture.sample(video_sampler, in.tex_coord).r;
     float2 cbcr = chroma_texture.sample(video_sampler, in.tex_coord).rg;
+    RangeExpandedYCbCr expanded = expand_ycbcr_range(y, cbcr, uniforms);
+    y = expanded.y;
+    cbcr = expanded.cbcr;
 
-    if (uniforms.full_range == 0) {
-        y = (y - (16.0 / 255.0)) * (255.0 / 219.0);
-        cbcr = (cbcr - float2(128.0 / 255.0)) * (255.0 / 224.0);
-    } else {
-        cbcr -= float2(0.5);
-    }
-
+    float kr = uniforms.luma_coefficients.x;
+    float kg = max(uniforms.luma_coefficients.y, 0.000001);
+    float kb = uniforms.luma_coefficients.z;
     float3 rgb;
-    rgb.r = y + 1.5748 * cbcr.y;
-    rgb.g = y - 0.1873 * cbcr.x - 0.4681 * cbcr.y;
-    rgb.b = y + 1.8556 * cbcr.x;
+    rgb.r = y + 2.0 * (1.0 - kr) * cbcr.y;
+    rgb.b = y + 2.0 * (1.0 - kb) * cbcr.x;
+    rgb.g = (y - kr * rgb.r - kb * rgb.b) / kg;
+    rgb = transfer_to_linear(rgb, uniforms);
+    rgb = tone_map_rgb(rgb, uniforms);
+    rgb = linear_to_output(rgb, uniforms);
     return float4(clamp(rgb, 0.0, 1.0), 1.0);
 }
 
@@ -963,4 +1086,28 @@ fn create_plane_texture(
         ))
     })?;
     Ok(unsafe { CFRetained::from_raw(raw_texture) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VIDEO_SHADER_SOURCE;
+
+    #[test]
+    fn video_shader_has_bit_depth_aware_range_expansion() {
+        assert!(VIDEO_SHADER_SOURCE.contains("uniforms.is_p010"));
+        assert!(VIDEO_SHADER_SOURCE.contains("64.0 / 1023.0"));
+        assert!(VIDEO_SHADER_SOURCE.contains("512.0 / 1023.0"));
+        assert!(VIDEO_SHADER_SOURCE.contains("1023.0 / 876.0"));
+        assert!(VIDEO_SHADER_SOURCE.contains("1023.0 / 896.0"));
+        assert!(VIDEO_SHADER_SOURCE.contains("16.0 / 255.0"));
+        assert!(VIDEO_SHADER_SOURCE.contains("128.0 / 255.0"));
+        assert!(VIDEO_SHADER_SOURCE.contains("255.0 / 219.0"));
+        assert!(VIDEO_SHADER_SOURCE.contains("255.0 / 224.0"));
+    }
+
+    #[test]
+    fn video_shader_keeps_source_and_target_transfer_separate() {
+        assert!(VIDEO_SHADER_SOURCE.contains("source_transfer"));
+        assert!(VIDEO_SHADER_SOURCE.contains("target_transfer"));
+    }
 }

@@ -17,6 +17,7 @@ members = [
   "examples/metal_import_videotoolbox",
   "examples/metal_overlay_check",
   "examples/playback_audio_tick",
+  "examples/render_pipeline_plan",
   "examples/macos_native_demo",
   "xtask",
 ]
