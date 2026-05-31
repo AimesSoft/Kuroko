@@ -24,6 +24,14 @@ fn main() {
     );
     println!("source transfer: {:?}", pipeline.source.transfer);
     println!("target transfer: {:?}", pipeline.target.transfer);
+    println!(
+        "requires gamut mapping: {}",
+        pipeline.requires_gamut_mapping()
+    );
+    println!("gamut matrix rows:");
+    for row in pipeline.gamut_matrix().rows() {
+        println!("  [{:>9.5}, {:>9.5}, {:>9.5}]", row[0], row[1], row[2]);
+    }
     println!("tone map: {:?}", pipeline.tone_map.operator);
     println!("scaler: {:?}", pipeline.scaler.kernel);
     println!(

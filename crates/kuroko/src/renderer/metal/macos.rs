@@ -360,6 +360,7 @@ impl MetalRendererImpl {
                 source_peak_nits: frame.pipeline.source.nominal_peak_nits,
                 target_peak_nits: frame.pipeline.target.peak_nits,
                 luma_coefficients: luma_coefficients(frame.pipeline.luma_coefficients()),
+                gamut_matrix_rows: frame.pipeline.gamut_matrix().row4s(),
             };
             encoder.setRenderPipelineState(&pipeline);
             encoder.setFragmentTexture_atIndex(Some(luma), 0);
@@ -740,6 +741,7 @@ struct VideoUniforms {
     source_peak_nits: f32,
     target_peak_nits: f32,
     luma_coefficients: [f32; 4],
+    gamut_matrix_rows: [[f32; 4]; 3],
 }
 
 fn transfer_code(transfer: crate::core::TransferFunction) -> u32 {
@@ -807,6 +809,7 @@ struct VideoUniforms {
     float source_peak_nits;
     float target_peak_nits;
     float4 luma_coefficients;
+    float4 gamut_matrix_rows[3];
 };
 
 float pq_eotf(float encoded) {
@@ -849,6 +852,14 @@ float3 tone_map_rgb(float3 rgb, constant VideoUniforms& uniforms) {
         return mix(scaled, high, smoothstep(knee, 1.0, max(max(scaled.r, scaled.g), scaled.b)));
     }
     return scaled;
+}
+
+float3 apply_gamut_map(float3 rgb, constant VideoUniforms& uniforms) {
+    return float3(
+        dot(uniforms.gamut_matrix_rows[0].xyz, rgb),
+        dot(uniforms.gamut_matrix_rows[1].xyz, rgb),
+        dot(uniforms.gamut_matrix_rows[2].xyz, rgb)
+    );
 }
 
 float3 linear_to_output(float3 rgb, constant VideoUniforms& uniforms) {
@@ -919,6 +930,7 @@ fragment float4 kuroko_video_fragment(
     rgb.b = y + 2.0 * (1.0 - kb) * cbcr.x;
     rgb.g = (y - kr * rgb.r - kb * rgb.b) / kg;
     rgb = transfer_to_linear(rgb, uniforms);
+    rgb = apply_gamut_map(rgb, uniforms);
     rgb = tone_map_rgb(rgb, uniforms);
     rgb = linear_to_output(rgb, uniforms);
     return float4(clamp(rgb, 0.0, 1.0), 1.0);
@@ -1109,5 +1121,14 @@ mod tests {
     fn video_shader_keeps_source_and_target_transfer_separate() {
         assert!(VIDEO_SHADER_SOURCE.contains("source_transfer"));
         assert!(VIDEO_SHADER_SOURCE.contains("target_transfer"));
+    }
+
+    #[test]
+    fn video_shader_applies_gamut_matrix_before_tone_mapping() {
+        assert!(VIDEO_SHADER_SOURCE.contains("gamut_matrix_rows"));
+        assert!(VIDEO_SHADER_SOURCE.contains("apply_gamut_map"));
+        let gamut = VIDEO_SHADER_SOURCE.find("rgb = apply_gamut_map").unwrap();
+        let tone_map = VIDEO_SHADER_SOURCE.find("rgb = tone_map_rgb").unwrap();
+        assert!(gamut < tone_map);
     }
 }

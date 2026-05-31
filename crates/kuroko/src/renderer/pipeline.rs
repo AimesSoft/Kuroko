@@ -73,6 +73,182 @@ impl LumaCoefficients {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Chromaticity {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Chromaticity {
+    pub const fn new(x: f32, y: f32) -> Self {
+        Self { x, y }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PrimariesCoordinates {
+    pub red: Chromaticity,
+    pub green: Chromaticity,
+    pub blue: Chromaticity,
+    pub white: Chromaticity,
+}
+
+impl PrimariesCoordinates {
+    pub const fn new(
+        red: Chromaticity,
+        green: Chromaticity,
+        blue: Chromaticity,
+        white: Chromaticity,
+    ) -> Self {
+        Self {
+            red,
+            green,
+            blue,
+            white,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RgbMatrix {
+    rows: [[f32; 3]; 3],
+}
+
+impl RgbMatrix {
+    pub const fn new(rows: [[f32; 3]; 3]) -> Self {
+        Self { rows }
+    }
+
+    pub const fn identity() -> Self {
+        Self::new([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    }
+
+    pub fn rows(self) -> [[f32; 3]; 3] {
+        self.rows
+    }
+
+    pub fn row4s(self) -> [[f32; 4]; 3] {
+        [
+            [self.rows[0][0], self.rows[0][1], self.rows[0][2], 0.0],
+            [self.rows[1][0], self.rows[1][1], self.rows[1][2], 0.0],
+            [self.rows[2][0], self.rows[2][1], self.rows[2][2], 0.0],
+        ]
+    }
+
+    fn mul(self, rhs: Self) -> Self {
+        let mut rows = [[0.0; 3]; 3];
+        for (row_index, row) in rows.iter_mut().enumerate() {
+            for (col_index, value) in row.iter_mut().enumerate() {
+                *value = self.rows[row_index][0] * rhs.rows[0][col_index]
+                    + self.rows[row_index][1] * rhs.rows[1][col_index]
+                    + self.rows[row_index][2] * rhs.rows[2][col_index];
+            }
+        }
+        Self::new(rows)
+    }
+
+    fn mul_vec(self, value: [f32; 3]) -> [f32; 3] {
+        [
+            self.rows[0][0] * value[0] + self.rows[0][1] * value[1] + self.rows[0][2] * value[2],
+            self.rows[1][0] * value[0] + self.rows[1][1] * value[1] + self.rows[1][2] * value[2],
+            self.rows[2][0] * value[0] + self.rows[2][1] * value[1] + self.rows[2][2] * value[2],
+        ]
+    }
+
+    fn inverse(self) -> Self {
+        let m = self.rows;
+        let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+        let inv_det = 1.0 / det;
+        Self::new([
+            [
+                (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv_det,
+                (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * inv_det,
+                (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv_det,
+            ],
+            [
+                (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * inv_det,
+                (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv_det,
+                (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * inv_det,
+            ],
+            [
+                (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv_det,
+                (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv_det,
+                (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv_det,
+            ],
+        ])
+    }
+}
+
+pub fn primaries_coordinates(primaries: ColorPrimaries) -> PrimariesCoordinates {
+    match resolve_primaries(primaries) {
+        ColorPrimaries::Bt2020 => PrimariesCoordinates::new(
+            Chromaticity::new(0.708, 0.292),
+            Chromaticity::new(0.170, 0.797),
+            Chromaticity::new(0.131, 0.046),
+            D65_WHITE,
+        ),
+        ColorPrimaries::DisplayP3 => PrimariesCoordinates::new(
+            Chromaticity::new(0.680, 0.320),
+            Chromaticity::new(0.265, 0.690),
+            Chromaticity::new(0.150, 0.060),
+            D65_WHITE,
+        ),
+        ColorPrimaries::Bt709 | ColorPrimaries::Unknown => PrimariesCoordinates::new(
+            Chromaticity::new(0.640, 0.330),
+            Chromaticity::new(0.300, 0.600),
+            Chromaticity::new(0.150, 0.060),
+            D65_WHITE,
+        ),
+    }
+}
+
+pub fn rgb_to_xyz_matrix(primaries: ColorPrimaries) -> RgbMatrix {
+    let coords = primaries_coordinates(primaries);
+    let red = xy_to_xyz(coords.red);
+    let green = xy_to_xyz(coords.green);
+    let blue = xy_to_xyz(coords.blue);
+    let white = xy_to_xyz(coords.white);
+    let unscaled = RgbMatrix::new([
+        [red[0], green[0], blue[0]],
+        [red[1], green[1], blue[1]],
+        [red[2], green[2], blue[2]],
+    ]);
+    let scale = unscaled.inverse().mul_vec(white);
+    RgbMatrix::new([
+        [red[0] * scale[0], green[0] * scale[1], blue[0] * scale[2]],
+        [red[1] * scale[0], green[1] * scale[1], blue[1] * scale[2]],
+        [red[2] * scale[0], green[2] * scale[1], blue[2] * scale[2]],
+    ])
+}
+
+pub fn xyz_to_rgb_matrix(primaries: ColorPrimaries) -> RgbMatrix {
+    rgb_to_xyz_matrix(primaries).inverse()
+}
+
+pub fn source_to_target_rgb_matrix(source: ColorPrimaries, target: ColorPrimaries) -> RgbMatrix {
+    let source = resolve_primaries(source);
+    let target = resolve_primaries(target);
+    if source == target {
+        return RgbMatrix::identity();
+    }
+    xyz_to_rgb_matrix(target).mul(rgb_to_xyz_matrix(source))
+}
+
+const D65_WHITE: Chromaticity = Chromaticity::new(0.3127, 0.3290);
+
+fn resolve_primaries(primaries: ColorPrimaries) -> ColorPrimaries {
+    match primaries {
+        ColorPrimaries::Unknown => ColorPrimaries::Bt709,
+        _ => primaries,
+    }
+}
+
+fn xy_to_xyz(value: Chromaticity) -> [f32; 3] {
+    [value.x / value.y, 1.0, (1.0 - value.x - value.y) / value.y]
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToneMapOperator {
     Clip,
@@ -307,6 +483,14 @@ impl VideoRenderPipeline {
     pub fn luma_coefficients(&self) -> LumaCoefficients {
         self.source.matrix.luma_coefficients(self.source.primaries)
     }
+
+    pub fn requires_gamut_mapping(&self) -> bool {
+        requires_gamut_mapping(self.source, self.target)
+    }
+
+    pub fn gamut_matrix(&self) -> RgbMatrix {
+        source_to_target_rgb_matrix(self.source.primaries, self.target.primaries)
+    }
 }
 
 impl Default for VideoRenderPipeline {
@@ -334,7 +518,7 @@ fn build_graph(
         RenderPassKind::TransferDecode,
         "decode transfer function",
     ));
-    if source.primaries != target.primaries && source.primaries != ColorPrimaries::Unknown {
+    if requires_gamut_mapping(source, target) {
         graph.push(RenderPass::new(RenderPassKind::GamutMap, "map gamut"));
     }
     if requires_tone_mapping(source, target) {
@@ -360,6 +544,10 @@ fn requires_tone_mapping(source: SourceColorState, target: TargetColorState) -> 
         return false;
     }
     source.nominal_peak_nits > target.peak_nits * 1.05
+}
+
+fn requires_gamut_mapping(source: SourceColorState, target: TargetColorState) -> bool {
+    resolve_primaries(source.primaries) != resolve_primaries(target.primaries)
 }
 
 fn nominal_peak_for_transfer(transfer: TransferFunction) -> f32 {
@@ -418,5 +606,71 @@ mod tests {
             ColorRange::Full.resolve(ColorRange::Limited),
             ColorRange::Full
         );
+    }
+
+    #[test]
+    fn bt709_to_bt709_gamut_matrix_is_identity() {
+        let matrix = source_to_target_rgb_matrix(ColorPrimaries::Bt709, ColorPrimaries::Bt709);
+        assert_matrix_close(matrix.rows(), RgbMatrix::identity().rows(), 0.00001);
+    }
+
+    #[test]
+    fn unknown_primaries_fall_back_to_bt709_for_gamut_matrix() {
+        let matrix = source_to_target_rgb_matrix(ColorPrimaries::Unknown, ColorPrimaries::Bt709);
+        assert_matrix_close(matrix.rows(), RgbMatrix::identity().rows(), 0.00001);
+    }
+
+    #[test]
+    fn bt2020_to_bt709_gamut_matrix_is_stable() {
+        let matrix = source_to_target_rgb_matrix(ColorPrimaries::Bt2020, ColorPrimaries::Bt709);
+
+        assert_matrix_close(
+            matrix.rows(),
+            [
+                [1.66049, -0.58764, -0.07285],
+                [-0.12455, 1.13290, -0.00835],
+                [-0.01815, -0.10058, 1.11873],
+            ],
+            0.0002,
+        );
+    }
+
+    #[test]
+    fn display_p3_to_bt709_gamut_matrix_is_stable() {
+        let matrix = source_to_target_rgb_matrix(ColorPrimaries::DisplayP3, ColorPrimaries::Bt709);
+
+        assert_matrix_close(
+            matrix.rows(),
+            [
+                [1.22494, -0.22494, 0.0],
+                [-0.04206, 1.04206, 0.0],
+                [-0.01964, -0.07864, 1.09827],
+            ],
+            0.0002,
+        );
+    }
+
+    #[test]
+    fn pipeline_reports_gamut_mapping_when_primaries_differ() {
+        let pipeline = VideoRenderPipeline::new(
+            SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq),
+            TargetColorState::sdr(ColorPrimaries::Bt709),
+        );
+
+        assert!(pipeline.requires_gamut_mapping());
+        assert!(pipeline.graph.contains(RenderPassKind::GamutMap));
+    }
+
+    fn assert_matrix_close(actual: [[f32; 3]; 3], expected: [[f32; 3]; 3], epsilon: f32) {
+        for row in 0..3 {
+            for col in 0..3 {
+                assert!(
+                    (actual[row][col] - expected[row][col]).abs() <= epsilon,
+                    "matrix[{row}][{col}] expected {}, got {}",
+                    expected[row][col],
+                    actual[row][col]
+                );
+            }
+        }
     }
 }
