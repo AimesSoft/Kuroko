@@ -1,0 +1,23 @@
+[package]
+name = "kuroko"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+crossbeam-channel.workspace = true
+libc.workspace = true
+kuroko_ffmpeg_sys = { path = "../kuroko_ffmpeg_sys" }
+objc2.workspace = true
+objc2-core-foundation.workspace = true
+objc2-core-video.workspace = true
+objc2-foundation.workspace = true
+objc2-metal.workspace = true
+objc2-quartz-core.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+coreaudio-rs.workspace = true

@@ -1,0 +1,9 @@
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavformat/avio.h>
+#include <libavutil/avutil.h>
+#include <libavutil/dict.h>
+#include <libavutil/error.h>
+#include <libavutil/mem.h>
+#include <libavutil/pixdesc.h>
+#include <libswresample/swresample.h>

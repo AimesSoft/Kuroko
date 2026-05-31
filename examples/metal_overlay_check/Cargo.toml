@@ -1,0 +1,13 @@
+[package]
+name = "metal_overlay_check"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+kuroko = { path = "../../crates/kuroko" }
+
+[build-dependencies]
+cc = "1.2.47"
