@@ -1,0 +1,36 @@
+[中文](../README.md) | [English](README.en.md) | [日本語](README.ja.md)
+
+# Kuroko
+
+A standalone media player engine written in Rust.
+
+Kuroko owns playback, timing, audio output, subtitle and danmaku overlay, and native rendering. The host frontend -- Flutter, Swift, or anything with a C FFI -- supplies a surface and issues commands. It does not touch frames.
+
+## Capabilities
+
+- Local file and HTTP range media sources
+- Hardware-accelerated video decode (VideoToolbox on macOS)
+- Native Metal/CAMetalLayer presentation path aimed at HDR/EDR
+- Subtitle support: SRT, WebVTT, ASS
+- Danmaku: Bilibili XML and JSON-lines, with collision-aware lane layout
+- Audio output through CoreAudio
+- Opaque C ABI -- callable from Swift, Dart FFI, C/C++, or any Rust crate
+
+Cross-platform support via wgpu is planned. macOS 14+ is the current target.
+
+## Embedding
+
+Kuroko exposes two C ABI families:
+
+- **`KurokoHandle`** — player control and event polling. Use this when the host owns its own render loop or only needs to drive playback.
+- **`KurokoPresenterHandle`** — Kuroko owns the full presenter stack (player, renderer, audio, overlays). The host supplies a native surface and calls `render_tick` from its display timer.
+
+See [`docs/flutter_embedding.md`](../docs/flutter_embedding.md) for the Flutter integration model and the macOS HDR embedding strategy.
+
+## Status
+
+Early foundation. The macOS playback path is working end-to-end. Not ready for production use.
+
+## License
+
+MPL-2.0. Native dependency profiles are managed separately; the default FFmpeg build is LGPL-oriented with GPL components opt-in.
