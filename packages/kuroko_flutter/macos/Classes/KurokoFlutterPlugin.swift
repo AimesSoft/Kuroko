@@ -1,0 +1,1135 @@
+import AppKit
+import Darwin
+import FlutterMacOS
+import Metal
+import ObjectiveC.runtime
+import QuartzCore
+
+private let kurokoWindowHostedVideoSurfaceId: Int64 = -1
+private let kurokoDebugLabelsEnabled =
+  ProcessInfo.processInfo.environment["KUROKO_DEBUG_LABELS"] == "1"
+
+private struct KurokoVideoParamsC {
+  var width: UInt32 = 0
+  var height: UInt32 = 0
+  var primaries: UInt32 = 0
+  var transfer: UInt32 = 0
+}
+
+private struct KurokoTrackCountsC {
+  var video: UInt32 = 0
+  var audio: UInt32 = 0
+  var subtitle: UInt32 = 0
+}
+
+private struct KurokoPresenterConfigC {
+  var outputMode: Int32 = 0
+  var edrHeadroom: Float = 1.0
+
+  static let sdr = KurokoPresenterConfigC()
+
+  static func appleEdr(headroom: Float) -> KurokoPresenterConfigC {
+    KurokoPresenterConfigC(outputMode: 1, edrHeadroom: max(1.0, headroom))
+  }
+}
+
+private struct KurokoEventC {
+  var kind: Int32 = 0
+  var status: Int32 = 0
+  var state: Int32 = 0
+  var durationMicros: Int64 = -1
+  var positionMicros: UInt64 = 0
+  var buffering: UInt8 = 0
+  var video: KurokoVideoParamsC = KurokoVideoParamsC()
+  var tracks: KurokoTrackCountsC = KurokoTrackCountsC()
+}
+
+private struct KurokoPresenterStatsC {
+  var decodedVideoFrames: UInt64 = 0
+  var renderedVideoFrames: UInt64 = 0
+  var renderedTestFrames: UInt64 = 0
+  var pushedAudioFrames: UInt64 = 0
+  var overlayFrames: UInt64 = 0
+  var importFailures: UInt64 = 0
+  var renderFailures: UInt64 = 0
+  var audioFailures: UInt64 = 0
+}
+
+private enum KurokoPluginError: Error, CustomStringConvertible {
+  case libraryNotFound([String])
+  case symbolMissing(String)
+  case invalidArguments(String)
+  case playerNotFound(Int64)
+  case viewNotFound(Int64)
+  case overlayNotAvailable
+  case presenterCreateFailed
+  case kurokoStatus(String, Int32)
+  case libraryLoadFailed(String, String?)
+
+  var description: String {
+    switch self {
+    case .libraryNotFound(let paths):
+      return "Unable to load libkuroko_capi.dylib. Tried: \(paths.joined(separator: ", "))"
+    case .symbolMissing(let symbol):
+      return "Missing Kuroko C ABI symbol: \(symbol)"
+    case .invalidArguments(let message):
+      return message
+    case .playerNotFound(let playerId):
+      return "Kuroko player \(playerId) was not found."
+    case .viewNotFound(let viewId):
+      return "Kuroko video view \(viewId) was not found."
+    case .overlayNotAvailable:
+      return "No window-hosted Kuroko overlay is available."
+    case .presenterCreateFailed:
+      return "kuroko_presenter_create returned null."
+    case .kurokoStatus(let operation, let status):
+      return "\(operation) failed with KurokoStatus \(status)."
+    case .libraryLoadFailed(let path, let detail):
+      if let detail, !detail.isEmpty {
+        return "\(path) (\(detail))"
+      }
+      return path
+    }
+  }
+}
+
+private final class KurokoNativeLibrary {
+  typealias CreateFn = @convention(c) () -> UnsafeMutableRawPointer?
+  typealias CreateWithOutputModeFn = @convention(c) (Int32, Float) -> UnsafeMutableRawPointer?
+  typealias DestroyFn = @convention(c) (UnsafeMutableRawPointer?) -> Void
+  typealias OpenFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> Int32
+  typealias CommandFn = @convention(c) (UnsafeMutableRawPointer?) -> Int32
+  typealias SeekFn = @convention(c) (UnsafeMutableRawPointer?, UInt64) -> Int32
+  typealias AttachMetalLayerFn = @convention(c) (UnsafeMutableRawPointer?, UInt64, UInt32, UInt32, Double) -> Int32
+  typealias ResizeSurfaceFn = @convention(c) (UnsafeMutableRawPointer?, UInt32, UInt32, Double) -> Int32
+  typealias RenderTickFn = @convention(c) (UnsafeMutableRawPointer?, Double, UnsafeMutableRawPointer?) -> Int32
+  typealias PollEventFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Int32
+
+  static let shared = try? KurokoNativeLibrary()
+
+  let create: CreateFn
+  let createWithOutputMode: CreateWithOutputModeFn?
+  let destroy: DestroyFn
+  let open: OpenFn
+  let play: CommandFn
+  let pause: CommandFn
+  let stop: CommandFn
+  let close: CommandFn
+  let seek: SeekFn
+  let attachMetalLayer: AttachMetalLayerFn
+  let resizeSurface: ResizeSurfaceFn
+  let detachSurface: CommandFn
+  let renderTick: RenderTickFn
+  let pollEvent: PollEventFn
+
+  private let libraryHandle: UnsafeMutableRawPointer
+
+  private init() throws {
+    let loaded = try Self.openLibrary()
+    libraryHandle = loaded.handle
+
+    create = try Self.load("kuroko_presenter_create", from: libraryHandle, as: CreateFn.self)
+    createWithOutputMode = Self.loadOptional("kuroko_presenter_create_with_output_mode", from: libraryHandle, as: CreateWithOutputModeFn.self)
+    destroy = try Self.load("kuroko_presenter_destroy", from: libraryHandle, as: DestroyFn.self)
+    open = try Self.load("kuroko_presenter_open", from: libraryHandle, as: OpenFn.self)
+    play = try Self.load("kuroko_presenter_play", from: libraryHandle, as: CommandFn.self)
+    pause = try Self.load("kuroko_presenter_pause", from: libraryHandle, as: CommandFn.self)
+    stop = try Self.load("kuroko_presenter_stop", from: libraryHandle, as: CommandFn.self)
+    close = try Self.load("kuroko_presenter_close", from: libraryHandle, as: CommandFn.self)
+    seek = try Self.load("kuroko_presenter_seek", from: libraryHandle, as: SeekFn.self)
+    attachMetalLayer = try Self.load("kuroko_presenter_attach_metal_layer", from: libraryHandle, as: AttachMetalLayerFn.self)
+    resizeSurface = try Self.load("kuroko_presenter_resize_surface", from: libraryHandle, as: ResizeSurfaceFn.self)
+    detachSurface = try Self.load("kuroko_presenter_detach_surface", from: libraryHandle, as: CommandFn.self)
+    renderTick = try Self.load("kuroko_presenter_render_tick", from: libraryHandle, as: RenderTickFn.self)
+    pollEvent = try Self.load("kuroko_presenter_poll_event", from: libraryHandle, as: PollEventFn.self)
+  }
+
+  deinit {
+    dlclose(libraryHandle)
+  }
+
+  private static func openLibrary() throws -> (handle: UnsafeMutableRawPointer, path: String) {
+    let environment = ProcessInfo.processInfo.environment
+    let bundle = Bundle(for: KurokoFlutterPlugin.self)
+    var candidates: [String] = []
+
+    if let explicitPath = environment["KUROKO_CAPI_DYLIB"], !explicitPath.isEmpty {
+      candidates.append(explicitPath)
+    }
+    if let resourcePath = bundle.path(forResource: "libkuroko_capi", ofType: "dylib") {
+      candidates.append(resourcePath)
+    }
+    if let frameworkPath = Bundle.main.privateFrameworksPath {
+      candidates.append(URL(fileURLWithPath: frameworkPath).appendingPathComponent("libkuroko_capi.dylib").path)
+    }
+    if let executablePath = Bundle.main.executablePath {
+      let executableDirectory = URL(fileURLWithPath: executablePath).deletingLastPathComponent().path
+      candidates.append(URL(fileURLWithPath: executableDirectory).appendingPathComponent("libkuroko_capi.dylib").path)
+    }
+    candidates.append("/Users/sakiko/Desktop/Kuroko/target/debug/libkuroko_capi.dylib")
+    candidates.append("libkuroko_capi.dylib")
+
+    var failures: [KurokoPluginError] = []
+    for path in candidates {
+      if let handle = dlopen(path, RTLD_NOW | RTLD_LOCAL) {
+        NSLog("KurokoFlutterPlugin: loaded Kuroko C API from \(path)")
+        return (handle, path)
+      }
+      let detail = dlerror().map { String(cString: $0) }
+      failures.append(.libraryLoadFailed(path, detail))
+    }
+    throw KurokoPluginError.libraryNotFound(failures.map(String.init(describing:)))
+  }
+
+  private static func load<T>(_ symbol: String, from handle: UnsafeMutableRawPointer, as type: T.Type) throws -> T {
+    guard let raw = dlsym(handle, symbol) else {
+      throw KurokoPluginError.symbolMissing(symbol)
+    }
+    return unsafeBitCast(raw, to: type)
+  }
+
+  private static func loadOptional<T>(_ symbol: String, from handle: UnsafeMutableRawPointer, as type: T.Type) -> T? {
+    guard let raw = dlsym(handle, symbol) else {
+      return nil
+    }
+    return unsafeBitCast(raw, to: type)
+  }
+
+  func createPresenter(config: KurokoPresenterConfigC) -> UnsafeMutableRawPointer? {
+    if let createWithOutputMode {
+      return createWithOutputMode(config.outputMode, config.edrHeadroom)
+    }
+    return create()
+  }
+}
+
+private final class KurokoPlayerHost {
+  let id: Int64
+
+  private let library: KurokoNativeLibrary
+  private let handle: UnsafeMutableRawPointer
+  private weak var attachedView: KurokoMetalSurfaceView?
+  private var displayTimer: Timer?
+  private var startTimeSeconds: CFTimeInterval = CACurrentMediaTime()
+
+  init(id: Int64, library: KurokoNativeLibrary, config: KurokoPresenterConfigC) throws {
+    self.id = id
+    self.library = library
+    guard let handle = library.createPresenter(config: config) else {
+      throw KurokoPluginError.presenterCreateFailed
+    }
+    self.handle = handle
+  }
+
+  deinit {
+    displayTimer?.invalidate()
+    _ = library.detachSurface(handle)
+    library.destroy(handle)
+  }
+
+  func open(uri: String) throws {
+    try uri.withCString { cString in
+      try check(library.open(handle, cString), operation: "open")
+    }
+  }
+
+  func play() throws {
+    try check(library.play(handle), operation: "play")
+  }
+
+  func pause() throws {
+    try check(library.pause(handle), operation: "pause")
+  }
+
+  func stop() throws {
+    try check(library.stop(handle), operation: "stop")
+  }
+
+  func close() throws {
+    try check(library.close(handle), operation: "close")
+  }
+
+  func seek(positionMicros: UInt64) throws {
+    try check(library.seek(handle, positionMicros), operation: "seek")
+  }
+
+  func attach(view: KurokoMetalSurfaceView) throws {
+    attachedView = view
+    view.attachedPlayerId = id
+    try attachOrResize(view: view, attach: true)
+    startDisplayTimerIfNeeded()
+  }
+
+  func detach(viewId: Int64?) {
+    guard viewId == nil || attachedView?.platformViewId == viewId else {
+      return
+    }
+    attachedView?.attachedPlayerId = nil
+    attachedView = nil
+    displayTimer?.invalidate()
+    displayTimer = nil
+    _ = library.detachSurface(handle)
+  }
+
+  func resizeFromAttachedView() {
+    guard let view = attachedView else {
+      return
+    }
+    do {
+      try attachOrResize(view: view, attach: false)
+    } catch {
+      NSLog("KurokoFlutterPlugin: resize failed: \(error)")
+    }
+  }
+
+  func renderTick(sendEvent: (([String: Any]) -> Void)?) {
+    let timeSeconds = CACurrentMediaTime() - startTimeSeconds
+    var stats = KurokoPresenterStatsC()
+    let status = withUnsafeMutablePointer(to: &stats) { pointer in
+      library.renderTick(handle, timeSeconds, UnsafeMutableRawPointer(pointer))
+    }
+    if status != 0 {
+      NSLog("KurokoFlutterPlugin: render_tick failed with status \(status)")
+    }
+    pollEvents(sendEvent: sendEvent)
+  }
+
+  func pollEvents(sendEvent: (([String: Any]) -> Void)?) {
+    guard let sendEvent else {
+      return
+    }
+    while true {
+      var event = KurokoEventC()
+      let status = withUnsafeMutablePointer(to: &event) { pointer in
+        library.pollEvent(handle, UnsafeMutableRawPointer(pointer))
+      }
+      if status == 0 {
+        sendEvent(event.toFlutterMap(playerId: id))
+        continue
+      }
+      if status != 5 {
+        NSLog("KurokoFlutterPlugin: poll_event failed with status \(status)")
+      }
+      break
+    }
+  }
+
+  private func attachOrResize(view: KurokoMetalSurfaceView, attach: Bool) throws {
+    view.updateDrawableSize()
+    let width = UInt32(max(1.0, view.bounds.width).rounded())
+    let height = UInt32(max(1.0, view.bounds.height).rounded())
+    let scale = view.currentBackingScale
+    if attach {
+      let rawLayer = UInt64(UInt(bitPattern: Unmanaged.passUnretained(view.metalLayer).toOpaque()))
+      try check(
+        library.attachMetalLayer(handle, rawLayer, width, height, scale),
+        operation: "attach_metal_layer"
+      )
+    } else {
+      try check(
+        library.resizeSurface(handle, width, height, scale),
+        operation: "resize_surface"
+      )
+    }
+  }
+
+  private func startDisplayTimerIfNeeded() {
+    guard displayTimer == nil else {
+      return
+    }
+    startTimeSeconds = CACurrentMediaTime()
+    let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+      guard let self else {
+        return
+      }
+      self.renderTick(sendEvent: KurokoFlutterPlugin.sharedEventSink)
+    }
+    displayTimer = timer
+    RunLoop.main.add(timer, forMode: .common)
+  }
+
+  private func check(_ status: Int32, operation: String) throws {
+    if status != 0 {
+      throw KurokoPluginError.kurokoStatus(operation, status)
+    }
+  }
+}
+
+private extension KurokoEventC {
+  func toFlutterMap(playerId: Int64) -> [String: Any] {
+    [
+      "playerId": playerId,
+      "kind": Int(kind),
+      "status": Int(status),
+      "state": Int(state),
+      "durationMicros": Int(durationMicros),
+      "positionMicros": Int64(positionMicros),
+      "buffering": buffering != 0,
+      "video": [
+        "width": Int(video.width),
+        "height": Int(video.height),
+        "primaries": Int(video.primaries),
+        "transfer": Int(video.transfer),
+      ],
+      "tracks": [
+        "video": Int(tracks.video),
+        "audio": Int(tracks.audio),
+        "subtitle": Int(tracks.subtitle),
+      ],
+    ]
+  }
+}
+
+private protocol KurokoMetalSurfaceView: AnyObject {
+  var platformViewId: Int64 { get }
+  var metalLayer: CAMetalLayer { get }
+  var attachedPlayerId: Int64? { get set }
+  var bounds: NSRect { get }
+  var currentBackingScale: Double { get }
+
+  func updateDrawableSize()
+}
+
+private final class WeakKurokoVideoPlatformViewBox {
+  weak var view: (NSView & KurokoMetalSurfaceView)?
+
+  init(view: NSView & KurokoMetalSurfaceView) {
+    self.view = view
+  }
+}
+
+final class KurokoVideoPlatformView: NSView, KurokoMetalSurfaceView {
+  let platformViewId: Int64
+  let metalLayer: CAMetalLayer
+
+  weak var plugin: KurokoFlutterPlugin?
+  var attachedPlayerId: Int64?
+
+  var currentBackingScale: Double {
+    let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1.0
+    return Double(max(1.0, scale))
+  }
+
+  init(viewId: Int64, arguments: Any?, plugin: KurokoFlutterPlugin?) {
+    platformViewId = viewId
+    self.plugin = plugin
+    metalLayer = CAMetalLayer()
+    super.init(frame: .zero)
+
+    wantsLayer = true
+    metalLayer.pixelFormat = .bgra8Unorm
+    metalLayer.framebufferOnly = true
+    metalLayer.isOpaque = true
+    metalLayer.backgroundColor = NSColor.black.cgColor
+    layer = metalLayer
+    layerContentsRedrawPolicy = .duringViewResize
+    autoresizingMask = [.width, .height]
+
+    if let params = arguments as? [String: Any],
+       let debugLabel = params["debugLabel"] as? String,
+       !debugLabel.isEmpty,
+       ProcessInfo.processInfo.environment["KUROKO_DEBUG_LABELS"] == "1" {
+      let label = NSTextField(labelWithString: debugLabel)
+      label.textColor = NSColor(white: 1.0, alpha: 0.4)
+      label.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+      label.translatesAutoresizingMaskIntoConstraints = false
+      addSubview(label)
+      NSLayoutConstraint.activate([
+        label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+        label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
+      ])
+    }
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  deinit {
+    plugin?.unregisterView(viewId: platformViewId)
+  }
+
+  override func layout() {
+    super.layout()
+    updateDrawableSize()
+    plugin?.resizePlayerAttachedToView(viewId: platformViewId)
+  }
+
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    updateDrawableSize()
+    plugin?.resizePlayerAttachedToView(viewId: platformViewId)
+  }
+
+  override func viewDidChangeBackingProperties() {
+    super.viewDidChangeBackingProperties()
+    updateDrawableSize()
+    plugin?.resizePlayerAttachedToView(viewId: platformViewId)
+  }
+
+  func updateDrawableSize() {
+    let scale = CGFloat(currentBackingScale)
+    let width = max(1.0, bounds.width * scale)
+    let height = max(1.0, bounds.height * scale)
+    metalLayer.frame = bounds
+    metalLayer.drawableSize = CGSize(width: width, height: height)
+  }
+}
+
+final class KurokoWindowOverlayView: NSView, KurokoMetalSurfaceView {
+  let platformViewId: Int64 = kurokoWindowHostedVideoSurfaceId
+  let metalLayer: CAMetalLayer
+
+  weak var plugin: KurokoFlutterPlugin?
+  var attachedPlayerId: Int64?
+
+  private var overlayFrameGeneration: Int64?
+
+  var currentBackingScale: Double {
+    let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1.0
+    return Double(max(1.0, scale))
+  }
+
+  init(plugin: KurokoFlutterPlugin?) {
+    self.plugin = plugin
+    metalLayer = CAMetalLayer()
+    super.init(frame: .zero)
+
+    wantsLayer = true
+    metalLayer.pixelFormat = .bgra8Unorm
+    metalLayer.framebufferOnly = true
+    metalLayer.isOpaque = true
+    metalLayer.backgroundColor = NSColor.black.cgColor
+    layer = metalLayer
+    layerContentsRedrawPolicy = .duringViewResize
+    autoresizingMask = [.width, .height]
+    isHidden = true
+    layer?.actions = [
+      "bounds": NSNull(),
+      "frame": NSNull(),
+      "position": NSNull(),
+    ]
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  deinit {
+    plugin?.detachOverlayView(self)
+  }
+
+  override func hitTest(_ point: NSPoint) -> NSView? {
+    nil
+  }
+
+  override func layout() {
+    super.layout()
+    updateDrawableSize()
+    plugin?.resizePlayerAttachedToView(viewId: platformViewId)
+  }
+
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    updateDrawableSize()
+    plugin?.resizePlayerAttachedToView(viewId: platformViewId)
+  }
+
+  override func viewDidChangeBackingProperties() {
+    super.viewDidChangeBackingProperties()
+    updateDrawableSize()
+    plugin?.resizePlayerAttachedToView(viewId: platformViewId)
+  }
+
+  func updateOverlayFrame(_ frame: CGRect?, visible: Bool, debugLabel: String?, generation: Int64?) {
+    if visible {
+      overlayFrameGeneration = generation
+    } else if let generation,
+              let overlayFrameGeneration,
+              generation != overlayFrameGeneration {
+      return
+    }
+
+    toolTip = kurokoDebugLabelsEnabled ? debugLabel : nil
+    let shouldShow = visible &&
+      (frame?.width ?? 0) > 0 &&
+      (frame?.height ?? 0) > 0
+
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    defer { CATransaction.commit() }
+
+    guard shouldShow, let frame else {
+      isHidden = true
+      return
+    }
+
+    let resolvedFrame = frame.integral
+    if self.frame != resolvedFrame {
+      self.frame = resolvedFrame
+    }
+    isHidden = false
+    updateDrawableSize()
+    plugin?.resizePlayerAttachedToView(viewId: platformViewId)
+  }
+
+  func updateDrawableSize() {
+    let scale = CGFloat(currentBackingScale)
+    let width = max(1.0, bounds.width * scale)
+    let height = max(1.0, bounds.height * scale)
+    metalLayer.frame = bounds
+    metalLayer.drawableSize = CGSize(width: width, height: height)
+  }
+}
+
+final class KurokoVideoViewFactory: NSObject, FlutterPlatformViewFactory {
+  private weak var plugin: KurokoFlutterPlugin?
+
+  init(plugin: KurokoFlutterPlugin) {
+    self.plugin = plugin
+    super.init()
+  }
+
+  func createArgsCodec() -> (FlutterMessageCodec & NSObjectProtocol)? {
+    FlutterStandardMessageCodec.sharedInstance()
+  }
+
+  func create(withViewIdentifier viewId: Int64, arguments args: Any?) -> NSView {
+    let view = KurokoVideoPlatformView(viewId: viewId, arguments: args, plugin: plugin)
+    plugin?.registerView(view, viewId: viewId)
+    return view
+  }
+}
+
+private enum KurokoAssociatedObjectKeys {
+  static var windowOverlayView: UInt8 = 0
+}
+
+private extension NSWindow {
+  var kurokoWindowOverlayView: KurokoWindowOverlayView? {
+    get {
+      objc_getAssociatedObject(
+        self,
+        &KurokoAssociatedObjectKeys.windowOverlayView
+      ) as? KurokoWindowOverlayView
+    }
+    set {
+      objc_setAssociatedObject(
+        self,
+        &KurokoAssociatedObjectKeys.windowOverlayView,
+        newValue,
+        .OBJC_ASSOCIATION_RETAIN_NONATOMIC
+      )
+    }
+  }
+}
+
+public final class KurokoFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
+  static var sharedEventSink: FlutterEventSink?
+
+  private static let playerChannelName = "kuroko_flutter/player"
+  private static let eventsChannelName = "kuroko_flutter/events"
+  private static let videoViewType = "kuroko_flutter/video_view"
+
+  private var players: [Int64: KurokoPlayerHost] = [:]
+  private var views: [Int64: WeakKurokoVideoPlatformViewBox] = [:]
+  private weak var flutterHostView: NSView?
+  private weak var flutterHostViewController: NSViewController?
+  private var nextPlayerId: Int64 = 1
+  private var pollTimer: Timer?
+
+  init(flutterHostView: NSView?, flutterHostViewController: NSViewController?) {
+    self.flutterHostView = flutterHostView
+    self.flutterHostViewController = flutterHostViewController
+    super.init()
+  }
+
+  public static func register(with registrar: FlutterPluginRegistrar) {
+    let instance = KurokoFlutterPlugin(
+      flutterHostView: registrar.view,
+      flutterHostViewController: registrar.viewController
+    )
+    let playerChannel = FlutterMethodChannel(
+      name: playerChannelName,
+      binaryMessenger: registrar.messenger
+    )
+    let eventsChannel = FlutterEventChannel(
+      name: eventsChannelName,
+      binaryMessenger: registrar.messenger
+    )
+    registrar.addMethodCallDelegate(instance, channel: playerChannel)
+    eventsChannel.setStreamHandler(instance)
+    registrar.register(KurokoVideoViewFactory(plugin: instance), withId: videoViewType)
+  }
+
+  public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    do {
+      switch call.method {
+      case "create":
+        result(try createPlayer(arguments: call.arguments))
+      case "dispose":
+        let args = try dictionaryArgs(call.arguments)
+        let playerId = try requiredInt64(args["playerId"], name: "playerId")
+        players.removeValue(forKey: playerId)
+        result(nil)
+      case "open":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        guard let uri = args["uri"] as? String, !uri.isEmpty else {
+          throw KurokoPluginError.invalidArguments("uri is required.")
+        }
+        try host.open(uri: uri)
+        result(nil)
+      case "play":
+        try playerHost(from: try dictionaryArgs(call.arguments)).play()
+        result(nil)
+      case "pause":
+        try playerHost(from: try dictionaryArgs(call.arguments)).pause()
+        result(nil)
+      case "stop":
+        try playerHost(from: try dictionaryArgs(call.arguments)).stop()
+        result(nil)
+      case "close":
+        try playerHost(from: try dictionaryArgs(call.arguments)).close()
+        result(nil)
+      case "seek":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        let positionMicros = try requiredUInt64(args["positionMicros"], name: "positionMicros")
+        try host.seek(positionMicros: positionMicros)
+        result(nil)
+      case "attachView":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        let viewId = try requiredInt64(args["viewId"], name: "viewId")
+        guard let view = views[viewId]?.view else {
+          throw KurokoPluginError.viewNotFound(viewId)
+        }
+        try host.attach(view: view)
+        result(nil)
+      case "detachView":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        let viewId = try requiredInt64(args["viewId"], name: "viewId")
+        host.detach(viewId: viewId)
+        result(nil)
+      case "attachOverlay":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        let overlay = try ensureWindowOverlayInstalled()
+        try host.attach(view: overlay)
+        result(kurokoWindowHostedVideoSurfaceId)
+      case "detachOverlay":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        host.detach(viewId: kurokoWindowHostedVideoSurfaceId)
+        if let overlay = resolveWindowOverlay() {
+          overlay.updateOverlayFrame(nil, visible: false, debugLabel: nil, generation: int64Value(args["generation"]))
+        }
+        result(nil)
+      case "setOverlayFrame":
+        let args = try dictionaryArgs(call.arguments)
+        let overlay = try ensureWindowOverlayInstalled()
+        let visible = boolValue(args["visible"]) ?? true
+        let frame = convertedOverlayRect(from: args, targetView: overlay)
+        overlay.updateOverlayFrame(
+          frame,
+          visible: visible,
+          debugLabel: args["debugLabel"] as? String,
+          generation: int64Value(args["generation"])
+        )
+        result(nil)
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    } catch {
+      result(flutterError(error))
+    }
+  }
+
+  public func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
+    Self.sharedEventSink = events
+    startPollTimerIfNeeded()
+    return nil
+  }
+
+  public func onCancel(withArguments arguments: Any?) -> FlutterError? {
+    Self.sharedEventSink = nil
+    pollTimer?.invalidate()
+    pollTimer = nil
+    return nil
+  }
+
+  fileprivate func registerView(_ view: NSView & KurokoMetalSurfaceView, viewId: Int64) {
+    views[viewId] = WeakKurokoVideoPlatformViewBox(view: view)
+  }
+
+  fileprivate func unregisterView(viewId: Int64) {
+    views.removeValue(forKey: viewId)
+    for host in players.values {
+      host.detach(viewId: viewId)
+    }
+  }
+
+  fileprivate func resizePlayerAttachedToView(viewId: Int64) {
+    for host in players.values {
+      if let attachedPlayerId = views[viewId]?.view?.attachedPlayerId,
+         attachedPlayerId == host.id {
+        host.resizeFromAttachedView()
+      }
+    }
+  }
+
+  fileprivate func detachOverlayView(_ view: KurokoWindowOverlayView) {
+    for host in players.values {
+      host.detach(viewId: view.platformViewId)
+    }
+    if views[view.platformViewId]?.view === view {
+      views.removeValue(forKey: view.platformViewId)
+    }
+    if view.window?.kurokoWindowOverlayView === view {
+      view.window?.kurokoWindowOverlayView = nil
+    }
+  }
+
+  private func ensureWindowOverlayInstalled() throws -> KurokoWindowOverlayView {
+    if let existing = resolveWindowOverlay(),
+       existing.superview != nil {
+      return existing
+    }
+
+    guard let flutterHostView else {
+      throw KurokoPluginError.overlayNotAvailable
+    }
+    guard let hostWindow = flutterHostView.window else {
+      throw KurokoPluginError.overlayNotAvailable
+    }
+    guard let hostSuperview = flutterHostView.superview else {
+      throw KurokoPluginError.overlayNotAvailable
+    }
+
+    let overlay = hostWindow.kurokoWindowOverlayView ??
+      KurokoWindowOverlayView(plugin: self)
+    overlay.plugin = self
+
+    if overlay.superview !== hostSuperview {
+      overlay.removeFromSuperview()
+      overlay.frame = .zero
+      overlay.translatesAutoresizingMaskIntoConstraints = true
+      hostSuperview.addSubview(
+        overlay,
+        positioned: shouldPlaceWindowOverlayAboveFlutter() ? .above : .below,
+        relativeTo: flutterHostView
+      )
+    } else {
+      hostSuperview.addSubview(
+        overlay,
+        positioned: shouldPlaceWindowOverlayAboveFlutter() ? .above : .below,
+        relativeTo: flutterHostView
+      )
+    }
+
+    hostWindow.kurokoWindowOverlayView = overlay
+    registerView(overlay, viewId: overlay.platformViewId)
+    return overlay
+  }
+
+  private func resolveWindowOverlay() -> KurokoWindowOverlayView? {
+    if let hostWindow = flutterHostView?.window,
+       let overlay = hostWindow.kurokoWindowOverlayView {
+      return overlay
+    }
+    if let hostWindow = flutterHostViewController?.view.window,
+       let overlay = hostWindow.kurokoWindowOverlayView {
+      return overlay
+    }
+    if let overlay = NSApp.keyWindow?.kurokoWindowOverlayView {
+      return overlay
+    }
+    if let overlay = NSApp.mainWindow?.kurokoWindowOverlayView {
+      return overlay
+    }
+    return NSApp.windows.compactMap(\.kurokoWindowOverlayView).first
+  }
+
+  private func shouldPlaceWindowOverlayAboveFlutter() -> Bool {
+    let environment = ProcessInfo.processInfo.environment
+    if environment["KUROKO_WINDOW_OVERLAY_BELOW"] == "1" {
+      return false
+    }
+    return environment["KUROKO_WINDOW_OVERLAY_ABOVE"] == "1"
+  }
+
+  private func convertedOverlayRect(
+    from args: [String: Any],
+    targetView: NSView
+  ) -> CGRect? {
+    guard let x = doubleValue(args["x"]),
+          let y = doubleValue(args["y"]),
+          let width = doubleValue(args["width"]),
+          let height = doubleValue(args["height"]) else {
+      return nil
+    }
+    guard width > 0, height > 0 else {
+      return nil
+    }
+    guard let flutterHostView,
+          let targetSuperview = targetView.superview else {
+      return CGRect(x: x, y: y, width: width, height: height)
+    }
+    let sourceY = flutterHostView.isFlipped
+      ? y
+      : flutterHostView.bounds.height - y - height
+    let rect = CGRect(x: x, y: sourceY, width: width, height: height)
+    return flutterHostView.convert(rect, to: targetSuperview)
+  }
+
+  private func createPlayer(arguments: Any?) throws -> Int64 {
+    guard let library = KurokoNativeLibrary.shared else {
+      throw KurokoPluginError.libraryNotFound([
+        ProcessInfo.processInfo.environment["KUROKO_CAPI_DYLIB"] ?? "",
+        "/Users/sakiko/Desktop/Kuroko/target/debug/libkuroko_capi.dylib",
+        "libkuroko_capi.dylib",
+      ].filter { !$0.isEmpty })
+    }
+    let id = nextPlayerId
+    nextPlayerId += 1
+    players[id] = try KurokoPlayerHost(
+      id: id,
+      library: library,
+      config: presenterConfigForNewPlayer(arguments: arguments)
+    )
+    startPollTimerIfNeeded()
+    return id
+  }
+
+  private func presenterConfigForNewPlayer(arguments: Any?) throws -> KurokoPresenterConfigC {
+    if let args = arguments as? [String: Any],
+       let explicitMode = int32Value(args["outputMode"]) {
+      let headroom = floatValue(args["edrHeadroom"]) ?? 4.0
+      switch explicitMode {
+      case 1:
+        return .appleEdr(headroom: headroom)
+      default:
+        return .sdr
+      }
+    }
+
+    let headroom = resolvedEdrHeadroom()
+    if headroom > 1.0 {
+      NSLog("KurokoFlutterPlugin: using Apple EDR output, headroom \(headroom)x")
+      return .appleEdr(headroom: headroom)
+    }
+    return .sdr
+  }
+
+  private func resolvedEdrHeadroom() -> Float {
+    let environment = ProcessInfo.processInfo.environment
+    if boolEnvironmentFlag("KUROKO_DISABLE_EDR", environment: environment) {
+      return 1.0
+    }
+    if let override = floatEnvironmentValue("KUROKO_EDR_HEADROOM", environment: environment),
+       override > 1.0 {
+      return override
+    }
+
+    let screenHeadroom = currentScreenEdrHeadroom()
+    if screenHeadroom > 1.0 {
+      return screenHeadroom
+    }
+    if boolEnvironmentFlag("KUROKO_ENABLE_EDR", environment: environment) {
+      return 4.0
+    }
+    return 1.0
+  }
+
+  private func currentScreenEdrHeadroom() -> Float {
+    let screen = flutterHostView?.window?.screen ??
+      flutterHostViewController?.view.window?.screen ??
+      NSApp.keyWindow?.screen ??
+      NSApp.mainWindow?.screen ??
+      NSScreen.main
+    guard let screen else {
+      return 1.0
+    }
+
+    let key = "maximumPotentialExtendedDynamicRangeColorComponentValue"
+    guard screen.responds(to: Selector((key))),
+          let number = screen.value(forKey: key) as? NSNumber else {
+      return 1.0
+    }
+    return max(1.0, number.floatValue)
+  }
+
+  private func boolEnvironmentFlag(
+    _ name: String,
+    environment: [String: String]
+  ) -> Bool {
+    switch environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    case "1", "true", "yes", "on":
+      return true
+    default:
+      return false
+    }
+  }
+
+  private func floatEnvironmentValue(
+    _ name: String,
+    environment: [String: String]
+  ) -> Float? {
+    guard let raw = environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !raw.isEmpty,
+          let value = Float(raw),
+          value.isFinite else {
+      return nil
+    }
+    return value
+  }
+
+  private func int32Value(_ value: Any?) -> Int32? {
+    if let value = value as? Int32 {
+      return value
+    }
+    if let value = value as? NSNumber {
+      return value.int32Value
+    }
+    if let value = value as? String {
+      return Int32(value)
+    }
+    return nil
+  }
+
+  private func floatValue(_ value: Any?) -> Float? {
+    if let value = value as? Float, value.isFinite {
+      return value
+    }
+    if let value = value as? Double, value.isFinite {
+      return Float(value)
+    }
+    if let value = value as? NSNumber {
+      let result = value.floatValue
+      return result.isFinite ? result : nil
+    }
+    if let value = value as? String,
+       let result = Float(value),
+       result.isFinite {
+      return result
+    }
+    return nil
+  }
+
+  private func playerHost(from args: [String: Any]) throws -> KurokoPlayerHost {
+    let playerId = try requiredInt64(args["playerId"], name: "playerId")
+    guard let host = players[playerId] else {
+      throw KurokoPluginError.playerNotFound(playerId)
+    }
+    return host
+  }
+
+  private func startPollTimerIfNeeded() {
+    guard pollTimer == nil else {
+      return
+    }
+    let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+      guard let self else {
+        return
+      }
+      let sink = Self.sharedEventSink
+      for host in self.players.values {
+        host.pollEvents(sendEvent: sink)
+      }
+    }
+    pollTimer = timer
+    RunLoop.main.add(timer, forMode: .common)
+  }
+
+  private func dictionaryArgs(_ arguments: Any?) throws -> [String: Any] {
+    guard let args = arguments as? [String: Any] else {
+      throw KurokoPluginError.invalidArguments("Arguments must be a dictionary.")
+    }
+    return args
+  }
+
+  private func int64Value(_ value: Any?) -> Int64? {
+    if let value = value as? Int64 {
+      return value
+    }
+    if let value = value as? NSNumber {
+      return value.int64Value
+    }
+    if let value = value as? String {
+      return Int64(value)
+    }
+    return nil
+  }
+
+  private func doubleValue(_ value: Any?) -> Double? {
+    if let value = value as? Double {
+      return value
+    }
+    if let value = value as? NSNumber {
+      return value.doubleValue
+    }
+    if let value = value as? String {
+      return Double(value)
+    }
+    return nil
+  }
+
+  private func boolValue(_ value: Any?) -> Bool? {
+    if let value = value as? Bool {
+      return value
+    }
+    if let value = value as? NSNumber {
+      return value.boolValue
+    }
+    if let value = value as? String {
+      switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+      case "1", "true", "yes", "on":
+        return true
+      case "0", "false", "no", "off":
+        return false
+      default:
+        return nil
+      }
+    }
+    return nil
+  }
+
+  private func requiredInt64(_ value: Any?, name: String) throws -> Int64 {
+    if let value = value as? Int64 {
+      return value
+    }
+    if let value = value as? NSNumber {
+      return value.int64Value
+    }
+    if let value = value as? String, let parsed = Int64(value) {
+      return parsed
+    }
+    throw KurokoPluginError.invalidArguments("\(name) is required.")
+  }
+
+  private func requiredUInt64(_ value: Any?, name: String) throws -> UInt64 {
+    if let value = value as? UInt64 {
+      return value
+    }
+    if let value = value as? Int64, value >= 0 {
+      return UInt64(value)
+    }
+    if let value = value as? NSNumber {
+      return value.uint64Value
+    }
+    if let value = value as? String, let parsed = UInt64(value) {
+      return parsed
+    }
+    throw KurokoPluginError.invalidArguments("\(name) is required.")
+  }
+
+  private func flutterError(_ error: Error) -> FlutterError {
+    FlutterError(
+      code: "KUROKO_ERROR",
+      message: String(describing: error),
+      details: nil
+    )
+  }
+}
