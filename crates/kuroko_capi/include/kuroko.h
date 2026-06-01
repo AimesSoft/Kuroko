@@ -64,6 +64,16 @@ typedef enum KurokoFlutterTextureKind {
   KurokoFlutterTextureKind_LinuxTextureRegistrar = 5,
 } KurokoFlutterTextureKind;
 
+typedef enum KurokoPresenterOutputMode {
+  KurokoPresenterOutputMode_Sdr = 0,
+  KurokoPresenterOutputMode_AppleEdr = 1,
+} KurokoPresenterOutputMode;
+
+typedef struct KurokoPresenterConfig {
+  int32_t output_mode;
+  float edr_headroom;
+} KurokoPresenterConfig;
+
 typedef struct KurokoVideoParams {
   uint32_t width;
   uint32_t height;
@@ -138,6 +148,10 @@ KurokoStatus kuroko_attach_flutter_texture(
 KurokoStatus kuroko_detach_surface(KurokoHandle *handle);
 
 KurokoPresenterHandle *kuroko_presenter_create(void);
+KurokoPresenterHandle *kuroko_presenter_create_with_config(KurokoPresenterConfig config);
+KurokoPresenterHandle *kuroko_presenter_create_with_output_mode(
+    int32_t output_mode,
+    float edr_headroom);
 void kuroko_presenter_destroy(KurokoPresenterHandle *handle);
 
 KurokoStatus kuroko_presenter_open(KurokoPresenterHandle *handle, const char *uri);

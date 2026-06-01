@@ -5,6 +5,8 @@ use std::time::Duration;
 use crossbeam_channel::Receiver;
 #[cfg(target_os = "macos")]
 use kuroko::presenter::{PresenterConfig, PresenterRuntime, PresenterStats};
+#[cfg(target_os = "macos")]
+use kuroko::renderer::metal::{MetalOutputMode, MetalRendererConfig};
 use kuroko::{
     FlutterTextureHandle, FlutterTextureKind, MediaRequest, MetalSurfaceHandle, PlatformSurface,
     Player, PlayerConfig, PlayerEvent, PlayerState, TrackKind, TransferFunction, WgpuSurfaceHandle,
@@ -72,6 +74,38 @@ pub enum KurokoFlutterTextureKind {
     AndroidSurfaceTexture = 3,
     WindowsTextureRegistrar = 4,
     LinuxTextureRegistrar = 5,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KurokoPresenterOutputMode {
+    Sdr = 0,
+    AppleEdr = 1,
+}
+
+impl KurokoPresenterOutputMode {
+    fn from_raw(value: i32) -> Self {
+        match value {
+            1 => Self::AppleEdr,
+            _ => Self::Sdr,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KurokoPresenterConfig {
+    pub output_mode: i32,
+    pub edr_headroom: f32,
+}
+
+impl Default for KurokoPresenterConfig {
+    fn default() -> Self {
+        Self {
+            output_mode: KurokoPresenterOutputMode::Sdr as i32,
+            edr_headroom: 1.0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -323,7 +357,55 @@ pub unsafe extern "C" fn kuroko_poll_event(
 #[cfg(target_os = "macos")]
 #[unsafe(no_mangle)]
 pub extern "C" fn kuroko_presenter_create() -> *mut KurokoPresenterHandle {
-    match PresenterRuntime::new(PresenterConfig::default()) {
+    create_presenter_handle(PresenterConfig::default())
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn kuroko_presenter_create() -> *mut std::ffi::c_void {
+    std::ptr::null_mut()
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub extern "C" fn kuroko_presenter_create_with_config(
+    config: KurokoPresenterConfig,
+) -> *mut KurokoPresenterHandle {
+    create_presenter_handle(presenter_config_from_c(config))
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub extern "C" fn kuroko_presenter_create_with_output_mode(
+    output_mode: i32,
+    edr_headroom: f32,
+) -> *mut KurokoPresenterHandle {
+    create_presenter_handle(presenter_config_from_c(KurokoPresenterConfig {
+        output_mode,
+        edr_headroom,
+    }))
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn kuroko_presenter_create_with_config(
+    _config: KurokoPresenterConfig,
+) -> *mut std::ffi::c_void {
+    std::ptr::null_mut()
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn kuroko_presenter_create_with_output_mode(
+    _output_mode: i32,
+    _edr_headroom: f32,
+) -> *mut std::ffi::c_void {
+    std::ptr::null_mut()
+}
+
+#[cfg(target_os = "macos")]
+fn create_presenter_handle(config: PresenterConfig) -> *mut KurokoPresenterHandle {
+    match PresenterRuntime::new(config) {
         Ok(presenter) => {
             let events = presenter.player().subscribe();
             Box::into_raw(Box::new(KurokoPresenterHandle { presenter, events }))
@@ -332,10 +414,29 @@ pub extern "C" fn kuroko_presenter_create() -> *mut KurokoPresenterHandle {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn kuroko_presenter_create() -> *mut std::ffi::c_void {
-    std::ptr::null_mut()
+#[cfg(target_os = "macos")]
+fn presenter_config_from_c(config: KurokoPresenterConfig) -> PresenterConfig {
+    let output_mode = match KurokoPresenterOutputMode::from_raw(config.output_mode) {
+        KurokoPresenterOutputMode::AppleEdr => {
+            let headroom = if config.edr_headroom.is_finite() {
+                config.edr_headroom
+            } else {
+                1.0
+            };
+            MetalOutputMode::apple_edr(headroom)
+        }
+        KurokoPresenterOutputMode::Sdr => MetalOutputMode::Sdr,
+    };
+
+    PresenterConfig {
+        renderer: MetalRendererConfig { output_mode },
+        ..PresenterConfig::default()
+    }
+}
+
+#[cfg(all(target_os = "macos", test))]
+fn metal_output_mode_from_c(config: KurokoPresenterConfig) -> MetalOutputMode {
+    presenter_config_from_c(config).renderer.output_mode
 }
 
 #[cfg(target_os = "macos")]
@@ -801,5 +902,46 @@ mod tests {
         let handle = kuroko_presenter_create();
         assert!(!handle.is_null());
         unsafe { kuroko_presenter_destroy(handle) };
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn c_presenter_can_be_created_with_edr_config() {
+        let handle = kuroko_presenter_create_with_config(KurokoPresenterConfig {
+            output_mode: KurokoPresenterOutputMode::AppleEdr as i32,
+            edr_headroom: 4.0,
+        });
+        assert!(!handle.is_null());
+        unsafe { kuroko_presenter_destroy(handle) };
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn c_presenter_config_maps_output_modes() {
+        assert_eq!(
+            metal_output_mode_from_c(KurokoPresenterConfig::default()),
+            MetalOutputMode::Sdr
+        );
+        assert_eq!(
+            metal_output_mode_from_c(KurokoPresenterConfig {
+                output_mode: KurokoPresenterOutputMode::AppleEdr as i32,
+                edr_headroom: 4.0,
+            }),
+            MetalOutputMode::apple_edr(4.0)
+        );
+        assert_eq!(
+            metal_output_mode_from_c(KurokoPresenterConfig {
+                output_mode: 999,
+                edr_headroom: 4.0,
+            }),
+            MetalOutputMode::Sdr
+        );
+        assert_eq!(
+            metal_output_mode_from_c(KurokoPresenterConfig {
+                output_mode: KurokoPresenterOutputMode::AppleEdr as i32,
+                edr_headroom: f32::NAN,
+            }),
+            MetalOutputMode::apple_edr(1.0)
+        );
     }
 }
