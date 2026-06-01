@@ -373,8 +373,14 @@ impl MetalRendererImpl {
                 target_transfer: transfer_code(frame.pipeline.target.transfer),
                 tone_map: tone_map_code(frame.pipeline.tone_map.operator),
                 edr_output: self.output_mode.is_edr() as u32,
-                source_peak_nits: frame.pipeline.source.nominal_peak_nits,
-                target_peak_nits: frame.pipeline.target.peak_nits,
+                _reserved0: 0,
+                _reserved1: 0,
+                nits: [
+                    frame.pipeline.source.nominal_peak_nits,
+                    frame.pipeline.target.peak_nits,
+                    frame.pipeline.source.reference_white_nits,
+                    frame.pipeline.target.reference_white_nits,
+                ],
                 luma_coefficients: luma_coefficients(frame.pipeline.luma_coefficients()),
                 gamut_matrix_rows: frame.pipeline.gamut_matrix().row4s(),
             };
@@ -755,8 +761,9 @@ struct VideoUniforms {
     target_transfer: u32,
     tone_map: u32,
     edr_output: u32,
-    source_peak_nits: f32,
-    target_peak_nits: f32,
+    _reserved0: u32,
+    _reserved1: u32,
+    nits: [f32; 4],
     luma_coefficients: [f32; 4],
     gamut_matrix_rows: [[f32; 4]; 3],
 }
@@ -831,11 +838,28 @@ struct VideoUniforms {
     uint target_transfer;
     uint tone_map;
     uint edr_output;
-    float source_peak_nits;
-    float target_peak_nits;
+    uint reserved0;
+    uint reserved1;
+    float4 nits;
     float4 luma_coefficients;
     float4 gamut_matrix_rows[3];
 };
+
+float source_peak_nits(constant VideoUniforms& uniforms) {
+    return max(uniforms.nits.x, 1.0);
+}
+
+float target_peak_nits(constant VideoUniforms& uniforms) {
+    return max(uniforms.nits.y, 1.0);
+}
+
+float source_reference_white_nits(constant VideoUniforms& uniforms) {
+    return max(uniforms.nits.z, 1.0);
+}
+
+float target_reference_white_nits(constant VideoUniforms& uniforms) {
+    return max(uniforms.nits.w, 1.0);
+}
 
 float pq_eotf(float encoded) {
     constexpr float m1 = 0.1593017578125;
@@ -849,10 +873,12 @@ float pq_eotf(float encoded) {
     return pow(num / den, 1.0 / m1);
 }
 
-float3 transfer_to_linear(float3 rgb, constant VideoUniforms& uniforms) {
+float3 transfer_to_source_reference_linear(float3 rgb, constant VideoUniforms& uniforms) {
     rgb = max(rgb, float3(0.0));
     if (uniforms.source_transfer == 3) {
-        return float3(pq_eotf(rgb.r), pq_eotf(rgb.g), pq_eotf(rgb.b));
+        constexpr float pq_absolute_peak_nits = 10000.0;
+        return float3(pq_eotf(rgb.r), pq_eotf(rgb.g), pq_eotf(rgb.b))
+            * (pq_absolute_peak_nits / source_reference_white_nits(uniforms));
     }
     if (uniforms.source_transfer == 1) {
         return pow(rgb, float3(2.2));
@@ -863,20 +889,27 @@ float3 transfer_to_linear(float3 rgb, constant VideoUniforms& uniforms) {
     return rgb;
 }
 
-float3 tone_map_rgb(float3 rgb, constant VideoUniforms& uniforms) {
-    float source_peak = max(uniforms.source_peak_nits, 1.0);
-    float target_peak = max(uniforms.target_peak_nits, 1.0);
-    float scale = source_peak / target_peak;
-    float3 scaled = rgb * scale;
+float3 source_reference_to_nits(float3 rgb, constant VideoUniforms& uniforms) {
+    return max(rgb, float3(0.0)) * source_reference_white_nits(uniforms);
+}
+
+float3 tone_map_nits(float3 nits, constant VideoUniforms& uniforms) {
+    float source_peak = source_peak_nits(uniforms);
+    float target_peak = target_peak_nits(uniforms);
+    float3 x = max(nits, float3(0.0)) / target_peak;
+    float white = max(source_peak / target_peak, 1.0);
     if (uniforms.tone_map == 1) {
-        return scaled / (float3(1.0) + scaled);
+        float white2 = white * white;
+        return target_peak * clamp((x * (float3(1.0) + x / white2)) / (float3(1.0) + x), 0.0, 1.0);
     }
     if (uniforms.tone_map == 2) {
         constexpr float knee = 0.75;
-        float3 high = scaled / (float3(1.0) + scaled);
-        return mix(scaled, high, smoothstep(knee, 1.0, max(max(scaled.r, scaled.g), scaled.b)));
+        float denom = max(white - knee, 0.0001);
+        float3 t = clamp((x - float3(knee)) / denom, 0.0, 1.0);
+        float3 shoulder = knee + (1.0 - knee) * (float3(1.0) - pow(float3(1.0) - t, float3(2.0)));
+        return target_peak * mix(x, shoulder, step(float3(knee), x));
     }
-    return scaled;
+    return target_peak * clamp(x, 0.0, 1.0);
 }
 
 float3 apply_gamut_map(float3 rgb, constant VideoUniforms& uniforms) {
@@ -887,7 +920,14 @@ float3 apply_gamut_map(float3 rgb, constant VideoUniforms& uniforms) {
     );
 }
 
-float3 linear_to_output(float3 rgb, constant VideoUniforms& uniforms) {
+float3 target_nits_to_reference_linear(float3 nits, constant VideoUniforms& uniforms) {
+    return max(nits, float3(0.0)) / target_reference_white_nits(uniforms);
+}
+
+float3 target_reference_linear_to_output(float3 rgb, constant VideoUniforms& uniforms) {
+    if (uniforms.edr_output != 0) {
+        return max(rgb, float3(0.0));
+    }
     if (uniforms.target_transfer == 1) {
         return pow(max(rgb, float3(0.0)), float3(1.0 / 2.2));
     }
@@ -899,7 +939,7 @@ float3 linear_to_output(float3 rgb, constant VideoUniforms& uniforms) {
 
 float4 final_output(float3 rgb, constant VideoUniforms& uniforms) {
     if (uniforms.edr_output != 0) {
-        float headroom = max(uniforms.target_peak_nits / 203.0, 1.0);
+        float headroom = max(target_peak_nits(uniforms) / target_reference_white_nits(uniforms), 1.0);
         return float4(clamp(rgb, 0.0, headroom), 1.0);
     }
     return float4(clamp(rgb, 0.0, 1.0), 1.0);
@@ -962,11 +1002,12 @@ fragment float4 kuroko_video_fragment(
     rgb.r = y + 2.0 * (1.0 - kr) * cbcr.y;
     rgb.b = y + 2.0 * (1.0 - kb) * cbcr.x;
     rgb.g = (y - kr * rgb.r - kb * rgb.b) / kg;
-    rgb = transfer_to_linear(rgb, uniforms);
+    rgb = transfer_to_source_reference_linear(rgb, uniforms);
     rgb = apply_gamut_map(rgb, uniforms);
-    rgb = max(rgb, float3(0.0));
-    rgb = tone_map_rgb(rgb, uniforms);
-    rgb = linear_to_output(rgb, uniforms);
+    rgb = source_reference_to_nits(rgb, uniforms);
+    rgb = tone_map_nits(rgb, uniforms);
+    rgb = target_nits_to_reference_linear(rgb, uniforms);
+    rgb = target_reference_linear_to_output(rgb, uniforms);
     return final_output(rgb, uniforms);
 }
 
@@ -1162,8 +1203,39 @@ mod tests {
     #[test]
     fn video_shader_has_edr_output_headroom_clamp() {
         assert!(VIDEO_SHADER_SOURCE.contains("edr_output"));
-        assert!(VIDEO_SHADER_SOURCE.contains("target_peak_nits / 203.0"));
+        assert!(
+            VIDEO_SHADER_SOURCE
+                .contains("target_peak_nits(uniforms) / target_reference_white_nits(uniforms)")
+        );
         assert!(VIDEO_SHADER_SOURCE.contains("return final_output(rgb, uniforms)"));
+    }
+
+    #[test]
+    fn video_shader_uses_absolute_nits_for_tone_mapping() {
+        assert!(VIDEO_SHADER_SOURCE.contains("float4 nits"));
+        assert!(VIDEO_SHADER_SOURCE.contains("pq_absolute_peak_nits = 10000.0"));
+        assert!(VIDEO_SHADER_SOURCE.contains("source_reference_to_nits"));
+        assert!(VIDEO_SHADER_SOURCE.contains("tone_map_nits"));
+        assert!(VIDEO_SHADER_SOURCE.contains("target_nits_to_reference_linear"));
+        let decode = VIDEO_SHADER_SOURCE
+            .find("rgb = transfer_to_source_reference_linear")
+            .unwrap();
+        let gamut = VIDEO_SHADER_SOURCE.find("rgb = apply_gamut_map").unwrap();
+        let source_nits = VIDEO_SHADER_SOURCE
+            .find("rgb = source_reference_to_nits")
+            .unwrap();
+        let tone_map = VIDEO_SHADER_SOURCE.find("rgb = tone_map_nits").unwrap();
+        let target_reference = VIDEO_SHADER_SOURCE
+            .find("rgb = target_nits_to_reference_linear")
+            .unwrap();
+        let output = VIDEO_SHADER_SOURCE
+            .find("rgb = target_reference_linear_to_output")
+            .unwrap();
+        assert!(decode < gamut);
+        assert!(gamut < source_nits);
+        assert!(source_nits < tone_map);
+        assert!(tone_map < target_reference);
+        assert!(target_reference < output);
     }
 
     #[test]
@@ -1171,27 +1243,22 @@ mod tests {
         assert!(VIDEO_SHADER_SOURCE.contains("gamut_matrix_rows"));
         assert!(VIDEO_SHADER_SOURCE.contains("apply_gamut_map"));
         let gamut = VIDEO_SHADER_SOURCE.find("rgb = apply_gamut_map").unwrap();
-        let guard = gamut
-            + VIDEO_SHADER_SOURCE[gamut..]
-                .find("rgb = max(rgb, float3(0.0))")
-                .unwrap();
-        let tone_map = VIDEO_SHADER_SOURCE.find("rgb = tone_map_rgb").unwrap();
+        let tone_map = VIDEO_SHADER_SOURCE.find("rgb = tone_map_nits").unwrap();
         assert!(gamut < tone_map);
-        assert!(gamut < guard);
-        assert!(guard < tone_map);
     }
 
     #[test]
     fn video_uniforms_keep_float4_fields_aligned() {
-        assert_eq!(std::mem::size_of::<super::VideoUniforms>(), 96);
+        assert_eq!(std::mem::size_of::<super::VideoUniforms>(), 112);
         assert_eq!(std::mem::offset_of!(super::VideoUniforms, edr_output), 20);
+        assert_eq!(std::mem::offset_of!(super::VideoUniforms, nits), 32);
         assert_eq!(
             std::mem::offset_of!(super::VideoUniforms, luma_coefficients),
-            32
+            48
         );
         assert_eq!(
             std::mem::offset_of!(super::VideoUniforms, gamut_matrix_rows),
-            48
+            64
         );
     }
 
