@@ -4,7 +4,7 @@
 
 Kuroko 是一个用 Rust 编写的独立媒体播放器引擎。
 
-Kuroko 负责播放控制、时序同步、原生渲染、字幕、弹幕、音频输出，以及面向 HDR/EDR 的呈现路径。Flutter 是可选宿主 UI，不是视频渲染器。
+Kuroko 负责播放控制、时序同步、原生渲染、字幕、弹幕、音频输出，以及面向 HDR/EDR 的呈现路径。
 
 当前首要实现目标是 macOS 14+ 与原生 Metal presenter。长期方向是优先使用各平台原生渲染器，并在原生 API 不适合的场景下提供 wgpu fallback。
 
