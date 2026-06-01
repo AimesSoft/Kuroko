@@ -476,6 +476,12 @@ impl VideoRenderPipeline {
         Self::new(SourceColorState::default(), TargetColorState::default())
     }
 
+    pub fn with_target(mut self, target: TargetColorState) -> Self {
+        self.target = target;
+        self.graph = build_graph(self.source, self.target, self.scaler);
+        self
+    }
+
     pub fn requires_tone_mapping(&self) -> bool {
         requires_tone_mapping(self.source, self.target)
     }
@@ -584,6 +590,23 @@ mod tests {
 
         assert!(!pipeline.requires_tone_mapping());
         assert!(!pipeline.graph.contains(RenderPassKind::ToneMap));
+    }
+
+    #[test]
+    fn retargeting_pipeline_preserves_render_options_and_rebuilds_graph() {
+        let source = SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq);
+        let mut pipeline =
+            VideoRenderPipeline::new(source, TargetColorState::sdr(ColorPrimaries::Bt709));
+        pipeline.tone_map.operator = ToneMapOperator::Clip;
+        pipeline.scaler.kernel = ScalerKernel::Nearest;
+
+        let pipeline =
+            pipeline.with_target(TargetColorState::apple_edr(ColorPrimaries::Bt709, 4.0));
+
+        assert_eq!(pipeline.target.edr_headroom, 4.0);
+        assert_eq!(pipeline.tone_map.operator, ToneMapOperator::Clip);
+        assert_eq!(pipeline.scaler.kernel, ScalerKernel::Nearest);
+        assert!(!pipeline.graph.contains(RenderPassKind::Scale));
     }
 
     #[test]

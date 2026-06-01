@@ -8,11 +8,13 @@ use std::time::Duration;
 use kuroko::danmaku::{DanmakuItem, DanmakuMode, DanmakuTimeline};
 use kuroko::overlay::OverlayTimeline;
 use kuroko::presenter::{PresenterConfig, PresenterRuntime};
+use kuroko::renderer::metal::{MetalOutputMode, MetalRendererConfig};
 use kuroko::subtitle::{SubtitleCue, SubtitleTimeline};
 use kuroko::{MediaRequest, MetalSurfaceHandle, PlatformSurface};
 
 static MEDIA_URI: OnceLock<String> = OnceLock::new();
 static SMOKE_SECONDS: OnceLock<f64> = OnceLock::new();
+static EDR_HEADROOM: OnceLock<f32> = OnceLock::new();
 
 unsafe extern "C" {
     fn kuroko_demo_run_app();
@@ -32,6 +34,7 @@ impl DemoState {
     fn new() -> kuroko::Result<Self> {
         Ok(Self {
             presenter: PresenterRuntime::new(PresenterConfig {
+                renderer: demo_renderer_config(),
                 overlay: demo_overlay_timeline(),
                 ..PresenterConfig::default()
             })?,
@@ -65,6 +68,15 @@ impl DemoState {
             }
             Err(error) => eprintln!("Kuroko demo render failed: {error}"),
         }
+    }
+}
+
+fn demo_renderer_config() -> MetalRendererConfig {
+    let Some(headroom) = EDR_HEADROOM.get().copied() else {
+        return MetalRendererConfig::default();
+    };
+    MetalRendererConfig {
+        output_mode: MetalOutputMode::apple_edr(headroom),
     }
 }
 
@@ -132,10 +144,16 @@ fn main() {
     let options = parse_args(&args).unwrap_or_else(|error| {
         eprintln!("{error}");
         eprintln!(
-            "usage: cargo run -p macos_native_demo -- [--smoke-seconds N] [media-path-or-uri]"
+            "usage: cargo run -p macos_native_demo -- [--edr [HEADROOM]] [--smoke-seconds N] [media-path-or-uri]"
         );
         process::exit(2);
     });
+    if let Some(headroom) = options.edr_headroom {
+        EDR_HEADROOM
+            .set(headroom)
+            .expect("EDR headroom is set once");
+        eprintln!("Kuroko demo EDR mode: RGBA16Float headroom {headroom:.2}x");
+    }
     if let Some(seconds) = options.smoke_seconds {
         SMOKE_SECONDS
             .set(seconds)
@@ -152,14 +170,31 @@ fn main() {
 struct DemoOptions {
     media_uri: Option<String>,
     smoke_seconds: Option<f64>,
+    edr_headroom: Option<f32>,
 }
 
 fn parse_args(args: &[String]) -> Result<DemoOptions, String> {
     let mut media_uri = None;
     let mut smoke_seconds = None;
+    let mut edr_headroom = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--edr" => {
+                let mut headroom = 4.0;
+                if let Some(value) = args.get(index + 1) {
+                    if !value.starts_with("--") && value.parse::<f32>().is_ok() {
+                        index += 1;
+                        headroom = args[index].parse::<f32>().map_err(|_| {
+                            format!("invalid --edr headroom value: {}", args[index])
+                        })?;
+                    }
+                }
+                if !headroom.is_finite() || headroom < 1.0 {
+                    return Err("--edr headroom must be finite and at least 1.0".to_string());
+                }
+                edr_headroom = Some(headroom);
+            }
             "--smoke-seconds" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -197,6 +232,7 @@ fn parse_args(args: &[String]) -> Result<DemoOptions, String> {
     Ok(DemoOptions {
         media_uri,
         smoke_seconds,
+        edr_headroom,
     })
 }
 
@@ -216,6 +252,35 @@ mod tests {
 
         assert_eq!(options.media_uri.as_deref(), Some("/tmp/movie.mp4"));
         assert_eq!(options.smoke_seconds, Some(1.5));
+        assert_eq!(options.edr_headroom, None);
+    }
+
+    #[test]
+    fn parse_args_accepts_edr_with_default_headroom() {
+        let args = vec!["--edr".to_string(), "/tmp/movie.mp4".to_string()];
+
+        let options = parse_args(&args).unwrap();
+
+        assert_eq!(options.edr_headroom, Some(4.0));
+        assert_eq!(options.media_uri.as_deref(), Some("/tmp/movie.mp4"));
+    }
+
+    #[test]
+    fn parse_args_accepts_edr_with_explicit_headroom() {
+        let args = vec!["--edr".to_string(), "2.5".to_string()];
+
+        let options = parse_args(&args).unwrap();
+
+        assert_eq!(options.edr_headroom, Some(2.5));
+    }
+
+    #[test]
+    fn parse_args_rejects_invalid_edr_headroom() {
+        let args = vec!["--edr".to_string(), "0".to_string()];
+
+        let error = parse_args(&args).unwrap_err();
+
+        assert!(error.contains("headroom"));
     }
 
     #[test]

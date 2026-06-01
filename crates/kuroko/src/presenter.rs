@@ -10,8 +10,8 @@ use crate::core::{
 use crate::ffmpeg::Frame;
 use crate::overlay::{OverlayFrame, OverlayTimeline, OverlayViewport};
 use crate::renderer::metal::{
-    ImportedVideoFrame, MetalRenderer, OverlayRenderFrame, VideoFrameTextureSource,
-    VideoRenderFrame,
+    ImportedVideoFrame, MetalRenderer, MetalRendererConfig, OverlayRenderFrame,
+    VideoFrameTextureSource, VideoRenderFrame,
 };
 use crate::{PlayerError, Result};
 
@@ -19,6 +19,7 @@ use crate::{PlayerError, Result};
 pub struct PresenterConfig {
     pub player: PlayerConfig,
     pub audio: CoreAudioOutputConfig,
+    pub renderer: MetalRendererConfig,
     pub overlay: OverlayTimeline,
 }
 
@@ -27,6 +28,7 @@ impl Default for PresenterConfig {
         Self {
             player: PlayerConfig::default(),
             audio: CoreAudioOutputConfig::default(),
+            renderer: MetalRendererConfig::default(),
             overlay: OverlayTimeline::default(),
         }
     }
@@ -64,7 +66,7 @@ impl PresenterRuntime {
         let audio_frames = player.subscribe_audio_frames();
         Ok(Self {
             player,
-            renderer: MetalRenderer::new()?,
+            renderer: MetalRenderer::with_config(config.renderer)?,
             video_frames,
             audio_frames,
             audio_output: CoreAudioOutput::new(config.audio),

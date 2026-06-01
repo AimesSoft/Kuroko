@@ -35,6 +35,66 @@ pub struct MetalRenderer {
     _unsupported: (),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetalRendererConfig {
+    pub output_mode: MetalOutputMode,
+}
+
+impl Default for MetalRendererConfig {
+    fn default() -> Self {
+        Self {
+            output_mode: MetalOutputMode::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MetalOutputMode {
+    Sdr,
+    AppleEdr { headroom: f32 },
+}
+
+impl MetalOutputMode {
+    pub fn apple_edr(headroom: f32) -> Self {
+        Self::AppleEdr {
+            headroom: headroom.max(1.0),
+        }
+    }
+
+    pub fn pixel_format(self) -> MetalDrawablePixelFormat {
+        match self {
+            Self::Sdr => MetalDrawablePixelFormat::Bgra8Unorm,
+            Self::AppleEdr { .. } => MetalDrawablePixelFormat::Rgba16Float,
+        }
+    }
+
+    pub fn is_edr(self) -> bool {
+        matches!(self, Self::AppleEdr { .. })
+    }
+
+    pub fn target_color(self) -> crate::renderer::pipeline::TargetColorState {
+        match self {
+            Self::Sdr => crate::renderer::pipeline::TargetColorState::sdr(ColorPrimaries::Bt709),
+            Self::AppleEdr { headroom } => crate::renderer::pipeline::TargetColorState::apple_edr(
+                ColorPrimaries::Bt709,
+                headroom,
+            ),
+        }
+    }
+}
+
+impl Default for MetalOutputMode {
+    fn default() -> Self {
+        Self::Sdr
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetalDrawablePixelFormat {
+    Bgra8Unorm,
+    Rgba16Float,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MetalRendererStats {
     pub drawable_width: u32,
@@ -205,10 +265,14 @@ pub struct ImportedVideoPlaneInfo {
 
 impl MetalRenderer {
     pub fn new() -> Result<Self> {
+        Self::with_config(MetalRendererConfig::default())
+    }
+
+    pub fn with_config(config: MetalRendererConfig) -> Result<Self> {
         #[cfg(target_os = "macos")]
         {
             Ok(Self {
-                inner: macos::MetalRendererImpl::new()?,
+                inner: macos::MetalRendererImpl::new(config)?,
             })
         }
         #[cfg(not(target_os = "macos"))]
@@ -509,6 +573,43 @@ mod tests {
         };
 
         assert!(inspect_overlay_frame(&frame).is_err());
+    }
+
+    #[test]
+    fn metal_output_mode_maps_sdr_to_default_drawable_and_target() {
+        let output = MetalOutputMode::default();
+
+        assert_eq!(output.pixel_format(), MetalDrawablePixelFormat::Bgra8Unorm);
+        assert!(!output.is_edr());
+
+        let target = output.target_color();
+        assert_eq!(target.primaries, ColorPrimaries::Bt709);
+        assert_eq!(target.transfer, TransferFunction::Srgb);
+        assert_eq!(target.peak_nits, 100.0);
+        assert_eq!(target.edr_headroom, 1.0);
+    }
+
+    #[test]
+    fn metal_output_mode_maps_apple_edr_to_float_drawable_and_headroom_target() {
+        let output = MetalOutputMode::apple_edr(4.0);
+
+        assert_eq!(output.pixel_format(), MetalDrawablePixelFormat::Rgba16Float);
+        assert!(output.is_edr());
+
+        let target = output.target_color();
+        assert_eq!(target.primaries, ColorPrimaries::Bt709);
+        assert_eq!(target.transfer, TransferFunction::Srgb);
+        assert_eq!(target.peak_nits, 812.0);
+        assert_eq!(target.reference_white_nits, 203.0);
+        assert_eq!(target.edr_headroom, 4.0);
+    }
+
+    #[test]
+    fn metal_output_mode_clamps_edr_headroom_to_one() {
+        let target = MetalOutputMode::apple_edr(0.25).target_color();
+
+        assert_eq!(target.peak_nits, 203.0);
+        assert_eq!(target.edr_headroom, 1.0);
     }
 
     #[test]

@@ -41,8 +41,9 @@ use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
 use crate::renderer::metal::{
     ClearColor, ImportedVideoFormat, ImportedVideoFrameInfo, ImportedVideoPlaneInfo,
-    MetalRendererStats, OverlayRenderFrame, PreparedOverlayFrameInfo, VideoFrameTextureSource,
-    VideoRenderFrame, fourcc_string,
+    MetalDrawablePixelFormat, MetalOutputMode, MetalRendererConfig, MetalRendererStats,
+    OverlayRenderFrame, PreparedOverlayFrameInfo, VideoFrameTextureSource, VideoRenderFrame,
+    fourcc_string,
 };
 use crate::renderer::pipeline::{ColorRange, ToneMapOperator};
 
@@ -94,6 +95,8 @@ pub struct ImportedVideoFrameResult {
 pub struct MetalRendererImpl {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    output_mode: MetalOutputMode,
+    drawable_pixel_format: MetalDrawablePixelFormat,
     layer: Option<Retained<CAMetalLayer>>,
     texture_cache: Option<CFRetained<CVMetalTextureCache>>,
     video_pipeline: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
@@ -103,7 +106,7 @@ pub struct MetalRendererImpl {
 }
 
 impl MetalRendererImpl {
-    pub fn new() -> Result<Self> {
+    pub fn new(config: MetalRendererConfig) -> Result<Self> {
         let device = MTLCreateSystemDefaultDevice().ok_or_else(|| {
             PlayerError::Renderer("MTLCreateSystemDefaultDevice returned nil".to_string())
         })?;
@@ -113,6 +116,8 @@ impl MetalRendererImpl {
         Ok(Self {
             device,
             queue,
+            output_mode: config.output_mode,
+            drawable_pixel_format: config.output_mode.pixel_format(),
             layer: None,
             texture_cache: None,
             video_pipeline: None,
@@ -137,7 +142,7 @@ impl MetalRendererImpl {
         let layer: Retained<CAMetalLayer> = unsafe { Retained::retain(layer.cast()) }
             .ok_or_else(|| PlayerError::Renderer("failed to retain CAMetalLayer".to_string()))?;
         layer.setDevice(Some(&*self.device));
-        layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+        self.configure_layer_output(&layer);
         self.layer = Some(layer);
         self.resize_surface(width, height, scale);
         Ok(())
@@ -161,6 +166,14 @@ impl MetalRendererImpl {
 
     pub fn stats(&self) -> MetalRendererStats {
         self.stats
+    }
+
+    fn configure_layer_output(&mut self, layer: &CAMetalLayer) {
+        self.drawable_pixel_format = self.output_mode.pixel_format();
+        layer.setPixelFormat(metal_pixel_format(self.drawable_pixel_format));
+        layer.setWantsExtendedDynamicRangeContent(self.output_mode.is_edr());
+        self.video_pipeline = None;
+        self.overlay_pipeline = None;
     }
 
     pub fn record_prepared_overlay_frame(&mut self, info: PreparedOverlayFrameInfo) {
@@ -289,7 +302,7 @@ impl MetalRendererImpl {
 
     fn render_video_frame_inner(
         &mut self,
-        frame: VideoRenderFrame<'_>,
+        mut frame: VideoRenderFrame<'_>,
         overlay: Option<OverlayRenderFrame<'_>>,
     ) -> Result<()> {
         let Some(layer) = &self.layer else {
@@ -313,6 +326,8 @@ impl MetalRendererImpl {
                 "imported video frame has no chroma plane".to_string(),
             ));
         };
+
+        frame.pipeline = frame.pipeline.with_target(self.output_mode.target_color());
 
         unsafe {
             let Some(drawable): Option<Retained<ProtocolObject<dyn CAMetalDrawable>>> =
@@ -357,9 +372,9 @@ impl MetalRendererImpl {
                 source_transfer: transfer_code(frame.pipeline.source.transfer),
                 target_transfer: transfer_code(frame.pipeline.target.transfer),
                 tone_map: tone_map_code(frame.pipeline.tone_map.operator),
+                edr_output: self.output_mode.is_edr() as u32,
                 source_peak_nits: frame.pipeline.source.nominal_peak_nits,
                 target_peak_nits: frame.pipeline.target.peak_nits,
-                _padding0: 0.0,
                 luma_coefficients: luma_coefficients(frame.pipeline.luma_coefficients()),
                 gamut_matrix_rows: frame.pipeline.gamut_matrix().row4s(),
             };
@@ -634,7 +649,7 @@ impl MetalRendererImpl {
             descriptor.setFragmentFunction(Some(&*fragment));
             let attachments = descriptor.colorAttachments();
             let attachment = unsafe { attachments.objectAtIndexedSubscript(0) };
-            attachment.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+            attachment.setPixelFormat(metal_pixel_format(self.drawable_pixel_format));
             let pipeline = self
                 .device
                 .newRenderPipelineStateWithDescriptor_error(&descriptor)
@@ -704,7 +719,7 @@ impl MetalRendererImpl {
             descriptor.setFragmentFunction(Some(&*fragment));
             let attachments = descriptor.colorAttachments();
             let attachment = unsafe { attachments.objectAtIndexedSubscript(0) };
-            attachment.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+            attachment.setPixelFormat(metal_pixel_format(self.drawable_pixel_format));
             attachment.setBlendingEnabled(true);
             attachment.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
             attachment.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
@@ -739,11 +754,18 @@ struct VideoUniforms {
     source_transfer: u32,
     target_transfer: u32,
     tone_map: u32,
+    edr_output: u32,
     source_peak_nits: f32,
     target_peak_nits: f32,
-    _padding0: f32,
     luma_coefficients: [f32; 4],
     gamut_matrix_rows: [[f32; 4]; 3],
+}
+
+fn metal_pixel_format(format: MetalDrawablePixelFormat) -> MTLPixelFormat {
+    match format {
+        MetalDrawablePixelFormat::Bgra8Unorm => MTLPixelFormat::BGRA8Unorm,
+        MetalDrawablePixelFormat::Rgba16Float => MTLPixelFormat::RGBA16Float,
+    }
 }
 
 fn transfer_code(transfer: crate::core::TransferFunction) -> u32 {
@@ -808,9 +830,9 @@ struct VideoUniforms {
     uint source_transfer;
     uint target_transfer;
     uint tone_map;
+    uint edr_output;
     float source_peak_nits;
     float target_peak_nits;
-    float padding0;
     float4 luma_coefficients;
     float4 gamut_matrix_rows[3];
 };
@@ -875,6 +897,14 @@ float3 linear_to_output(float3 rgb, constant VideoUniforms& uniforms) {
     return rgb;
 }
 
+float4 final_output(float3 rgb, constant VideoUniforms& uniforms) {
+    if (uniforms.edr_output != 0) {
+        float headroom = max(uniforms.target_peak_nits / 203.0, 1.0);
+        return float4(clamp(rgb, 0.0, headroom), 1.0);
+    }
+    return float4(clamp(rgb, 0.0, 1.0), 1.0);
+}
+
 struct RangeExpandedYCbCr {
     float y;
     float2 cbcr;
@@ -937,7 +967,7 @@ fragment float4 kuroko_video_fragment(
     rgb = max(rgb, float3(0.0));
     rgb = tone_map_rgb(rgb, uniforms);
     rgb = linear_to_output(rgb, uniforms);
-    return float4(clamp(rgb, 0.0, 1.0), 1.0);
+    return final_output(rgb, uniforms);
 }
 
 struct OverlayUniforms {
@@ -1106,7 +1136,9 @@ fn create_plane_texture(
 
 #[cfg(test)]
 mod tests {
-    use super::VIDEO_SHADER_SOURCE;
+    use super::{VIDEO_SHADER_SOURCE, metal_pixel_format};
+    use crate::renderer::metal::MetalDrawablePixelFormat;
+    use objc2_metal::MTLPixelFormat;
 
     #[test]
     fn video_shader_has_bit_depth_aware_range_expansion() {
@@ -1128,6 +1160,13 @@ mod tests {
     }
 
     #[test]
+    fn video_shader_has_edr_output_headroom_clamp() {
+        assert!(VIDEO_SHADER_SOURCE.contains("edr_output"));
+        assert!(VIDEO_SHADER_SOURCE.contains("target_peak_nits / 203.0"));
+        assert!(VIDEO_SHADER_SOURCE.contains("return final_output(rgb, uniforms)"));
+    }
+
+    #[test]
     fn video_shader_applies_gamut_matrix_before_tone_mapping() {
         assert!(VIDEO_SHADER_SOURCE.contains("gamut_matrix_rows"));
         assert!(VIDEO_SHADER_SOURCE.contains("apply_gamut_map"));
@@ -1145,6 +1184,7 @@ mod tests {
     #[test]
     fn video_uniforms_keep_float4_fields_aligned() {
         assert_eq!(std::mem::size_of::<super::VideoUniforms>(), 96);
+        assert_eq!(std::mem::offset_of!(super::VideoUniforms, edr_output), 20);
         assert_eq!(
             std::mem::offset_of!(super::VideoUniforms, luma_coefficients),
             32
@@ -1152,6 +1192,18 @@ mod tests {
         assert_eq!(
             std::mem::offset_of!(super::VideoUniforms, gamut_matrix_rows),
             48
+        );
+    }
+
+    #[test]
+    fn drawable_pixel_formats_map_to_metal_pipeline_formats() {
+        assert_eq!(
+            metal_pixel_format(MetalDrawablePixelFormat::Bgra8Unorm),
+            MTLPixelFormat::BGRA8Unorm
+        );
+        assert_eq!(
+            metal_pixel_format(MetalDrawablePixelFormat::Rgba16Float),
+            MTLPixelFormat::RGBA16Float
         );
     }
 }
