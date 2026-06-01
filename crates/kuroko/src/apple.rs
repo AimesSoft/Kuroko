@@ -29,8 +29,8 @@ pub mod coreaudio {
     use thiserror::Error;
 
     use crate::audio::{
-        AudioOutputBackend, AudioOutputState, AudioPushResult, AudioReadResult, AudioRingBuffer,
-        AudioRingBufferConfig, AudioRingBufferStats,
+        AudioClockSnapshot, AudioOutputBackend, AudioOutputState, AudioPushResult, AudioReadResult,
+        AudioRingBuffer, AudioRingBufferConfig, AudioRingBufferStats,
     };
     use crate::ffmpeg::{PcmAudioFrame, PcmFormat, PcmSampleFormat};
 
@@ -146,6 +146,14 @@ pub mod coreaudio {
                 .map_err(|_| CoreAudioOutputError::LockPoisoned)?;
             Ok(buffer.stats())
         }
+
+        pub fn clock_snapshot(&self) -> Result<AudioClockSnapshot> {
+            let buffer = self
+                .buffer
+                .lock()
+                .map_err(|_| CoreAudioOutputError::LockPoisoned)?;
+            Ok(buffer.clock_snapshot())
+        }
     }
 
     impl Default for CoreAudioOutput {
@@ -186,6 +194,10 @@ pub mod coreaudio {
 
         fn stats(&self) -> AudioRingBufferStats {
             self.stats().unwrap_or_default()
+        }
+
+        fn clock_snapshot(&self) -> Option<AudioClockSnapshot> {
+            self.clock_snapshot().ok()
         }
     }
 

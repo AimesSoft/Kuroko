@@ -194,11 +194,23 @@ impl PresenterRuntime {
     fn pump_audio(&mut self) {
         loop {
             match self.audio_frames.try_recv() {
-                Ok(frame) => self.push_audio(frame),
+                Ok(frame) => {
+                    self.push_audio(frame);
+                }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => break,
             }
         }
+        if self.audio_started {
+            self.sync_player_to_audio_output();
+        }
+    }
+
+    fn sync_player_to_audio_output(&self) {
+        let Ok(snapshot) = self.audio_output.clock_snapshot() else {
+            return;
+        };
+        let _ = self.player.update_audio_clock(snapshot);
     }
 
     fn push_audio(&mut self, frame: PlayerAudioFrame) {

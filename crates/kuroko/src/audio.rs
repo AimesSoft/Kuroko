@@ -67,11 +67,35 @@ pub struct AudioReadResult {
     pub underflow_frames: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioClockSnapshot {
+    pub media_time: Option<Duration>,
+    pub queued_duration: Option<Duration>,
+    pub queued_frames: usize,
+    pub read_frames: u64,
+    pub written_frames: u64,
+    pub underflow_frames: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AudioTimelineSegment {
+    start: Option<Duration>,
+    frames: usize,
+}
+
+impl AudioTimelineSegment {
+    fn new(start: Option<Duration>, frames: usize) -> Self {
+        Self { start, frames }
+    }
+}
+
 #[derive(Debug)]
 pub struct AudioRingBuffer {
     config: AudioRingBufferConfig,
     format: Option<PcmFormat>,
     samples: VecDeque<f32>,
+    timeline: VecDeque<AudioTimelineSegment>,
+    last_media_time: Option<Duration>,
     stats: AudioRingBufferStats,
 }
 
@@ -81,6 +105,8 @@ impl AudioRingBuffer {
             config,
             format: None,
             samples: VecDeque::new(),
+            timeline: VecDeque::new(),
+            last_media_time: None,
             stats: AudioRingBufferStats::default(),
         }
     }
@@ -133,8 +159,25 @@ impl AudioRingBuffer {
         }
     }
 
+    pub fn clock_snapshot(&self) -> AudioClockSnapshot {
+        AudioClockSnapshot {
+            media_time: self
+                .timeline
+                .front()
+                .and_then(|segment| segment.start)
+                .or(self.last_media_time),
+            queued_duration: self.queued_duration(),
+            queued_frames: self.queued_frames(),
+            read_frames: self.stats.read_frames,
+            written_frames: self.stats.written_frames,
+            underflow_frames: self.stats.underflow_frames,
+        }
+    }
+
     pub fn clear(&mut self) {
         self.samples.clear();
+        self.timeline.clear();
+        self.last_media_time = None;
         self.stats.queued_frames = 0;
         self.stats.queued_samples = 0;
     }
@@ -155,6 +198,8 @@ impl AudioRingBuffer {
         let channels = format.channels as usize;
         let incoming_frames = frame.samples.len() / channels;
         let mut dropped_frames = 0usize;
+        let frame_pts = frame.pts;
+        let frame_samples = frame.samples;
 
         if self.config.drop_oldest_on_overflow {
             while self.queued_frames() + incoming_frames > self.config.capacity_frames {
@@ -180,11 +225,14 @@ impl AudioRingBuffer {
             .min(free_frames);
         let accepted_samples = accepted_frames * channels;
         self.samples.extend(
-            frame
-                .samples
+            frame_samples
                 .into_iter()
                 .skip(skipped_incoming_samples)
                 .take(accepted_samples),
+        );
+        self.push_timeline_segment(
+            frame_pts.and_then(|pts| offset_pts(pts, skip_incoming_frames, format.sample_rate)),
+            accepted_frames,
         );
         self.stats.written_frames += accepted_frames as u64;
         self.stats.dropped_frames +=
@@ -220,6 +268,7 @@ impl AudioRingBuffer {
 
         let read_frames = read_samples / channels;
         let underflow_frames = requested_frames.saturating_sub(read_frames);
+        self.advance_timeline(read_frames, format.sample_rate);
         self.stats.read_frames += read_frames as u64;
         self.stats.underflow_frames += underflow_frames as u64;
 
@@ -238,7 +287,34 @@ impl AudioRingBuffer {
         for _ in 0..channels {
             let _ = self.samples.pop_front();
         }
+        self.advance_timeline(1, self.format.map_or(0, |format| format.sample_rate));
         true
+    }
+
+    fn push_timeline_segment(&mut self, start: Option<Duration>, frames: usize) {
+        if frames == 0 {
+            return;
+        }
+        self.timeline
+            .push_back(AudioTimelineSegment::new(start, frames));
+    }
+
+    fn advance_timeline(&mut self, mut frames: usize, sample_rate: u32) {
+        while frames > 0 {
+            let Some(front) = self.timeline.front_mut() else {
+                break;
+            };
+            let consumed = frames.min(front.frames);
+            if let Some(start) = front.start {
+                self.last_media_time = offset_pts(start, consumed, sample_rate);
+                front.start = self.last_media_time;
+            }
+            front.frames -= consumed;
+            frames -= consumed;
+            if front.frames == 0 {
+                let _ = self.timeline.pop_front();
+            }
+        }
     }
 }
 
@@ -250,6 +326,9 @@ pub trait AudioOutputBackend {
     fn push(&mut self, frame: PcmAudioFrame) -> Result<AudioPushResult>;
     fn state(&self) -> AudioOutputState;
     fn stats(&self) -> AudioRingBufferStats;
+    fn clock_snapshot(&self) -> Option<AudioClockSnapshot> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -276,6 +355,10 @@ impl BufferedAudioOutput {
 
     pub fn read_interleaved(&mut self, output: &mut [f32]) -> Result<AudioReadResult> {
         self.buffer.read_interleaved(output)
+    }
+
+    pub fn clock_snapshot(&self) -> AudioClockSnapshot {
+        self.buffer.clock_snapshot()
     }
 }
 
@@ -311,6 +394,17 @@ impl AudioOutputBackend for BufferedAudioOutput {
     fn stats(&self) -> AudioRingBufferStats {
         self.buffer.stats()
     }
+
+    fn clock_snapshot(&self) -> Option<AudioClockSnapshot> {
+        Some(self.buffer.clock_snapshot())
+    }
+}
+
+fn offset_pts(pts: Duration, frames: usize, sample_rate: u32) -> Option<Duration> {
+    if sample_rate == 0 {
+        return Some(pts);
+    }
+    Some(pts + Duration::from_secs_f64(frames as f64 / sample_rate as f64))
 }
 
 #[cfg(test)]
@@ -332,6 +426,15 @@ mod tests {
             pts: None,
             frames: samples.len() / 2,
             samples,
+        }
+    }
+
+    fn timed_frame(pts: Duration, frames: usize) -> PcmAudioFrame {
+        PcmAudioFrame {
+            format: stereo_format(),
+            pts: Some(pts),
+            frames,
+            samples: vec![0.0; frames * 2],
         }
     }
 
@@ -388,5 +491,54 @@ mod tests {
         assert_eq!(output.state(), AudioOutputState::Paused);
         output.stop().unwrap();
         assert_eq!(output.state(), AudioOutputState::Stopped);
+    }
+
+    #[test]
+    fn ring_buffer_clock_snapshot_tracks_front_audio_pts() {
+        let mut buffer = AudioRingBuffer::with_format(
+            AudioRingBufferConfig {
+                capacity_frames: 48_000,
+                drop_oldest_on_overflow: true,
+            },
+            stereo_format(),
+        )
+        .unwrap();
+        buffer
+            .push_frame(timed_frame(Duration::from_secs(10), 480))
+            .unwrap();
+
+        assert_eq!(
+            buffer.clock_snapshot().media_time,
+            Some(Duration::from_secs(10))
+        );
+
+        let mut output = vec![0.0; 240 * 2];
+        buffer.read_interleaved(&mut output).unwrap();
+
+        assert_eq!(
+            buffer.clock_snapshot().media_time,
+            Some(Duration::from_millis(10_005))
+        );
+        assert_eq!(buffer.clock_snapshot().queued_frames, 240);
+    }
+
+    #[test]
+    fn ring_buffer_clock_survives_frame_drop() {
+        let mut buffer = AudioRingBuffer::with_format(
+            AudioRingBufferConfig {
+                capacity_frames: 2,
+                drop_oldest_on_overflow: true,
+            },
+            stereo_format(),
+        )
+        .unwrap();
+        buffer
+            .push_frame(timed_frame(Duration::from_secs(1), 4))
+            .unwrap();
+
+        assert_eq!(
+            buffer.clock_snapshot().media_time,
+            Some(Duration::from_nanos(1_000_041_667))
+        );
     }
 }

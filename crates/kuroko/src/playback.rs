@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
+use crate::audio::AudioClockSnapshot;
 use crate::core::{MediaRequest, TrackInfo, TrackKind, VideoParams};
 use crate::ffmpeg::{
     self, AudioResampler, Decoder, DecoderBackend, DecoderConfig, DecoderOutputFrame, Demuxer,
@@ -60,6 +61,7 @@ impl Default for VideoDecodePreference {
 pub struct PlaybackSessionConfig {
     pub video_decode: VideoDecodePreference,
     pub audio_output: PcmFormat,
+    pub timing: PlaybackTimingConfig,
 }
 
 impl Default for PlaybackSessionConfig {
@@ -67,6 +69,7 @@ impl Default for PlaybackSessionConfig {
         Self {
             video_decode: VideoDecodePreference::default(),
             audio_output: PcmFormat::default(),
+            timing: PlaybackTimingConfig::default(),
         }
     }
 }
@@ -302,6 +305,416 @@ pub enum PlaybackRunState {
     Ended,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackClockMode {
+    Wall,
+    AudioMaster,
+}
+
+impl Default for PlaybackClockMode {
+    fn default() -> Self {
+        Self::AudioMaster
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioSyncConfig {
+    pub enabled: bool,
+    pub deadband: Duration,
+    pub max_correction_per_frame: Duration,
+    pub snap_threshold: Duration,
+}
+
+impl Default for AudioSyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            deadband: Duration::from_millis(5),
+            max_correction_per_frame: Duration::from_millis(5),
+            snap_threshold: Duration::from_millis(250),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaybackTimingConfig {
+    pub clock_mode: PlaybackClockMode,
+    pub video_scheduler: VideoFrameScheduler,
+    pub audio_lead_time: Duration,
+    pub audio_sync: AudioSyncConfig,
+}
+
+impl Default for PlaybackTimingConfig {
+    fn default() -> Self {
+        Self {
+            clock_mode: PlaybackClockMode::default(),
+            video_scheduler: VideoFrameScheduler::default(),
+            audio_lead_time: Duration::from_millis(12),
+            audio_sync: AudioSyncConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackClockSource {
+    Wall,
+    Audio,
+    Display,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClockCorrectionDirection {
+    None,
+    Forward,
+    Backward,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockCorrection {
+    pub source: PlaybackClockSource,
+    pub direction: ClockCorrectionDirection,
+    pub drift: Duration,
+    pub applied: Duration,
+    pub snapped: bool,
+}
+
+impl ClockCorrection {
+    pub const fn none(source: PlaybackClockSource) -> Self {
+        Self {
+            source,
+            direction: ClockCorrectionDirection::None,
+            drift: Duration::ZERO,
+            applied: Duration::ZERO,
+            snapped: false,
+        }
+    }
+}
+
+impl Default for PlaybackClockSource {
+    fn default() -> Self {
+        Self::Wall
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlaybackClockSnapshot {
+    pub media_time: Duration,
+    pub source: PlaybackClockSource,
+    pub rate: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaybackClock {
+    base_media_time: Duration,
+    anchor: Option<Instant>,
+    rate: f64,
+    source: PlaybackClockSource,
+}
+
+impl PlaybackClock {
+    pub fn paused_at(media_time: Duration) -> Self {
+        Self {
+            base_media_time: media_time,
+            anchor: None,
+            rate: 1.0,
+            source: PlaybackClockSource::Wall,
+        }
+    }
+
+    pub fn running_at(media_time: Duration, now: Instant) -> Self {
+        let mut clock = Self::paused_at(media_time);
+        clock.anchor = Some(now);
+        clock
+    }
+
+    pub fn media_time_at(&self, now: Instant) -> Duration {
+        let Some(anchor) = self.anchor else {
+            return self.base_media_time;
+        };
+        self.base_media_time
+            .saturating_add(scale_duration(elapsed_since(anchor, now), self.rate))
+    }
+
+    pub fn snapshot_at(&self, now: Instant) -> PlaybackClockSnapshot {
+        PlaybackClockSnapshot {
+            media_time: self.media_time_at(now),
+            source: self.source,
+            rate: self.rate,
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.anchor.is_some()
+    }
+
+    pub fn source(&self) -> PlaybackClockSource {
+        self.source
+    }
+
+    pub fn rate(&self) -> f64 {
+        self.rate
+    }
+
+    pub fn play(&mut self, now: Instant) {
+        if self.anchor.is_none() {
+            self.anchor = Some(now);
+        }
+    }
+
+    pub fn pause(&mut self, now: Instant) {
+        self.base_media_time = self.media_time_at(now);
+        self.anchor = None;
+    }
+
+    pub fn seek(&mut self, media_time: Duration, now: Instant) {
+        self.base_media_time = media_time;
+        if self.anchor.is_some() {
+            self.anchor = Some(now);
+        }
+    }
+
+    pub fn reset(&mut self, media_time: Duration, running: bool, now: Instant) {
+        self.base_media_time = media_time;
+        self.anchor = running.then_some(now);
+        self.source = PlaybackClockSource::Wall;
+    }
+
+    pub fn sync_to(&mut self, media_time: Duration, now: Instant, source: PlaybackClockSource) {
+        self.base_media_time = media_time;
+        if self.anchor.is_some() {
+            self.anchor = Some(now);
+        }
+        self.source = source;
+    }
+
+    pub fn discipline_to(
+        &mut self,
+        reference_time: Duration,
+        now: Instant,
+        source: PlaybackClockSource,
+        config: AudioSyncConfig,
+    ) -> ClockCorrection {
+        self.source = source;
+        if !config.enabled {
+            return ClockCorrection::none(source);
+        }
+
+        let current = self.media_time_at(now);
+        let drift_nanos = duration_to_nanos(reference_time) - duration_to_nanos(current);
+        let drift_abs = nanos_to_duration(drift_nanos.abs());
+        let direction = if drift_nanos > 0 {
+            ClockCorrectionDirection::Forward
+        } else if drift_nanos < 0 {
+            ClockCorrectionDirection::Backward
+        } else {
+            ClockCorrectionDirection::None
+        };
+
+        if drift_abs <= config.deadband || direction == ClockCorrectionDirection::None {
+            return ClockCorrection {
+                source,
+                direction,
+                drift: drift_abs,
+                applied: Duration::ZERO,
+                snapped: false,
+            };
+        }
+
+        if drift_abs >= config.snap_threshold {
+            self.sync_to(reference_time, now, source);
+            return ClockCorrection {
+                source,
+                direction,
+                drift: drift_abs,
+                applied: drift_abs,
+                snapped: true,
+            };
+        }
+
+        let applied = drift_abs.min(config.max_correction_per_frame);
+        let correction_nanos = match direction {
+            ClockCorrectionDirection::Forward => duration_to_nanos(applied),
+            ClockCorrectionDirection::Backward => -duration_to_nanos(applied),
+            ClockCorrectionDirection::None => 0,
+        };
+        self.sync_to(add_signed_duration(current, correction_nanos), now, source);
+        ClockCorrection {
+            source,
+            direction,
+            drift: drift_abs,
+            applied,
+            snapped: false,
+        }
+    }
+
+    pub fn set_rate(&mut self, rate: f64, now: Instant) {
+        self.base_media_time = self.media_time_at(now);
+        self.rate = sanitize_playback_rate(rate);
+        if self.anchor.is_some() {
+            self.anchor = Some(now);
+        }
+    }
+}
+
+impl Default for PlaybackClock {
+    fn default() -> Self {
+        Self::paused_at(Duration::ZERO)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoFrameDecision {
+    Present { late_by: Option<Duration> },
+    Wait { early_by: Duration },
+    Drop { late_by: Duration },
+}
+
+impl VideoFrameDecision {
+    pub fn late_by(self) -> Option<Duration> {
+        match self {
+            Self::Present { late_by } => late_by,
+            Self::Drop { late_by } => Some(late_by),
+            Self::Wait { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoFrameScheduler {
+    pub lead_time: Duration,
+    pub drop_tolerance: Duration,
+    pub max_consecutive_drops: usize,
+}
+
+impl VideoFrameScheduler {
+    pub fn new(lead_time: Duration, drop_tolerance: Duration) -> Self {
+        Self {
+            lead_time,
+            drop_tolerance,
+            max_consecutive_drops: 5,
+        }
+    }
+
+    pub fn schedule(
+        self,
+        pts: Option<Duration>,
+        media_time: Duration,
+        first_frame: bool,
+    ) -> VideoFrameDecision {
+        let Some(pts) = pts else {
+            return VideoFrameDecision::Present { late_by: None };
+        };
+        if first_frame {
+            return VideoFrameDecision::Present {
+                late_by: media_time.checked_sub(pts),
+            };
+        }
+        if media_time.saturating_add(self.lead_time) < pts {
+            return VideoFrameDecision::Wait {
+                early_by: pts.saturating_sub(media_time.saturating_add(self.lead_time)),
+            };
+        }
+        let late_by = media_time.checked_sub(pts);
+        if late_by.is_some_and(|late| late > self.drop_tolerance) {
+            return VideoFrameDecision::Drop {
+                late_by: late_by.expect("checked above"),
+            };
+        }
+        VideoFrameDecision::Present { late_by }
+    }
+}
+
+impl Default for VideoFrameScheduler {
+    fn default() -> Self {
+        Self::new(Duration::from_millis(4), Duration::from_millis(120))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplaySyncConfig {
+    pub enabled: bool,
+    pub vsync_interval: Duration,
+    pub allow_zero_vsyncs: bool,
+}
+
+impl DisplaySyncConfig {
+    pub fn for_refresh_rate_hz(refresh_rate_hz: f64) -> Self {
+        let interval = if refresh_rate_hz.is_finite() && refresh_rate_hz > 0.0 {
+            Duration::from_secs_f64(1.0 / refresh_rate_hz)
+        } else {
+            Duration::from_millis(16)
+        };
+        Self {
+            vsync_interval: interval,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for DisplaySyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            vsync_interval: Duration::from_nanos(16_666_667),
+            allow_zero_vsyncs: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DisplaySyncState {
+    residual_error_nanos: i128,
+}
+
+impl DisplaySyncState {
+    pub fn reset(&mut self) {
+        self.residual_error_nanos = 0;
+    }
+
+    pub fn residual_error_nanos(&self) -> i128 {
+        self.residual_error_nanos
+    }
+
+    pub fn schedule_frame(
+        &mut self,
+        frame_duration: Duration,
+        config: DisplaySyncConfig,
+    ) -> DisplayFrameSchedule {
+        if !config.enabled || config.vsync_interval.is_zero() {
+            return DisplayFrameSchedule {
+                vsyncs: 1,
+                scheduled_duration: frame_duration,
+                residual_error_nanos: self.residual_error_nanos,
+            };
+        }
+
+        let vsync_nanos = duration_to_nanos(config.vsync_interval).max(1);
+        let target_nanos = duration_to_nanos(frame_duration) + self.residual_error_nanos;
+        let rounded = if target_nanos <= 0 {
+            0
+        } else {
+            (target_nanos + vsync_nanos / 2) / vsync_nanos
+        };
+        let min_vsyncs = if config.allow_zero_vsyncs { 0 } else { 1 };
+        let vsyncs = rounded.max(min_vsyncs).min(u32::MAX as i128) as u32;
+        let scheduled_nanos = vsyncs as i128 * vsync_nanos;
+        self.residual_error_nanos = target_nanos - scheduled_nanos;
+
+        DisplayFrameSchedule {
+            vsyncs,
+            scheduled_duration: nanos_to_duration(scheduled_nanos),
+            residual_error_nanos: self.residual_error_nanos,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayFrameSchedule {
+    pub vsyncs: u32,
+    pub scheduled_duration: Duration,
+    pub residual_error_nanos: i128,
+}
+
 pub struct TimedVideoFrame {
     pub frame: Frame,
     pub pts: Option<Duration>,
@@ -319,13 +732,11 @@ pub struct TimedAudioFrame {
 pub struct VideoPlaybackEngine {
     session: PlaybackSession,
     state: PlaybackRunState,
-    clock_base: Duration,
-    started_at: Option<Instant>,
+    clock: PlaybackClock,
+    timing: PlaybackTimingConfig,
     pending_frame: Option<Frame>,
     pending_audio: Option<PcmAudioFrame>,
     last_presented_pts: Option<Duration>,
-    frame_lead_time: Duration,
-    audio_lead_time: Duration,
     eof: bool,
     waiting_for_first_frame: bool,
 }
@@ -334,20 +745,29 @@ unsafe impl Send for VideoPlaybackEngine {}
 
 impl VideoPlaybackEngine {
     pub fn open(request: &MediaRequest, config: PlaybackSessionConfig) -> Result<Self> {
-        Ok(Self::from_session(PlaybackSession::open(request, config)?))
+        let timing = config.timing;
+        Ok(Self::from_session_with_timing(
+            PlaybackSession::open(request, config)?,
+            timing,
+        ))
     }
 
     pub fn from_session(session: PlaybackSession) -> Self {
+        Self::from_session_with_timing(session, PlaybackTimingConfig::default())
+    }
+
+    pub fn from_session_with_timing(
+        session: PlaybackSession,
+        timing: PlaybackTimingConfig,
+    ) -> Self {
         Self {
             session,
             state: PlaybackRunState::Paused,
-            clock_base: Duration::ZERO,
-            started_at: None,
+            clock: PlaybackClock::default(),
+            timing,
             pending_frame: None,
             pending_audio: None,
             last_presented_pts: None,
-            frame_lead_time: Duration::from_millis(4),
-            audio_lead_time: Duration::from_millis(12),
             eof: false,
             waiting_for_first_frame: false,
         }
@@ -368,7 +788,7 @@ impl VideoPlaybackEngine {
         ) {
             return;
         }
-        self.started_at = Some(Instant::now());
+        self.clock.play(Instant::now());
         self.state = PlaybackRunState::Playing;
         self.waiting_for_first_frame = self.last_presented_pts.is_none();
     }
@@ -377,14 +797,12 @@ impl VideoPlaybackEngine {
         if self.state != PlaybackRunState::Playing {
             return;
         }
-        self.clock_base = self.media_time();
-        self.started_at = None;
+        self.clock.pause(Instant::now());
         self.state = PlaybackRunState::Paused;
     }
 
     pub fn stop(&mut self) {
-        self.clock_base = Duration::ZERO;
-        self.started_at = None;
+        self.clock.reset(Duration::ZERO, false, Instant::now());
         self.pending_frame = None;
         self.pending_audio = None;
         self.last_presented_pts = None;
@@ -395,8 +813,11 @@ impl VideoPlaybackEngine {
 
     pub fn seek(&mut self, position: Duration) -> Result<()> {
         self.session.seek(position)?;
-        self.clock_base = position;
-        self.started_at = (self.state == PlaybackRunState::Playing).then(Instant::now);
+        self.clock.reset(
+            position,
+            self.state == PlaybackRunState::Playing,
+            Instant::now(),
+        );
         self.pending_frame = None;
         self.pending_audio = None;
         self.last_presented_pts = None;
@@ -406,10 +827,36 @@ impl VideoPlaybackEngine {
     }
 
     pub fn media_time(&self) -> Duration {
-        match (self.state, self.started_at) {
-            (PlaybackRunState::Playing, Some(started_at)) => self.clock_base + started_at.elapsed(),
-            _ => self.clock_base,
+        self.clock.media_time_at(Instant::now())
+    }
+
+    pub fn clock_snapshot(&self) -> PlaybackClockSnapshot {
+        self.clock.snapshot_at(Instant::now())
+    }
+
+    pub fn timing_config(&self) -> PlaybackTimingConfig {
+        self.timing
+    }
+
+    pub fn set_timing_config(&mut self, timing: PlaybackTimingConfig) {
+        self.timing = timing;
+    }
+
+    pub fn set_playback_rate(&mut self, rate: f64) {
+        self.clock.set_rate(rate, Instant::now());
+    }
+
+    pub fn sync_to_audio_clock(&mut self, snapshot: AudioClockSnapshot) -> Option<ClockCorrection> {
+        if self.state != PlaybackRunState::Playing {
+            return None;
         }
+        let media_time = snapshot.media_time?;
+        Some(self.clock.discipline_to(
+            media_time,
+            Instant::now(),
+            PlaybackClockSource::Audio,
+            self.timing.audio_sync,
+        ))
     }
 
     pub fn next_audio_frame(&mut self) -> Result<Option<PcmAudioFrame>> {
@@ -426,13 +873,17 @@ impl VideoPlaybackEngine {
         };
 
         let pts = frame.pts;
-        let media_time = self.media_time();
-        if pts.is_some_and(|pts| pts > media_time + self.audio_lead_time) {
+        let now = Instant::now();
+        let media_time = self.clock.media_time_at(now);
+        if pts.is_some_and(|pts| pts > media_time + self.timing.audio_lead_time) {
             return Ok(None);
         }
 
         let frame = self.pending_audio.take().expect("pending audio exists");
         let late_by = pts.and_then(|pts| media_time.checked_sub(pts));
+        if let Some(pts) = pts {
+            self.sync_clock_to_audio(pts, now);
+        }
         Ok(Some(TimedAudioFrame {
             frame,
             pts,
@@ -445,34 +896,51 @@ impl VideoPlaybackEngine {
         if self.state != PlaybackRunState::Playing {
             return Ok(None);
         }
-        self.ensure_pending_frame()?;
-        let Some(frame) = self.pending_frame.as_ref() else {
-            return Ok(None);
-        };
+        let mut consecutive_drops = 0usize;
+        loop {
+            self.ensure_pending_frame()?;
+            let Some(frame) = self.pending_frame.as_ref() else {
+                return Ok(None);
+            };
 
-        let pts = frame.pts().and_then(|pts| pts.as_duration());
-        let should_present_first = self.last_presented_pts.is_none();
-        if should_present_first && self.waiting_for_first_frame {
-            self.clock_base = pts.unwrap_or(Duration::ZERO);
-            self.started_at = Some(Instant::now());
-            self.waiting_for_first_frame = false;
+            let pts = frame.pts().and_then(|pts| pts.as_duration());
+            let should_present_first = self.last_presented_pts.is_none();
+            if should_present_first && self.waiting_for_first_frame {
+                let now = Instant::now();
+                self.clock.sync_to(
+                    pts.unwrap_or(Duration::ZERO),
+                    now,
+                    PlaybackClockSource::Wall,
+                );
+                self.clock.play(now);
+                self.waiting_for_first_frame = false;
+            }
+
+            let media_time = self.media_time();
+            match self
+                .timing
+                .video_scheduler
+                .schedule(pts, media_time, should_present_first)
+            {
+                VideoFrameDecision::Wait { .. } => return Ok(None),
+                VideoFrameDecision::Drop { .. }
+                    if consecutive_drops < self.timing.video_scheduler.max_consecutive_drops =>
+                {
+                    let _ = self.pending_frame.take();
+                    consecutive_drops += 1;
+                }
+                decision => {
+                    let frame = self.pending_frame.take().expect("pending frame exists");
+                    self.last_presented_pts = pts;
+                    return Ok(Some(TimedVideoFrame {
+                        frame,
+                        pts,
+                        media_time,
+                        late_by: decision.late_by(),
+                    }));
+                }
+            }
         }
-
-        let media_time = self.media_time();
-        let should_present_by_time = pts.is_none_or(|pts| pts <= media_time + self.frame_lead_time);
-        if !should_present_first && !should_present_by_time {
-            return Ok(None);
-        }
-
-        let frame = self.pending_frame.take().expect("pending frame exists");
-        let late_by = pts.and_then(|pts| media_time.checked_sub(pts));
-        self.last_presented_pts = pts;
-        Ok(Some(TimedVideoFrame {
-            frame,
-            pts,
-            media_time,
-            late_by,
-        }))
     }
 
     fn ensure_pending_frame(&mut self) -> Result<()> {
@@ -483,8 +951,9 @@ impl VideoPlaybackEngine {
         if self.pending_frame.is_none() {
             self.eof = true;
             self.state = PlaybackRunState::Ended;
-            self.started_at = None;
-            self.clock_base = self.info().duration.unwrap_or_else(|| self.media_time());
+            let now = Instant::now();
+            let media_time = self.info().duration.unwrap_or_else(|| self.media_time());
+            self.clock.reset(media_time, false, now);
         }
         Ok(())
     }
@@ -495,6 +964,15 @@ impl VideoPlaybackEngine {
         }
         self.pending_audio = self.session.next_audio_frame()?;
         Ok(())
+    }
+
+    fn sync_clock_to_audio(&mut self, pts: Duration, now: Instant) {
+        if self.timing.clock_mode != PlaybackClockMode::AudioMaster {
+            return;
+        }
+        let _ =
+            self.clock
+                .discipline_to(pts, now, PlaybackClockSource::Audio, self.timing.audio_sync);
     }
 }
 
@@ -517,6 +995,39 @@ fn trim_audio_queue(frames: &mut VecDeque<PcmAudioFrame>) {
     while frames.len() > AUDIO_FRAME_QUEUE_LIMIT {
         let _ = frames.pop_front();
     }
+}
+
+fn sanitize_playback_rate(rate: f64) -> f64 {
+    if rate.is_finite() && rate > 0.0 {
+        rate
+    } else {
+        1.0
+    }
+}
+
+fn elapsed_since(anchor: Instant, now: Instant) -> Duration {
+    now.checked_duration_since(anchor).unwrap_or(Duration::ZERO)
+}
+
+fn scale_duration(duration: Duration, rate: f64) -> Duration {
+    let seconds = duration.as_secs_f64() * sanitize_playback_rate(rate);
+    if seconds.is_finite() && seconds > 0.0 {
+        Duration::from_secs_f64(seconds)
+    } else {
+        Duration::ZERO
+    }
+}
+
+fn duration_to_nanos(duration: Duration) -> i128 {
+    duration.as_nanos().min(i128::MAX as u128) as i128
+}
+
+fn nanos_to_duration(nanos: i128) -> Duration {
+    Duration::from_nanos(nanos.max(0).min(u64::MAX as i128) as u64)
+}
+
+fn add_signed_duration(base: Duration, delta_nanos: i128) -> Duration {
+    nanos_to_duration(duration_to_nanos(base).saturating_add(delta_nanos))
 }
 
 #[cfg(test)]
@@ -557,5 +1068,146 @@ mod tests {
         assert_eq!(info.selected_audio_track, Some(1));
         assert_eq!(info.video_decode_backend, Some(DecoderBackend::Software));
         assert_eq!(info.audio_output, Some(PcmFormat::default()));
+    }
+
+    #[test]
+    fn playback_clock_tracks_pause_seek_and_rate() {
+        let t0 = Instant::now();
+        let mut clock = PlaybackClock::paused_at(Duration::from_secs(10));
+
+        assert_eq!(clock.media_time_at(t0), Duration::from_secs(10));
+        clock.play(t0);
+        assert_eq!(
+            clock.media_time_at(t0 + Duration::from_millis(250)),
+            Duration::from_millis(10_250)
+        );
+
+        clock.pause(t0 + Duration::from_millis(500));
+        assert_eq!(
+            clock.media_time_at(t0 + Duration::from_secs(10)),
+            Duration::from_millis(10_500)
+        );
+
+        clock.seek(Duration::from_secs(2), t0 + Duration::from_secs(10));
+        clock.play(t0 + Duration::from_secs(10));
+        clock.set_rate(2.0, t0 + Duration::from_secs(11));
+
+        assert_eq!(
+            clock.media_time_at(t0 + Duration::from_secs(12)),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn playback_clock_disciplines_toward_audio_master() {
+        let t0 = Instant::now();
+        let mut clock = PlaybackClock::running_at(Duration::from_secs(10), t0);
+        let config = AudioSyncConfig {
+            deadband: Duration::from_millis(5),
+            max_correction_per_frame: Duration::from_millis(20),
+            snap_threshold: Duration::from_millis(250),
+            ..AudioSyncConfig::default()
+        };
+
+        let correction = clock.discipline_to(
+            Duration::from_millis(10_100),
+            t0 + Duration::from_millis(50),
+            PlaybackClockSource::Audio,
+            config,
+        );
+
+        assert_eq!(correction.source, PlaybackClockSource::Audio);
+        assert_eq!(correction.direction, ClockCorrectionDirection::Forward);
+        assert_eq!(correction.drift, Duration::from_millis(50));
+        assert_eq!(correction.applied, Duration::from_millis(20));
+        assert!(!correction.snapped);
+        assert_eq!(clock.source(), PlaybackClockSource::Audio);
+        assert_eq!(
+            clock.media_time_at(t0 + Duration::from_millis(50)),
+            Duration::from_millis(10_070)
+        );
+    }
+
+    #[test]
+    fn playback_clock_snaps_on_large_audio_drift() {
+        let t0 = Instant::now();
+        let mut clock = PlaybackClock::running_at(Duration::from_secs(10), t0);
+
+        let correction = clock.discipline_to(
+            Duration::from_secs(11),
+            t0,
+            PlaybackClockSource::Audio,
+            AudioSyncConfig::default(),
+        );
+
+        assert_eq!(correction.direction, ClockCorrectionDirection::Forward);
+        assert_eq!(correction.drift, Duration::from_secs(1));
+        assert!(correction.snapped);
+        assert_eq!(clock.media_time_at(t0), Duration::from_secs(11));
+    }
+
+    #[test]
+    fn video_frame_scheduler_waits_presents_and_drops() {
+        let scheduler =
+            VideoFrameScheduler::new(Duration::from_millis(4), Duration::from_millis(80));
+
+        assert_eq!(
+            scheduler.schedule(
+                Some(Duration::from_millis(110)),
+                Duration::from_millis(100),
+                false
+            ),
+            VideoFrameDecision::Wait {
+                early_by: Duration::from_millis(6)
+            }
+        );
+        assert_eq!(
+            scheduler.schedule(
+                Some(Duration::from_millis(98)),
+                Duration::from_millis(100),
+                false
+            ),
+            VideoFrameDecision::Present {
+                late_by: Some(Duration::from_millis(2))
+            }
+        );
+        assert_eq!(
+            scheduler.schedule(
+                Some(Duration::from_millis(10)),
+                Duration::from_millis(100),
+                false
+            ),
+            VideoFrameDecision::Drop {
+                late_by: Duration::from_millis(90)
+            }
+        );
+    }
+
+    #[test]
+    fn video_frame_scheduler_always_presents_first_frame() {
+        let scheduler = VideoFrameScheduler::new(Duration::ZERO, Duration::from_millis(1));
+
+        assert_eq!(
+            scheduler.schedule(
+                Some(Duration::from_millis(10)),
+                Duration::from_millis(100),
+                true
+            ),
+            VideoFrameDecision::Present {
+                late_by: Some(Duration::from_millis(90))
+            }
+        );
+    }
+
+    #[test]
+    fn display_sync_quantizes_frames_to_vsyncs_and_carries_error() {
+        let mut state = DisplaySyncState::default();
+        let config = DisplaySyncConfig::for_refresh_rate_hz(60.0);
+        let first = state.schedule_frame(Duration::from_secs_f64(1.0 / 24.0), config);
+        let second = state.schedule_frame(Duration::from_secs_f64(1.0 / 24.0), config);
+
+        assert_eq!(first.vsyncs + second.vsyncs, 5);
+        assert_ne!(first.vsyncs, second.vsyncs);
+        assert!(first.residual_error_nanos.signum() != second.residual_error_nanos.signum());
     }
 }

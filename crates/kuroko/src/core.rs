@@ -4,9 +4,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded, unbounded};
 use thiserror::Error;
 
+use crate::audio::AudioClockSnapshot;
 use crate::ffmpeg::{Frame, PcmAudioFrame};
 use crate::playback::{PlaybackRunState, PlaybackSessionConfig, VideoPlaybackEngine};
 
@@ -310,6 +311,7 @@ enum PlaybackCommand {
     Pause,
     Seek(Duration),
     Stop,
+    AudioClock(AudioClockSnapshot),
     Shutdown,
 }
 
@@ -489,6 +491,17 @@ impl Player {
         self.transition(PlayerState::Stopped)
     }
 
+    pub fn update_audio_clock(&self, snapshot: AudioClockSnapshot) -> Result<()> {
+        self.ensure_not_closed()?;
+        let commands = self.playback_commands()?;
+        match commands.try_send(PlaybackCommand::AudioClock(snapshot)) {
+            Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+            Err(TrySendError::Disconnected(_)) => Err(PlayerError::Playback(
+                "playback worker is not running".to_string(),
+            )),
+        }
+    }
+
     pub fn close(&self) -> Result<()> {
         self.replace_playback(None);
         self.inner.lock().expect("player mutex poisoned").media = None;
@@ -524,18 +537,20 @@ impl Player {
     }
 
     fn send_playback_command(&self, command: PlaybackCommand) -> Result<()> {
-        let commands = {
-            let inner = self.inner.lock().expect("player mutex poisoned");
-            inner
-                .playback
-                .as_ref()
-                .ok_or_else(|| PlayerError::Playback("no media is open".to_string()))?
-                .commands
-                .clone()
-        };
+        let commands = self.playback_commands()?;
         commands
             .send(command)
             .map_err(|_| PlayerError::Playback("playback worker is not running".to_string()))
+    }
+
+    fn playback_commands(&self) -> Result<Sender<PlaybackCommand>> {
+        let inner = self.inner.lock().expect("player mutex poisoned");
+        Ok(inner
+            .playback
+            .as_ref()
+            .ok_or_else(|| PlayerError::Playback("no media is open".to_string()))?
+            .commands
+            .clone())
     }
 
     fn replace_playback(&self, playback: Option<PlaybackRuntime>) {
@@ -590,6 +605,9 @@ fn run_playback_worker(
             Ok(PlaybackCommand::Stop) => {
                 engine.stop();
             }
+            Ok(PlaybackCommand::AudioClock(snapshot)) => {
+                let _ = engine.sync_to_audio_clock(snapshot);
+            }
             Ok(PlaybackCommand::Shutdown) => return,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
@@ -611,6 +629,9 @@ fn run_playback_worker(
                 }
                 PlaybackCommand::Stop => {
                     engine.stop();
+                }
+                PlaybackCommand::AudioClock(snapshot) => {
+                    let _ = engine.sync_to_audio_clock(snapshot);
                 }
                 PlaybackCommand::Shutdown => return,
             }

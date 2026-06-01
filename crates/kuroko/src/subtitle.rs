@@ -8,6 +8,17 @@ pub enum SubtitleError {
     InvalidTimestamp(String),
     #[error("invalid subtitle cue")]
     InvalidCue,
+    #[error("invalid subtitle bitmap: width={width} height={height} stride={stride} bytes={bytes}")]
+    InvalidBitmap {
+        width: u32,
+        height: u32,
+        stride: usize,
+        bytes: usize,
+    },
+    #[error("subtitle bitmap pointer is null")]
+    NullBitmap,
+    #[error("subtitle bitmap list exceeded safety limit")]
+    BitmapListTooLong,
 }
 
 pub type Result<T> = std::result::Result<T, SubtitleError>;
@@ -26,7 +37,7 @@ pub struct SubtitleCue {
     pub text: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubtitleBitmapPlane {
     pub x: i32,
     pub y: i32,
@@ -35,10 +46,524 @@ pub struct SubtitleBitmapPlane {
     pub rgba: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubtitleBitmapPlacement {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl SubtitleBitmapPlacement {
+    pub const fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    pub fn clipped_to(self, frame_width: u32, frame_height: u32) -> Option<Self> {
+        let left = self.x.max(0) as i64;
+        let top = self.y.max(0) as i64;
+        let right = (self.x as i64 + self.width as i64).min(frame_width as i64);
+        let bottom = (self.y as i64 + self.height as i64).min(frame_height as i64);
+        if right <= left || bottom <= top {
+            return None;
+        }
+        Some(Self::new(
+            left as i32,
+            top as i32,
+            (right - left) as u32,
+            (bottom - top) as u32,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtitleBitmapColorSpace {
+    Srgb,
+    Video,
+}
+
+impl Default for SubtitleBitmapColorSpace {
+    fn default() -> Self {
+        Self::Srgb
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitleAlphaBitmap {
+    pub placement: SubtitleBitmapPlacement,
+    pub stride: usize,
+    pub color_rgba: u32,
+    pub alpha: Vec<u8>,
+}
+
+impl SubtitleAlphaBitmap {
+    pub fn new(
+        placement: SubtitleBitmapPlacement,
+        stride: usize,
+        color_rgba: u32,
+        alpha: Vec<u8>,
+    ) -> Self {
+        Self {
+            placement,
+            stride: stride.max(placement.width as usize),
+            color_rgba,
+            alpha,
+        }
+    }
+
+    pub fn required_len(&self) -> usize {
+        if self.placement.height == 0 || self.placement.width == 0 {
+            return 0;
+        }
+        self.stride
+            .saturating_mul(self.placement.height.saturating_sub(1) as usize)
+            .saturating_add(self.placement.width as usize)
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.alpha.len() >= self.required_len()
+    }
+
+    pub fn to_rgba_plane(&self) -> Option<SubtitleBitmapPlane> {
+        if !self.is_valid() {
+            return None;
+        }
+        let width = self.placement.width as usize;
+        let height = self.placement.height as usize;
+        if width == 0 || height == 0 {
+            return None;
+        }
+
+        let color = AssColor::from_libass_rgba(self.color_rgba);
+        let mut rgba = vec![0u8; width * height * 4];
+        for y in 0..height {
+            let row_start = y * self.stride;
+            for x in 0..width {
+                let coverage = self.alpha[row_start + x];
+                let alpha = multiply_u8(color.alpha, coverage);
+                let pixel = &mut rgba[(y * width + x) * 4..][..4];
+                pixel.copy_from_slice(&[color.red, color.green, color.blue, alpha]);
+            }
+        }
+
+        Some(SubtitleBitmapPlane {
+            x: self.placement.x,
+            y: self.placement.y,
+            width: self.placement.width,
+            height: self.placement.height,
+            rgba,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitleBitmapSet {
+    pub pts: Duration,
+    pub frame_width: u32,
+    pub frame_height: u32,
+    pub color_space: SubtitleBitmapColorSpace,
+    pub parts: Vec<SubtitleAlphaBitmap>,
+    pub changed: bool,
+}
+
+impl SubtitleBitmapSet {
+    pub fn new(pts: Duration, frame_width: u32, frame_height: u32) -> Self {
+        Self {
+            pts,
+            frame_width,
+            frame_height,
+            color_space: SubtitleBitmapColorSpace::default(),
+            parts: Vec::new(),
+            changed: true,
+        }
+    }
+
+    pub fn with_color_space(mut self, color_space: SubtitleBitmapColorSpace) -> Self {
+        self.color_space = color_space;
+        self
+    }
+
+    pub fn with_changed(mut self, changed: bool) -> Self {
+        self.changed = changed;
+        self
+    }
+
+    pub fn push(&mut self, bitmap: SubtitleAlphaBitmap) {
+        if bitmap.placement.width > 0 && bitmap.placement.height > 0 {
+            self.parts.push(bitmap);
+        }
+    }
+
+    pub fn to_frame(&self) -> SubtitleFrame {
+        let planes = self
+            .parts
+            .iter()
+            .filter_map(SubtitleAlphaBitmap::to_rgba_plane)
+            .collect();
+        SubtitleFrame {
+            pts: self.pts,
+            planes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubtitleFrame {
     pub pts: Duration,
     pub planes: Vec<SubtitleBitmapPlane>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubtitleRenderViewport {
+    pub width: u32,
+    pub height: u32,
+    pub storage_width: u32,
+    pub storage_height: u32,
+}
+
+impl SubtitleRenderViewport {
+    pub fn new(width: u32, height: u32) -> Self {
+        let width = width.max(1);
+        let height = height.max(1);
+        Self {
+            width,
+            height,
+            storage_width: width,
+            storage_height: height,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubtitleRenderRequest {
+    pub pts: Duration,
+    pub viewport: SubtitleRenderViewport,
+}
+
+impl SubtitleRenderRequest {
+    pub fn new(pts: Duration, width: u32, height: u32) -> Self {
+        Self {
+            pts,
+            viewport: SubtitleRenderViewport::new(width, height),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtitleRenderBackend {
+    DebugTimeline,
+    Libass,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubtitleRenderOutput {
+    Rgba(SubtitleFrame),
+    Alpha(SubtitleBitmapSet),
+}
+
+impl SubtitleRenderOutput {
+    pub fn into_rgba_frame(self) -> SubtitleFrame {
+        match self {
+            Self::Rgba(frame) => frame,
+            Self::Alpha(bitmaps) => bitmaps.to_frame(),
+        }
+    }
+}
+
+pub trait SubtitleRenderer {
+    fn backend(&self) -> SubtitleRenderBackend;
+    fn render(&mut self, request: SubtitleRenderRequest) -> Result<SubtitleRenderOutput>;
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RawAssImage {
+    pub w: i32,
+    pub h: i32,
+    pub stride: i32,
+    pub bitmap: *const u8,
+    pub color: u32,
+    pub dst_x: i32,
+    pub dst_y: i32,
+    pub next: *const RawAssImage,
+    pub image_type: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LibassRenderConfig {
+    pub glyph_cache_limit: i32,
+    pub bitmap_cache_limit_mb: i32,
+}
+
+impl Default for LibassRenderConfig {
+    fn default() -> Self {
+        Self {
+            glyph_cache_limit: 0,
+            bitmap_cache_limit_mb: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibassRenderOperation {
+    SetFrameSize { width: u32, height: u32 },
+    SetStorageSize { width: u32, height: u32 },
+    SetCacheLimits { glyphs: i32, bitmap_mb: i32 },
+    RenderFrame { timestamp_ms: i64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibassRenderPlan {
+    pub request: SubtitleRenderRequest,
+    pub config: LibassRenderConfig,
+    pub operations: Vec<LibassRenderOperation>,
+}
+
+impl LibassRenderPlan {
+    pub fn new(request: SubtitleRenderRequest, config: LibassRenderConfig) -> Self {
+        let viewport = request.viewport;
+        Self {
+            request,
+            config,
+            operations: vec![
+                LibassRenderOperation::SetFrameSize {
+                    width: viewport.width,
+                    height: viewport.height,
+                },
+                LibassRenderOperation::SetStorageSize {
+                    width: viewport.storage_width,
+                    height: viewport.storage_height,
+                },
+                LibassRenderOperation::SetCacheLimits {
+                    glyphs: config.glyph_cache_limit,
+                    bitmap_mb: config.bitmap_cache_limit_mb,
+                },
+                LibassRenderOperation::RenderFrame {
+                    timestamp_ms: duration_to_millis_i64(request.pts),
+                },
+            ],
+        }
+    }
+}
+
+pub struct LibassImageImporter;
+
+impl LibassImageImporter {
+    pub unsafe fn import_raw_list(
+        pts: Duration,
+        frame_width: u32,
+        frame_height: u32,
+        first: *const RawAssImage,
+        changed: bool,
+    ) -> Result<SubtitleBitmapSet> {
+        let mut set = SubtitleBitmapSet::new(pts, frame_width, frame_height)
+            .with_color_space(SubtitleBitmapColorSpace::Video)
+            .with_changed(changed);
+        let mut current = first;
+        let mut count = 0usize;
+
+        while !current.is_null() {
+            if count >= RAW_ASS_IMAGE_LIST_LIMIT {
+                return Err(SubtitleError::BitmapListTooLong);
+            }
+            let image = unsafe { &*current };
+            if image.w > 0 && image.h > 0 {
+                let bitmap = unsafe { raw_ass_image_to_alpha_bitmap(image)? };
+                set.push(bitmap);
+            }
+            current = image.next;
+            count += 1;
+        }
+
+        Ok(set)
+    }
+}
+
+pub type SubtitleViewport = SubtitleRenderViewport;
+pub type SubtitleRendererBackend = SubtitleRenderBackend;
+
+impl SubtitleFrame {
+    pub fn from_ass_bitmaps<'a>(
+        pts: Duration,
+        bitmaps: impl IntoIterator<Item = &'a AssBitmapPlane>,
+    ) -> Result<Self> {
+        let mut set = SubtitleBitmapSet::new(pts, 1, 1);
+        for bitmap in bitmaps {
+            if let Some(part) = bitmap.as_alpha_bitmap()? {
+                set.push(part);
+            }
+        }
+        Ok(set.to_frame())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtitleFrameChange {
+    Changed,
+    Unchanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitleRenderResult {
+    pub backend: SubtitleRendererBackend,
+    pub change: SubtitleFrameChange,
+    pub frame: SubtitleFrame,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubtitleFrameSignature {
+    viewport: SubtitleViewport,
+    active_cues: Vec<SubtitleCue>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubtitleRendererCore {
+    timeline: SubtitleTimeline,
+    last_signature: Option<SubtitleFrameSignature>,
+}
+
+impl SubtitleRendererCore {
+    pub fn new_debug(timeline: SubtitleTimeline) -> Self {
+        Self {
+            timeline,
+            last_signature: None,
+        }
+    }
+
+    pub fn timeline(&self) -> &SubtitleTimeline {
+        &self.timeline
+    }
+
+    pub fn render(&mut self, pts: Duration, viewport: SubtitleViewport) -> SubtitleRenderResult {
+        let active_cues = self
+            .timeline
+            .active_cues(pts)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let signature = SubtitleFrameSignature {
+            viewport,
+            active_cues,
+        };
+        let change = if self.last_signature.as_ref() == Some(&signature) {
+            SubtitleFrameChange::Unchanged
+        } else {
+            SubtitleFrameChange::Changed
+        };
+        self.last_signature = Some(signature);
+        SubtitleRenderResult {
+            backend: SubtitleRenderBackend::DebugTimeline,
+            change,
+            frame: self
+                .timeline
+                .render_debug_frame(pts, viewport.width, viewport.height),
+        }
+    }
+
+    pub fn render_ass_bitmaps<'a>(
+        pts: Duration,
+        bitmaps: impl IntoIterator<Item = &'a AssBitmapPlane>,
+    ) -> Result<SubtitleRenderResult> {
+        Ok(SubtitleRenderResult {
+            backend: SubtitleRenderBackend::Libass,
+            change: SubtitleFrameChange::Changed,
+            frame: SubtitleFrame::from_ass_bitmaps(pts, bitmaps)?,
+        })
+    }
+}
+
+impl SubtitleRenderer for SubtitleRendererCore {
+    fn backend(&self) -> SubtitleRenderBackend {
+        SubtitleRenderBackend::DebugTimeline
+    }
+
+    fn render(&mut self, request: SubtitleRenderRequest) -> Result<SubtitleRenderOutput> {
+        Ok(SubtitleRenderOutput::Rgba(
+            self.render(request.pts, request.viewport).frame,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssColor {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub alpha: u8,
+}
+
+impl AssColor {
+    pub fn from_libass_rgba(color: u32) -> Self {
+        Self {
+            red: ((color >> 24) & 0xff) as u8,
+            green: ((color >> 16) & 0xff) as u8,
+            blue: ((color >> 8) & 0xff) as u8,
+            alpha: (0xff - (color & 0xff)) as u8,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssBitmapPlane {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub stride: usize,
+    pub color: u32,
+    pub alpha: Vec<u8>,
+}
+
+impl AssBitmapPlane {
+    pub fn new(
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        stride: usize,
+        color: u32,
+        alpha: Vec<u8>,
+    ) -> Result<Self> {
+        validate_ass_bitmap(width, height, stride, alpha.len())?;
+        Ok(Self {
+            x,
+            y,
+            width,
+            height,
+            stride,
+            color,
+            alpha,
+        })
+    }
+
+    pub fn to_rgba_plane(&self) -> Result<SubtitleBitmapPlane> {
+        self.as_alpha_bitmap()?
+            .and_then(|bitmap| bitmap.to_rgba_plane())
+            .ok_or_else(|| SubtitleError::InvalidBitmap {
+                width: self.width,
+                height: self.height,
+                stride: self.stride,
+                bytes: self.alpha.len(),
+            })
+    }
+
+    pub fn as_alpha_bitmap(&self) -> Result<Option<SubtitleAlphaBitmap>> {
+        validate_ass_bitmap(self.width, self.height, self.stride, self.alpha.len())?;
+        if self.width == 0 || self.height == 0 {
+            return Ok(None);
+        }
+        Ok(Some(SubtitleAlphaBitmap::new(
+            SubtitleBitmapPlacement::new(self.x, self.y, self.width, self.height),
+            self.stride,
+            self.color,
+            self.alpha.clone(),
+        )))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -240,6 +765,63 @@ fn debug_rgba_plane(width: u32, height: u32) -> Vec<u8> {
     rgba
 }
 
+fn validate_ass_bitmap(width: u32, height: u32, stride: usize, bytes: usize) -> Result<()> {
+    let width = width as usize;
+    let height = height as usize;
+    if width == 0 || height == 0 {
+        return Ok(());
+    }
+    let required = stride
+        .checked_mul(height.saturating_sub(1))
+        .and_then(|prefix| prefix.checked_add(width))
+        .unwrap_or(usize::MAX);
+    if stride < width || bytes < required {
+        return Err(SubtitleError::InvalidBitmap {
+            width: width.min(u32::MAX as usize) as u32,
+            height: height.min(u32::MAX as usize) as u32,
+            stride,
+            bytes,
+        });
+    }
+    Ok(())
+}
+
+fn multiply_u8(a: u8, b: u8) -> u8 {
+    ((a as u16 * b as u16 + 127) / 255) as u8
+}
+
+const RAW_ASS_IMAGE_LIST_LIMIT: usize = 16_384;
+
+unsafe fn raw_ass_image_to_alpha_bitmap(image: &RawAssImage) -> Result<SubtitleAlphaBitmap> {
+    if image.bitmap.is_null() {
+        return Err(SubtitleError::NullBitmap);
+    }
+    let width = image.w as u32;
+    let height = image.h as u32;
+    let stride = image.stride.max(0) as usize;
+    let required = required_bitmap_len(width, height, stride)?;
+    let alpha = unsafe { std::slice::from_raw_parts(image.bitmap, required) }.to_vec();
+    Ok(SubtitleAlphaBitmap::new(
+        SubtitleBitmapPlacement::new(image.dst_x, image.dst_y, width, height),
+        stride,
+        image.color,
+        alpha,
+    ))
+}
+
+fn required_bitmap_len(width: u32, height: u32, stride: usize) -> Result<usize> {
+    validate_ass_bitmap(width, height, stride, usize::MAX)?;
+    let height = height as usize;
+    if width == 0 || height == 0 {
+        return Ok(0);
+    }
+    Ok(stride * height.saturating_sub(1) + width as usize)
+}
+
+fn duration_to_millis_i64(value: Duration) -> i64 {
+    value.as_millis().min(i64::MAX as u128) as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,5 +864,187 @@ mod tests {
             frame.planes[0].rgba.len(),
             frame.planes[0].width as usize * frame.planes[0].height as usize * 4
         );
+    }
+
+    #[test]
+    fn ass_color_decodes_libass_inverse_alpha() {
+        assert_eq!(
+            AssColor::from_libass_rgba(0x11223300),
+            AssColor {
+                red: 0x11,
+                green: 0x22,
+                blue: 0x33,
+                alpha: 0xff,
+            }
+        );
+        assert_eq!(AssColor::from_libass_rgba(0x112233ff).alpha, 0);
+    }
+
+    #[test]
+    fn ass_bitmap_plane_expands_alpha_mask_to_straight_rgba() {
+        let bitmap =
+            AssBitmapPlane::new(3, 4, 2, 2, 4, 0x20406080, vec![0, 255, 9, 9, 128, 64]).unwrap();
+
+        let plane = bitmap.to_rgba_plane().unwrap();
+
+        assert_eq!(plane.x, 3);
+        assert_eq!(plane.y, 4);
+        assert_eq!(plane.width, 2);
+        assert_eq!(plane.height, 2);
+        assert_eq!(
+            plane.rgba,
+            vec![
+                0x20, 0x40, 0x60, 0, 0x20, 0x40, 0x60, 127, 0x20, 0x40, 0x60, 64, 0x20, 0x40, 0x60,
+                32,
+            ]
+        );
+    }
+
+    #[test]
+    fn subtitle_alpha_bitmap_expands_libass_color_and_coverage() {
+        let bitmap = SubtitleAlphaBitmap::new(
+            SubtitleBitmapPlacement::new(2, 3, 2, 1),
+            2,
+            0x12345680,
+            vec![255, 128],
+        );
+
+        let plane = bitmap.to_rgba_plane().unwrap();
+
+        assert_eq!(plane.x, 2);
+        assert_eq!(plane.y, 3);
+        assert_eq!(
+            plane.rgba,
+            vec![0x12, 0x34, 0x56, 127, 0x12, 0x34, 0x56, 64]
+        );
+    }
+
+    #[test]
+    fn subtitle_bitmap_set_converts_alpha_parts_to_rgba_frame() {
+        let mut set = SubtitleBitmapSet::new(Duration::from_secs(7), 640, 360)
+            .with_color_space(SubtitleBitmapColorSpace::Video)
+            .with_changed(false);
+        set.push(SubtitleAlphaBitmap::new(
+            SubtitleBitmapPlacement::new(0, 0, 1, 1),
+            1,
+            0x00ff0000,
+            vec![255],
+        ));
+
+        let frame = SubtitleRenderOutput::Alpha(set).into_rgba_frame();
+
+        assert_eq!(frame.pts, Duration::from_secs(7));
+        assert_eq!(frame.planes.len(), 1);
+        assert_eq!(frame.planes[0].rgba, vec![0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn ass_bitmap_validation_accepts_unpadded_last_row() {
+        let bitmap = AssBitmapPlane::new(0, 0, 3, 2, 8, 0xffffff00, vec![0; 11]).unwrap();
+
+        assert_eq!(bitmap.to_rgba_plane().unwrap().rgba.len(), 24);
+    }
+
+    #[test]
+    fn ass_bitmap_validation_rejects_short_alpha_buffer() {
+        let error = AssBitmapPlane::new(0, 0, 3, 2, 8, 0xffffff00, vec![0; 10]).unwrap_err();
+
+        assert!(matches!(error, SubtitleError::InvalidBitmap { .. }));
+    }
+
+    #[test]
+    fn subtitle_renderer_core_reports_unchanged_timeline_frame() {
+        let timeline = SubtitleTimeline::new(vec![SubtitleCue {
+            start: Duration::from_secs(1),
+            end: Duration::from_secs(3),
+            text: "Hello".to_string(),
+        }]);
+        let mut renderer = SubtitleRendererCore::new_debug(timeline);
+        let viewport = SubtitleViewport::new(640, 360);
+
+        let first = renderer.render(Duration::from_secs(2), viewport);
+        let second = renderer.render(Duration::from_millis(2500), viewport);
+
+        assert_eq!(first.change, SubtitleFrameChange::Changed);
+        assert_eq!(second.change, SubtitleFrameChange::Unchanged);
+        assert_eq!(second.frame.planes.len(), 1);
+    }
+
+    #[test]
+    fn subtitle_renderer_core_converts_ass_bitmaps() {
+        let bitmap = AssBitmapPlane::new(0, 0, 1, 1, 1, 0xff000000, vec![255]).unwrap();
+        let result =
+            SubtitleRendererCore::render_ass_bitmaps(Duration::from_secs(1), [&bitmap]).unwrap();
+
+        assert_eq!(result.backend, SubtitleRendererBackend::Libass);
+        assert_eq!(result.frame.planes.len(), 1);
+        assert_eq!(result.frame.planes[0].rgba, vec![255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn libass_render_plan_keeps_renderer_operation_order() {
+        let request = SubtitleRenderRequest {
+            pts: Duration::from_millis(1234),
+            viewport: SubtitleRenderViewport {
+                width: 1920,
+                height: 1080,
+                storage_width: 3840,
+                storage_height: 2160,
+            },
+        };
+        let plan = LibassRenderPlan::new(
+            request,
+            LibassRenderConfig {
+                glyph_cache_limit: 128,
+                bitmap_cache_limit_mb: 32,
+            },
+        );
+
+        assert_eq!(
+            plan.operations,
+            vec![
+                LibassRenderOperation::SetFrameSize {
+                    width: 1920,
+                    height: 1080,
+                },
+                LibassRenderOperation::SetStorageSize {
+                    width: 3840,
+                    height: 2160,
+                },
+                LibassRenderOperation::SetCacheLimits {
+                    glyphs: 128,
+                    bitmap_mb: 32,
+                },
+                LibassRenderOperation::RenderFrame { timestamp_ms: 1234 },
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_ass_image_list_imports_alpha_bitmaps() {
+        let alpha = [255u8, 128, 64, 0];
+        let image = RawAssImage {
+            w: 2,
+            h: 2,
+            stride: 2,
+            bitmap: alpha.as_ptr(),
+            color: 0x80402000,
+            dst_x: 10,
+            dst_y: 20,
+            next: std::ptr::null(),
+            image_type: 0,
+        };
+
+        let set = unsafe {
+            LibassImageImporter::import_raw_list(Duration::from_secs(1), 1920, 1080, &image, true)
+        }
+        .unwrap();
+
+        assert_eq!(set.parts.len(), 1);
+        let plane = set.to_frame().planes.remove(0);
+        assert_eq!(plane.x, 10);
+        assert_eq!(plane.y, 20);
+        assert_eq!(plane.rgba[0..4], [0x80, 0x40, 0x20, 255]);
+        assert_eq!(plane.rgba[4..8], [0x80, 0x40, 0x20, 128]);
     }
 }

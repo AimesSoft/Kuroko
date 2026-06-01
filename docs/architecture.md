@@ -109,17 +109,28 @@ returns owned decoded video frames, and returns f32 PCM audio blocks. `Player::o
 session and emits real duration, track, and video parameter events instead of only changing state.
 
 `VideoPlaybackEngine` adds the first clocked playback loop. It drives both video and audio ticks,
-with play, pause, stop, seek, media time, pending frames, EOF state, and PTS-based scheduling. The
-clock aligns to the first frame after decode preroll, so initial hardware decoder warmup does not
-make the early frames appear permanently late. A later audio-master clock can replace this early
-video-clock scheduling without changing the `Player` API.
+with play, pause, stop, seek, media time, pending frames, EOF state, and PTS-based scheduling.
+`PlaybackClock` owns the media-time anchor, playback rate, and master-clock source, while
+`VideoFrameScheduler` owns the present/wait/drop decision for decoded video frames. The first
+audio-master path disciplines the media clock toward decoded audio PTS with deadband, bounded
+per-frame correction, and large-drift snap behavior. `AudioRingBuffer` now tracks the PTS of queued
+PCM samples and exposes an `AudioClockSnapshot`; the macOS presenter feeds CoreAudio output snapshots
+back to the player worker through a non-blocking command so the playback clock can be disciplined by
+the actual output queue. `DisplaySyncState` provides the first pure Rust vsync quantizer that carries
+residual frame-duration error across frames.
 
 ## Overlay Foundation
 
 `kuroko::subtitle` owns early SRT/WebVTT/ASS timeline parsing and can produce debug RGBA
-subtitle planes. `kuroko::danmaku` owns Bilibili XML/JSON-lines parsing, timeline windows, lane
-placement, and collision-aware layout boxes. `kuroko::overlay::OverlayTimeline` combines those
-outputs for a timestamp and viewport without routing overlay content through Flutter.
+subtitle planes. `SubtitleRendererCore` is the first renderer-facing subtitle boundary: the current
+debug timeline path reports changed/unchanged frames, and the libass-facing bitmap model accepts
+ASS alpha planes plus RGBA/inverse-alpha color before converting them into Kuroko straight-RGBA
+overlay planes. `LibassRenderPlan` records the renderer operation order used by mature ASS paths
+(`set_frame_size`, `set_storage_size`, cache limits, then `render_frame`), and `RawAssImage` mirrors
+the ABI prefix needed to import an `ASS_Image` list once the static libass link is enabled.
+`kuroko::danmaku` owns Bilibili XML/JSON-lines parsing, timeline windows, lane placement, and
+collision-aware layout boxes. `kuroko::overlay::OverlayTimeline` combines those outputs for a
+timestamp and viewport without routing overlay content through Flutter.
 
 `MetalRenderer::render_video_frame_with_overlay()` now uploads subtitle RGBA planes into Metal
 textures and alpha-blends them over the current video drawable. Danmaku layout boxes are still

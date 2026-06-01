@@ -1,7 +1,9 @@
 use std::time::Duration;
 
 use crate::danmaku::{DanmakuLayoutBox, DanmakuLayoutConfig, DanmakuTimeline};
-use crate::subtitle::{SubtitleBitmapPlane, SubtitleFrame, SubtitleTimeline};
+use crate::subtitle::{
+    SubtitleBitmapPlane, SubtitleFrame, SubtitleRendererCore, SubtitleTimeline, SubtitleViewport,
+};
 use crate::text::TextShaper;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +37,7 @@ impl OverlayFrame {
 
 #[derive(Debug, Clone)]
 pub struct OverlayTimeline {
-    subtitles: Option<SubtitleTimeline>,
+    subtitles: Option<SubtitleRendererCore>,
     danmaku: Option<DanmakuTimeline>,
     shaper: TextShaper,
     danmaku_config: DanmakuLayoutConfig,
@@ -52,7 +54,7 @@ impl OverlayTimeline {
     }
 
     pub fn with_subtitles(mut self, subtitles: SubtitleTimeline) -> Self {
-        self.subtitles = Some(subtitles);
+        self.subtitles = Some(SubtitleRendererCore::new_debug(subtitles));
         self
     }
 
@@ -65,11 +67,11 @@ impl OverlayTimeline {
         self.danmaku_config = config;
     }
 
-    pub fn render(&self, pts: Duration, viewport: OverlayViewport) -> OverlayFrame {
+    pub fn render(&mut self, pts: Duration, viewport: OverlayViewport) -> OverlayFrame {
         let subtitle_planes = self
             .subtitles
-            .as_ref()
-            .map(|timeline| subtitle_frame(timeline, pts, viewport).planes)
+            .as_mut()
+            .map(|renderer| subtitle_frame(renderer, pts, viewport).planes)
             .unwrap_or_default();
 
         let danmaku_boxes = self
@@ -99,11 +101,13 @@ impl Default for OverlayTimeline {
 }
 
 fn subtitle_frame(
-    timeline: &SubtitleTimeline,
+    renderer: &mut SubtitleRendererCore,
     pts: Duration,
     viewport: OverlayViewport,
 ) -> SubtitleFrame {
-    timeline.render_debug_frame(pts, viewport.width, viewport.height)
+    renderer
+        .render(pts, SubtitleViewport::new(viewport.width, viewport.height))
+        .frame
 }
 
 #[cfg(test)]
@@ -129,10 +133,10 @@ mod tests {
             color_rgba: [1.0, 1.0, 1.0, 1.0],
         });
 
-        let frame = OverlayTimeline::default()
+        let mut timeline = OverlayTimeline::default()
             .with_subtitles(subtitles)
-            .with_danmaku(danmaku)
-            .render(Duration::from_secs(2), OverlayViewport::new(640, 360));
+            .with_danmaku(danmaku);
+        let frame = timeline.render(Duration::from_secs(2), OverlayViewport::new(640, 360));
 
         assert!(!frame.is_empty());
         assert_eq!(frame.subtitle_planes.len(), 1);
