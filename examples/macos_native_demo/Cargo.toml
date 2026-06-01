@@ -12,5 +12,9 @@ build = "build.rs"
 crossbeam-channel.workspace = true
 kuroko = { path = "../../crates/kuroko" }
 
+[features]
+default = []
+libass = ["kuroko/libass"]
+
 [build-dependencies]
 cc = "1.2.47"

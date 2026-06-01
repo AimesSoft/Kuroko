@@ -1,8 +1,16 @@
+#[cfg(feature = "libass")]
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::danmaku::{DanmakuLayoutBox, DanmakuLayoutConfig, DanmakuTimeline};
+#[cfg(feature = "libass")]
 use crate::subtitle::{
-    SubtitleBitmapPlane, SubtitleFrame, SubtitleRendererCore, SubtitleTimeline, SubtitleViewport,
+    LibassRenderConfig, LibassSubtitleRenderer, SubtitleError, SubtitleRenderOutput,
+    SubtitleRenderRequest, SubtitleRenderer,
+};
+use crate::subtitle::{
+    Result as SubtitleResult, SubtitleBitmapPlane, SubtitleFrame, SubtitleRendererCore,
+    SubtitleTimeline, SubtitleViewport,
 };
 use crate::text::TextShaper;
 
@@ -37,10 +45,44 @@ impl OverlayFrame {
 
 #[derive(Debug, Clone)]
 pub struct OverlayTimeline {
-    subtitles: Option<SubtitleRendererCore>,
+    subtitles: Option<OverlaySubtitleRenderer>,
     danmaku: Option<DanmakuTimeline>,
     shaper: TextShaper,
     danmaku_config: DanmakuLayoutConfig,
+}
+
+#[derive(Debug, Clone)]
+enum OverlaySubtitleRenderer {
+    DebugTimeline(SubtitleRendererCore),
+    #[cfg(feature = "libass")]
+    Libass(Arc<Mutex<LibassSubtitleRenderer>>),
+}
+
+impl OverlaySubtitleRenderer {
+    fn render(
+        &mut self,
+        pts: Duration,
+        viewport: OverlayViewport,
+    ) -> SubtitleResult<SubtitleFrame> {
+        match self {
+            Self::DebugTimeline(renderer) => Ok(renderer
+                .render(pts, SubtitleViewport::new(viewport.width, viewport.height))
+                .frame),
+            #[cfg(feature = "libass")]
+            Self::Libass(renderer) => {
+                let mut renderer = renderer
+                    .lock()
+                    .map_err(|_| SubtitleError::Libass("renderer lock poisoned".to_string()))?;
+                renderer
+                    .render(SubtitleRenderRequest::new(
+                        pts,
+                        viewport.width,
+                        viewport.height,
+                    ))
+                    .map(SubtitleRenderOutput::into_rgba_frame)
+            }
+        }
+    }
 }
 
 impl OverlayTimeline {
@@ -54,7 +96,29 @@ impl OverlayTimeline {
     }
 
     pub fn with_subtitles(mut self, subtitles: SubtitleTimeline) -> Self {
-        self.subtitles = Some(SubtitleRendererCore::new_debug(subtitles));
+        self.subtitles = Some(OverlaySubtitleRenderer::DebugTimeline(
+            SubtitleRendererCore::new_debug(subtitles),
+        ));
+        self
+    }
+
+    #[cfg(feature = "libass")]
+    pub fn with_ass_subtitles(
+        mut self,
+        script: impl AsRef<[u8]>,
+        config: LibassRenderConfig,
+    ) -> SubtitleResult<Self> {
+        self.subtitles = Some(OverlaySubtitleRenderer::Libass(Arc::new(Mutex::new(
+            LibassSubtitleRenderer::from_ass_script(script, config)?,
+        ))));
+        Ok(self)
+    }
+
+    #[cfg(feature = "libass")]
+    pub fn with_libass_renderer(mut self, renderer: LibassSubtitleRenderer) -> Self {
+        self.subtitles = Some(OverlaySubtitleRenderer::Libass(Arc::new(Mutex::new(
+            renderer,
+        ))));
         self
     }
 
@@ -71,7 +135,13 @@ impl OverlayTimeline {
         let subtitle_planes = self
             .subtitles
             .as_mut()
-            .map(|renderer| subtitle_frame(renderer, pts, viewport).planes)
+            .and_then(|renderer| match renderer.render(pts, viewport) {
+                Ok(frame) => Some(frame.planes),
+                Err(error) => {
+                    eprintln!("Kuroko overlay subtitle render failed: {error}");
+                    None
+                }
+            })
             .unwrap_or_default();
 
         let danmaku_boxes = self
@@ -100,21 +170,26 @@ impl Default for OverlayTimeline {
     }
 }
 
-fn subtitle_frame(
-    renderer: &mut SubtitleRendererCore,
-    pts: Duration,
-    viewport: OverlayViewport,
-) -> SubtitleFrame {
-    renderer
-        .render(pts, SubtitleViewport::new(viewport.width, viewport.height))
-        .frame
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::danmaku::{DanmakuItem, DanmakuMode};
     use crate::subtitle::{SubtitleCue, SubtitleTimeline};
+
+    #[cfg(feature = "libass")]
+    const SIMPLE_ASS_SCRIPT: &str = r#"[Script Info]
+ScriptType: v4.00+
+PlayResX: 640
+PlayResY: 360
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,32,&H00FFFFFF,&H000000FF,&H80000000,&H80000000,0,0,0,0,100,100,0,0,1,2,0,2,20,20,24,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,Overlay libass
+"#;
 
     #[test]
     fn overlay_timeline_combines_subtitles_and_danmaku() {
@@ -142,5 +217,25 @@ mod tests {
         assert_eq!(frame.subtitle_planes.len(), 1);
         assert_eq!(frame.danmaku_boxes.len(), 1);
         assert_eq!(frame.danmaku_boxes[0].item_id, 7);
+    }
+
+    #[cfg(feature = "libass")]
+    #[test]
+    fn overlay_timeline_renders_libass_subtitles() {
+        let mut timeline = OverlayTimeline::default()
+            .with_ass_subtitles(SIMPLE_ASS_SCRIPT, LibassRenderConfig::default())
+            .unwrap();
+
+        let frame = timeline.render(Duration::from_millis(500), OverlayViewport::new(640, 360));
+
+        assert_eq!(frame.pts, Duration::from_millis(500));
+        assert_eq!(frame.viewport, OverlayViewport::new(640, 360));
+        assert!(!frame.subtitle_planes.is_empty());
+        assert!(frame.danmaku_boxes.is_empty());
+        assert!(
+            frame.subtitle_planes.iter().all(|plane| {
+                plane.rgba.len() == plane.width as usize * plane.height as usize * 4
+            })
+        );
     }
 }

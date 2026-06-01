@@ -123,14 +123,15 @@ residual frame-duration error across frames.
 
 `kuroko::subtitle` owns early SRT/WebVTT/ASS timeline parsing and can produce debug RGBA
 subtitle planes. `SubtitleRendererCore` is the first renderer-facing subtitle boundary: the current
-debug timeline path reports changed/unchanged frames, and the libass-facing bitmap model accepts
-ASS alpha planes plus RGBA/inverse-alpha color before converting them into Kuroko straight-RGBA
-overlay planes. `LibassRenderPlan` records the renderer operation order used by mature ASS paths
-(`set_frame_size`, `set_storage_size`, cache limits, then `render_frame`), and `RawAssImage` mirrors
-the ABI prefix needed to import an `ASS_Image` list once the static libass link is enabled.
+debug timeline path reports changed/unchanged frames, and the feature-gated libass renderer accepts
+ASS scripts, calls `ass_render_frame`, and imports libass alpha planes plus RGBA/inverse-alpha color
+into Kuroko straight-RGBA overlay planes. `LibassRenderPlan` records the renderer operation order
+used by mature ASS paths (`set_frame_size`, `set_storage_size`, cache limits, then `render_frame`),
+and `RawAssImage` mirrors the ABI prefix needed to import an `ASS_Image` list.
 `kuroko::danmaku` owns Bilibili XML/JSON-lines parsing, timeline windows, lane placement, and
-collision-aware layout boxes. `kuroko::overlay::OverlayTimeline` combines those outputs for a
-timestamp and viewport without routing overlay content through Flutter.
+collision-aware layout boxes. `kuroko::overlay::OverlayTimeline` combines debug subtitles or
+libass-backed subtitles with danmaku for a timestamp and viewport without routing overlay content
+through Flutter.
 
 `MetalRenderer::render_video_frame_with_overlay()` now uploads subtitle RGBA planes into Metal
 textures and alpha-blends them over the current video drawable. Danmaku layout boxes are still
