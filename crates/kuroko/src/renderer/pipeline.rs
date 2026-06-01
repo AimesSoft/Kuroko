@@ -1,5 +1,62 @@
 use crate::core::{ColorPrimaries, TransferFunction};
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HdrMetadata {
+    pub mastering_display: Option<MasteringDisplayMetadata>,
+    pub content_light: Option<ContentLightMetadata>,
+}
+
+impl HdrMetadata {
+    pub fn new(
+        mastering_display: Option<MasteringDisplayMetadata>,
+        content_light: Option<ContentLightMetadata>,
+    ) -> Self {
+        Self {
+            mastering_display,
+            content_light,
+        }
+    }
+
+    pub fn nominal_peak_nits(self) -> Option<f32> {
+        self.content_light
+            .and_then(|metadata| metadata.max_content_light_level_nits())
+            .or_else(|| {
+                self.mastering_display
+                    .and_then(|metadata| metadata.max_luminance_nits())
+            })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MasteringDisplayMetadata {
+    pub display_primaries: Option<[Chromaticity; 3]>,
+    pub white_point: Option<Chromaticity>,
+    pub min_luminance_nits: Option<f32>,
+    pub max_luminance_nits: Option<f32>,
+}
+
+impl MasteringDisplayMetadata {
+    pub fn max_luminance_nits(self) -> Option<f32> {
+        self.max_luminance_nits
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContentLightMetadata {
+    pub max_content_light_level_nits: u32,
+    pub max_frame_average_light_level_nits: u32,
+}
+
+impl ContentLightMetadata {
+    pub fn max_content_light_level_nits(self) -> Option<f32> {
+        if self.max_content_light_level_nits == 0 {
+            None
+        } else {
+            Some(self.max_content_light_level_nits as f32)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorRange {
     Unspecified,
@@ -282,6 +339,7 @@ pub struct SourceColorState {
     pub transfer: TransferFunction,
     pub matrix: MatrixCoefficients,
     pub range: ColorRange,
+    pub hdr_metadata: Option<HdrMetadata>,
     pub nominal_peak_nits: f32,
     pub reference_white_nits: f32,
 }
@@ -293,6 +351,7 @@ impl SourceColorState {
             transfer,
             matrix: MatrixCoefficients::default(),
             range: ColorRange::default(),
+            hdr_metadata: None,
             nominal_peak_nits: nominal_peak_for_transfer(transfer),
             reference_white_nits: 203.0,
         }
@@ -310,6 +369,14 @@ impl SourceColorState {
 
     pub fn nominal_peak_nits(mut self, peak: f32) -> Self {
         self.nominal_peak_nits = peak.max(1.0);
+        self
+    }
+
+    pub fn hdr_metadata(mut self, metadata: Option<HdrMetadata>) -> Self {
+        if let Some(peak) = metadata.and_then(HdrMetadata::nominal_peak_nits) {
+            self.nominal_peak_nits = peak.max(1.0);
+        }
+        self.hdr_metadata = metadata;
         self
     }
 
@@ -629,6 +696,51 @@ mod tests {
             ColorRange::Full.resolve(ColorRange::Limited),
             ColorRange::Full
         );
+    }
+
+    #[test]
+    fn hdr_metadata_prefers_content_light_peak() {
+        let metadata = HdrMetadata::new(
+            Some(MasteringDisplayMetadata {
+                display_primaries: None,
+                white_point: None,
+                min_luminance_nits: Some(0.005),
+                max_luminance_nits: Some(1000.0),
+            }),
+            Some(ContentLightMetadata {
+                max_content_light_level_nits: 4000,
+                max_frame_average_light_level_nits: 450,
+            }),
+        );
+
+        let source = SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq)
+            .hdr_metadata(Some(metadata));
+
+        assert_eq!(metadata.nominal_peak_nits(), Some(4000.0));
+        assert_eq!(source.nominal_peak_nits, 4000.0);
+        assert_eq!(source.hdr_metadata, Some(metadata));
+    }
+
+    #[test]
+    fn hdr_metadata_falls_back_to_mastering_peak_when_max_cll_is_missing() {
+        let metadata = HdrMetadata::new(
+            Some(MasteringDisplayMetadata {
+                display_primaries: None,
+                white_point: None,
+                min_luminance_nits: Some(0.005),
+                max_luminance_nits: Some(1000.0),
+            }),
+            Some(ContentLightMetadata {
+                max_content_light_level_nits: 0,
+                max_frame_average_light_level_nits: 450,
+            }),
+        );
+
+        let source = SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq)
+            .hdr_metadata(Some(metadata));
+
+        assert_eq!(metadata.nominal_peak_nits(), Some(1000.0));
+        assert_eq!(source.nominal_peak_nits, 1000.0);
     }
 
     #[test]

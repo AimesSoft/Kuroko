@@ -250,6 +250,7 @@ fn import_video_frame(renderer: &mut MetalRenderer, frame: &Frame) -> Result<Imp
         frame.transfer_function(),
         frame.color_range(),
         frame.matrix_coefficients(),
+        frame.hdr_metadata(),
     );
     Ok(imported)
 }

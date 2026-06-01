@@ -1,12 +1,20 @@
 use kuroko::renderer::pipeline::{
-    ColorRange, MatrixCoefficients, SourceColorState, TargetColorState, VideoRenderPipeline,
+    ColorRange, ContentLightMetadata, HdrMetadata, MatrixCoefficients, SourceColorState,
+    TargetColorState, VideoRenderPipeline,
 };
 use kuroko::{ColorPrimaries, TransferFunction};
 
 fn main() {
     let source = SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq)
         .range(ColorRange::Limited)
-        .matrix(MatrixCoefficients::Bt2020NonConstantLuminance);
+        .matrix(MatrixCoefficients::Bt2020NonConstantLuminance)
+        .hdr_metadata(Some(HdrMetadata::new(
+            None,
+            Some(ContentLightMetadata {
+                max_content_light_level_nits: 4000,
+                max_frame_average_light_level_nits: 450,
+            }),
+        )));
     let target = TargetColorState::sdr(ColorPrimaries::Bt709);
     let pipeline = VideoRenderPipeline::new(source, target);
 
@@ -24,6 +32,7 @@ fn main() {
     );
     println!("source transfer: {:?}", pipeline.source.transfer);
     println!("target transfer: {:?}", pipeline.target.transfer);
+    println!("source peak nits: {:.1}", pipeline.source.nominal_peak_nits);
     println!(
         "requires gamut mapping: {}",
         pipeline.requires_gamut_mapping()

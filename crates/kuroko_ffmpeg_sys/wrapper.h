@@ -4,6 +4,7 @@
 #include <libavutil/avutil.h>
 #include <libavutil/dict.h>
 #include <libavutil/error.h>
+#include <libavutil/mastering_display_metadata.h>
 #include <libavutil/mem.h>
 #include <libavutil/pixdesc.h>
 #include <libswresample/swresample.h>

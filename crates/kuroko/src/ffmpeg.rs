@@ -1,13 +1,17 @@
 use std::collections::BTreeSet;
 use std::ffi::{CStr, CString, c_int, c_void};
 use std::marker::PhantomData;
+use std::mem;
 use std::path::Path;
 use std::ptr;
 use std::slice;
 use std::time::Duration;
 
 use crate::core::{ColorPrimaries, TrackInfo, TrackKind, TransferFunction, VideoParams};
-use crate::renderer::pipeline::{ColorRange, MatrixCoefficients};
+use crate::renderer::pipeline::{
+    Chromaticity, ColorRange, ContentLightMetadata, HdrMetadata, MasteringDisplayMetadata,
+    MatrixCoefficients,
+};
 use crate::source::{ByteRange, MediaSource};
 use kuroko_ffmpeg_sys as sys;
 use libc::{EAGAIN, EINVAL, EIO, ESPIPE, SEEK_CUR, SEEK_END, SEEK_SET};
@@ -716,19 +720,20 @@ impl Frame {
         unsafe { matrix_coefficients((*self.ptr).colorspace) }
     }
 
+    pub fn hdr_metadata(&self) -> Option<HdrMetadata> {
+        unsafe { frame_hdr_metadata(self.ptr) }
+    }
+
     pub fn transfer_to_system_memory(&self) -> Result<Frame> {
         let frame = Frame::alloc(self.time_base)?;
         check(
             unsafe { sys::av_hwframe_transfer_data(frame.ptr, self.ptr, 0) },
             "av_hwframe_transfer_data",
         )?;
-        unsafe {
-            (*frame.ptr).pts = (*self.ptr).pts;
-            (*frame.ptr).color_primaries = (*self.ptr).color_primaries;
-            (*frame.ptr).color_trc = (*self.ptr).color_trc;
-            (*frame.ptr).color_range = (*self.ptr).color_range;
-            (*frame.ptr).colorspace = (*self.ptr).colorspace;
-        }
+        check(
+            unsafe { sys::av_frame_copy_props(frame.ptr, self.ptr) },
+            "av_frame_copy_props",
+        )?;
         Ok(frame)
     }
 }
@@ -1437,6 +1442,116 @@ unsafe fn matrix_coefficients(value: sys::AVColorSpace) -> MatrixCoefficients {
     }
 }
 
+unsafe fn frame_hdr_metadata(frame: *const sys::AVFrame) -> Option<HdrMetadata> {
+    let mastering_display = unsafe { mastering_display_metadata(frame) };
+    let content_light = unsafe { content_light_metadata(frame) };
+    if mastering_display.is_none() && content_light.is_none() {
+        return None;
+    }
+    Some(HdrMetadata::new(mastering_display, content_light))
+}
+
+unsafe fn mastering_display_metadata(
+    frame: *const sys::AVFrame,
+) -> Option<MasteringDisplayMetadata> {
+    let metadata = unsafe {
+        read_frame_side_data::<sys::AVMasteringDisplayMetadata>(
+            frame,
+            sys::AVFrameSideDataType_AV_FRAME_DATA_MASTERING_DISPLAY_METADATA,
+        )
+    }?;
+
+    let has_primaries = metadata.has_primaries != 0;
+    let has_luminance = metadata.has_luminance != 0;
+    let display_primaries = has_primaries
+        .then(|| {
+            Some([
+                rational_chromaticity(metadata.display_primaries[0])?,
+                rational_chromaticity(metadata.display_primaries[1])?,
+                rational_chromaticity(metadata.display_primaries[2])?,
+            ])
+        })
+        .flatten();
+    let white_point = has_primaries
+        .then(|| rational_chromaticity(metadata.white_point))
+        .flatten();
+    let min_luminance_nits = has_luminance
+        .then(|| rational_to_positive_f32(metadata.min_luminance))
+        .flatten();
+    let max_luminance_nits = has_luminance
+        .then(|| rational_to_positive_f32(metadata.max_luminance))
+        .flatten();
+
+    if display_primaries.is_none()
+        && white_point.is_none()
+        && min_luminance_nits.is_none()
+        && max_luminance_nits.is_none()
+    {
+        return None;
+    }
+
+    Some(MasteringDisplayMetadata {
+        display_primaries,
+        white_point,
+        min_luminance_nits,
+        max_luminance_nits,
+    })
+}
+
+unsafe fn content_light_metadata(frame: *const sys::AVFrame) -> Option<ContentLightMetadata> {
+    let metadata = unsafe {
+        read_frame_side_data::<sys::AVContentLightMetadata>(
+            frame,
+            sys::AVFrameSideDataType_AV_FRAME_DATA_CONTENT_LIGHT_LEVEL,
+        )
+    }?;
+    if metadata.MaxCLL == 0 && metadata.MaxFALL == 0 {
+        return None;
+    }
+    Some(ContentLightMetadata {
+        max_content_light_level_nits: metadata.MaxCLL,
+        max_frame_average_light_level_nits: metadata.MaxFALL,
+    })
+}
+
+unsafe fn read_frame_side_data<T: Copy>(
+    frame: *const sys::AVFrame,
+    side_data_type: sys::AVFrameSideDataType,
+) -> Option<T> {
+    if frame.is_null() {
+        return None;
+    }
+    let side_data = unsafe { sys::av_frame_get_side_data(frame, side_data_type) };
+    if side_data.is_null() {
+        return None;
+    }
+    let data = unsafe { (*side_data).data };
+    let size = unsafe { (*side_data).size };
+    if data.is_null() || size < mem::size_of::<T>() {
+        return None;
+    }
+    Some(unsafe { ptr::read_unaligned(data.cast::<T>()) })
+}
+
+fn rational_chromaticity(values: [sys::AVRational; 2]) -> Option<Chromaticity> {
+    Some(Chromaticity::new(
+        rational_to_positive_f32(values[0])?,
+        rational_to_positive_f32(values[1])?,
+    ))
+}
+
+fn rational_to_positive_f32(value: sys::AVRational) -> Option<f32> {
+    if value.den == 0 {
+        return None;
+    }
+    let value = value.num as f32 / value.den as f32;
+    if value.is_finite() && value > 0.0 {
+        Some(value)
+    } else {
+        None
+    }
+}
+
 fn metadata_value(metadata: *mut sys::AVDictionary, key: &str) -> Option<String> {
     let key = CString::new(key).ok()?;
     unsafe {
@@ -1571,6 +1686,51 @@ mod tests {
         assert_eq!(
             unsafe { matrix_coefficients(sys::AVColorSpace_AVCOL_SPC_UNSPECIFIED) },
             MatrixCoefficients::Unspecified
+        );
+    }
+
+    #[test]
+    fn frame_reads_hdr_side_data() {
+        let frame = Frame::alloc(TimeBase { num: 1, den: 1 }).unwrap();
+        unsafe {
+            let mastering = sys::av_mastering_display_metadata_create_side_data(frame.ptr);
+            assert!(!mastering.is_null());
+            (*mastering).has_primaries = 1;
+            (*mastering).display_primaries[0] = [rational(708, 1000), rational(292, 1000)];
+            (*mastering).display_primaries[1] = [rational(170, 1000), rational(797, 1000)];
+            (*mastering).display_primaries[2] = [rational(131, 1000), rational(46, 1000)];
+            (*mastering).white_point = [rational(3127, 10000), rational(3290, 10000)];
+            (*mastering).has_luminance = 1;
+            (*mastering).min_luminance = rational(5, 1000);
+            (*mastering).max_luminance = rational(1000, 1);
+
+            let content_light = sys::av_content_light_metadata_create_side_data(frame.ptr);
+            assert!(!content_light.is_null());
+            (*content_light).MaxCLL = 4000;
+            (*content_light).MaxFALL = 450;
+        }
+
+        let metadata = frame.hdr_metadata().unwrap();
+        let mastering = metadata.mastering_display.unwrap();
+        let content_light = metadata.content_light.unwrap();
+
+        assert_eq!(metadata.nominal_peak_nits(), Some(4000.0));
+        assert_eq!(content_light.max_content_light_level_nits, 4000);
+        assert_eq!(content_light.max_frame_average_light_level_nits, 450);
+        assert_close(mastering.max_luminance_nits.unwrap(), 1000.0);
+        assert_close(mastering.min_luminance_nits.unwrap(), 0.005);
+        assert_close(mastering.display_primaries.unwrap()[0].x, 0.708);
+        assert_close(mastering.white_point.unwrap().y, 0.329);
+    }
+
+    fn rational(num: i32, den: i32) -> sys::AVRational {
+        sys::AVRational { num, den }
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 0.0001,
+            "expected {expected}, got {actual}"
         );
     }
 }

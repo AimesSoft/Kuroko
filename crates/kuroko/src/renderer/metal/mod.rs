@@ -3,7 +3,7 @@ use std::ffi::c_void;
 use crate::core::{ColorPrimaries, PlatformSurface, RendererBackend, Result, TransferFunction};
 use crate::overlay::OverlayFrame;
 use crate::renderer::pipeline::{
-    ColorRange, MatrixCoefficients, SourceColorState, VideoRenderPipeline,
+    ColorRange, HdrMetadata, MatrixCoefficients, SourceColorState, VideoRenderPipeline,
 };
 
 #[cfg(target_os = "macos")]
@@ -181,11 +181,13 @@ impl ImportedVideoFrame {
         transfer: TransferFunction,
         range: ColorRange,
         matrix: MatrixCoefficients,
+        hdr_metadata: Option<HdrMetadata>,
     ) {
         self.set_source_color(
             SourceColorState::new(primaries, transfer)
                 .range(range)
-                .matrix(matrix),
+                .matrix(matrix)
+                .hdr_metadata(hdr_metadata),
         );
     }
 }
@@ -646,10 +648,37 @@ mod tests {
             TransferFunction::Srgb,
             ColorRange::Limited,
             MatrixCoefficients::Bt709,
+            None,
         );
 
         assert_eq!(frame.source_color().range, ColorRange::Full);
         assert_eq!(frame.source_color().matrix, MatrixCoefficients::Bt709);
+    }
+
+    #[test]
+    fn imported_frame_applies_hdr_metadata_peak() {
+        let mut frame = test_imported_frame(
+            ColorRange::Limited,
+            SourceColorState::new(ColorPrimaries::Unknown, TransferFunction::Unknown),
+        );
+        let metadata = HdrMetadata::new(
+            None,
+            Some(crate::renderer::pipeline::ContentLightMetadata {
+                max_content_light_level_nits: 4000,
+                max_frame_average_light_level_nits: 450,
+            }),
+        );
+
+        frame.set_source_color_metadata(
+            ColorPrimaries::Bt2020,
+            TransferFunction::Pq,
+            ColorRange::Limited,
+            MatrixCoefficients::Bt2020NonConstantLuminance,
+            Some(metadata),
+        );
+
+        assert_eq!(frame.source_color().hdr_metadata, Some(metadata));
+        assert_eq!(frame.source_color().nominal_peak_nits, 4000.0);
     }
 
     #[test]

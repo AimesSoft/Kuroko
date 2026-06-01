@@ -115,7 +115,7 @@ fn import_first_frame(decoder: &mut kuroko::ffmpeg::Decoder, renderer: &mut Meta
 
                 let info = imported.info();
                 println!(
-                    "frame pts={} {}x{} cv={} format={:?} planes={}",
+                    "frame pts={} {}x{} cv={} format={:?} planes={} peak_nits={}",
                     frame
                         .pts()
                         .map_or("-".to_string(), |pts| format!("{:.6}", pts.seconds())),
@@ -124,7 +124,31 @@ fn import_first_frame(decoder: &mut kuroko::ffmpeg::Decoder, renderer: &mut Meta
                     info.pixel_format_fourcc,
                     info.format,
                     imported.plane_count(),
+                    frame
+                        .hdr_metadata()
+                        .and_then(|metadata| metadata.nominal_peak_nits())
+                        .map_or("-".to_string(), |peak| format!("{peak:.0}")),
                 );
+                if let Some(metadata) = frame.hdr_metadata() {
+                    if let Some(mastering) = metadata.mastering_display {
+                        println!(
+                            "  mastering: min={} max={}",
+                            mastering
+                                .min_luminance_nits
+                                .map_or("-".to_string(), |value| format!("{value:.4}")),
+                            mastering
+                                .max_luminance_nits
+                                .map_or("-".to_string(), |value| format!("{value:.0}")),
+                        );
+                    }
+                    if let Some(content_light) = metadata.content_light {
+                        println!(
+                            "  content light: MaxCLL={} MaxFALL={}",
+                            content_light.max_content_light_level_nits,
+                            content_light.max_frame_average_light_level_nits,
+                        );
+                    }
+                }
                 for plane in &info.planes {
                     println!(
                         "  plane {}: {}x{} metal={}",
