@@ -1,7 +1,7 @@
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
@@ -318,7 +318,7 @@ fn build_dependencies(options: DepsOptions) -> Result<()> {
     ensure_required_tools()?;
     let layout = workspace_layout(options.profile)?;
     prepare_dependency_dirs(&layout)?;
-    fetch_dependency_sources(&layout, false)?;
+    fetch_dependency_sources(&layout, options.all)?;
     build_ffmpeg(&layout, options)?;
     if options.all {
         build_text_dependencies(&layout, options)?;
@@ -525,7 +525,8 @@ fn build_fribidi(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
     fs::create_dir_all(&layout.fribidi_prefix)
         .with_context(|| format!("create {}", layout.fribidi_prefix.display()))?;
     println!("configure FriBidi");
-    run(Command::new(&meson.meson)
+    let mut setup = meson_command(&meson);
+    setup
         .arg("setup")
         .arg(&layout.fribidi_build_dir)
         .arg(&layout.fribidi_source_dir)
@@ -533,7 +534,8 @@ fn build_fribidi(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
         .arg("--default-library=static")
         .arg("--buildtype=release")
         .arg("-Ddocs=false")
-        .arg("-Dtests=false"))?;
+        .arg("-Dtests=false");
+    run(&mut setup)?;
     meson_compile_install(&meson, &layout.fribidi_build_dir, options.jobs)?;
     write_marker(
         &layout.fribidi_build_marker,
@@ -562,7 +564,7 @@ fn build_libass(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
         &layout.fribidi_prefix,
     ]);
     println!("configure libass");
-    let mut setup = Command::new(&meson.meson);
+    let mut setup = meson_command(&meson);
     setup
         .arg("setup")
         .arg(&layout.libass_build_dir)
@@ -579,7 +581,7 @@ fn build_libass(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
         .env("PKG_CONFIG_PATH", &pkg_config_path);
     run(&mut setup)?;
 
-    let mut compile = Command::new(&meson.meson);
+    let mut compile = meson_command(&meson);
     compile
         .arg("compile")
         .arg("-C")
@@ -589,11 +591,13 @@ fn build_libass(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
         compile.arg(format!("-j{jobs}"));
     }
     run(&mut compile)?;
-    run(Command::new(&meson.meson)
+    let mut install = meson_command(&meson);
+    install
         .arg("install")
         .arg("-C")
         .arg(&layout.libass_build_dir)
-        .env("PKG_CONFIG_PATH", &pkg_config_path))?;
+        .env("PKG_CONFIG_PATH", &pkg_config_path);
+    run(&mut install)?;
 
     write_marker(
         &layout.libass_build_marker,
@@ -624,12 +628,14 @@ fn cmake_build_install(build_dir: &std::path::Path, jobs: Option<usize>) -> Resu
 #[derive(Debug, Clone)]
 struct MesonTools {
     meson: PathBuf,
+    bin_dir: PathBuf,
 }
 
 fn ensure_meson_tools(layout: &WorkspaceLayout) -> Result<MesonTools> {
     if let Some(meson) = which("meson") {
         if which("ninja").is_some() {
-            return Ok(MesonTools { meson });
+            let bin_dir = meson.parent().unwrap_or(Path::new("")).to_path_buf();
+            return Ok(MesonTools { meson, bin_dir });
         }
     }
 
@@ -637,7 +643,10 @@ fn ensure_meson_tools(layout: &WorkspaceLayout) -> Result<MesonTools> {
     let meson = venv.join("bin/meson");
     let ninja = venv.join("bin/ninja");
     if meson.exists() && ninja.exists() {
-        return Ok(MesonTools { meson });
+        return Ok(MesonTools {
+            meson,
+            bin_dir: venv.join("bin"),
+        });
     }
 
     fs::create_dir_all(&layout.python_tools_dir)
@@ -652,7 +661,27 @@ fn ensure_meson_tools(layout: &WorkspaceLayout) -> Result<MesonTools> {
         .arg("pip")
         .arg("meson==1.8.5")
         .arg("ninja==1.13.0"))?;
-    Ok(MesonTools { meson })
+    Ok(MesonTools {
+        meson,
+        bin_dir: venv.join("bin"),
+    })
+}
+
+fn meson_command(meson: &MesonTools) -> Command {
+    let mut command = Command::new(&meson.meson);
+    prepend_path(&mut command, &meson.bin_dir);
+    command
+}
+
+fn prepend_path(command: &mut Command, dir: &Path) {
+    let mut paths = vec![dir.to_path_buf()];
+    if let Some(path) = env::var_os("PATH") {
+        paths.extend(env::split_paths(&path));
+    }
+    command.env(
+        "PATH",
+        env::join_paths(paths).expect("PATH entries are valid"),
+    );
 }
 
 fn meson_compile_install(
@@ -660,16 +689,15 @@ fn meson_compile_install(
     build_dir: &std::path::Path,
     jobs: Option<usize>,
 ) -> Result<()> {
-    let mut compile = Command::new(&meson.meson);
+    let mut compile = meson_command(meson);
     compile.arg("compile").arg("-C").arg(build_dir);
     if let Some(jobs) = jobs {
         compile.arg(format!("-j{jobs}"));
     }
     run(&mut compile)?;
-    run(Command::new(&meson.meson)
-        .arg("install")
-        .arg("-C")
-        .arg(build_dir))
+    let mut install = meson_command(meson);
+    install.arg("install").arg("-C").arg(build_dir);
+    run(&mut install)
 }
 
 fn clean_build_and_prefix(

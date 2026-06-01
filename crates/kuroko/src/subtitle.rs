@@ -1,3 +1,5 @@
+#[cfg(feature = "libass")]
+use std::ptr::NonNull;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -19,6 +21,8 @@ pub enum SubtitleError {
     NullBitmap,
     #[error("subtitle bitmap list exceeded safety limit")]
     BitmapListTooLong,
+    #[error("libass error: {0}")]
+    Libass(String),
 }
 
 pub type Result<T> = std::result::Result<T, SubtitleError>;
@@ -294,6 +298,64 @@ pub struct RawAssImage {
     pub image_type: i32,
 }
 
+#[cfg(feature = "libass")]
+mod libass_ffi {
+    use libc::{c_char, c_int, c_longlong, c_void, size_t};
+
+    pub type AssImageType = c_int;
+    pub type AssLibrary = c_void;
+    pub type AssRenderer = c_void;
+    pub type AssTrack = c_void;
+
+    #[repr(C)]
+    pub struct AssImage {
+        pub w: c_int,
+        pub h: c_int,
+        pub stride: c_int,
+        pub bitmap: *mut u8,
+        pub color: u32,
+        pub dst_x: c_int,
+        pub dst_y: c_int,
+        pub next: *mut AssImage,
+        pub image_type: AssImageType,
+    }
+
+    unsafe extern "C" {
+        pub fn ass_library_init() -> *mut AssLibrary;
+        pub fn ass_library_done(library: *mut AssLibrary);
+        pub fn ass_renderer_init(library: *mut AssLibrary) -> *mut AssRenderer;
+        pub fn ass_renderer_done(renderer: *mut AssRenderer);
+        pub fn ass_set_frame_size(renderer: *mut AssRenderer, width: c_int, height: c_int);
+        pub fn ass_set_storage_size(renderer: *mut AssRenderer, width: c_int, height: c_int);
+        pub fn ass_set_fonts(
+            renderer: *mut AssRenderer,
+            default_font: *const c_char,
+            default_family: *const c_char,
+            default_font_provider: c_int,
+            config: *const c_char,
+            update: c_int,
+        );
+        pub fn ass_set_cache_limits(
+            renderer: *mut AssRenderer,
+            glyph_max: c_int,
+            bitmap_max_size: c_int,
+        );
+        pub fn ass_read_memory(
+            library: *mut AssLibrary,
+            buffer: *mut c_char,
+            buffer_size: size_t,
+            codepage: *const c_char,
+        ) -> *mut AssTrack;
+        pub fn ass_free_track(track: *mut AssTrack);
+        pub fn ass_render_frame(
+            renderer: *mut AssRenderer,
+            track: *mut AssTrack,
+            now: c_longlong,
+            detect_change: *mut c_int,
+        ) -> *mut AssImage;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LibassRenderConfig {
     pub glyph_cache_limit: i32,
@@ -351,6 +413,134 @@ impl LibassRenderPlan {
     }
 }
 
+#[cfg(feature = "libass")]
+#[derive(Debug)]
+pub struct LibassSubtitleRenderer {
+    library: NonNull<libass_ffi::AssLibrary>,
+    renderer: NonNull<libass_ffi::AssRenderer>,
+    track: NonNull<libass_ffi::AssTrack>,
+    config: LibassRenderConfig,
+}
+
+#[cfg(feature = "libass")]
+impl LibassSubtitleRenderer {
+    pub fn from_ass_script(script: impl AsRef<[u8]>, config: LibassRenderConfig) -> Result<Self> {
+        let script = script.as_ref();
+        if script.is_empty() {
+            return Err(SubtitleError::Libass("ASS script is empty".to_string()));
+        }
+
+        let mut script = script.to_vec();
+        unsafe {
+            let library = NonNull::new(libass_ffi::ass_library_init()).ok_or_else(|| {
+                SubtitleError::Libass("failed to initialize libass library".to_string())
+            })?;
+
+            let Some(renderer) = NonNull::new(libass_ffi::ass_renderer_init(library.as_ptr()))
+            else {
+                libass_ffi::ass_library_done(library.as_ptr());
+                return Err(SubtitleError::Libass(
+                    "failed to initialize libass renderer".to_string(),
+                ));
+            };
+
+            libass_ffi::ass_set_fonts(
+                renderer.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                std::ptr::null(),
+                1,
+            );
+            libass_ffi::ass_set_cache_limits(
+                renderer.as_ptr(),
+                config.glyph_cache_limit,
+                config.bitmap_cache_limit_mb,
+            );
+
+            let Some(track) = NonNull::new(libass_ffi::ass_read_memory(
+                library.as_ptr(),
+                script.as_mut_ptr().cast(),
+                script.len(),
+                std::ptr::null(),
+            )) else {
+                libass_ffi::ass_renderer_done(renderer.as_ptr());
+                libass_ffi::ass_library_done(library.as_ptr());
+                return Err(SubtitleError::Libass(
+                    "failed to parse ASS script with libass".to_string(),
+                ));
+            };
+
+            Ok(Self {
+                library,
+                renderer,
+                track,
+                config,
+            })
+        }
+    }
+
+    pub fn config(&self) -> LibassRenderConfig {
+        self.config
+    }
+
+    pub fn render_plan(&self, request: SubtitleRenderRequest) -> LibassRenderPlan {
+        LibassRenderPlan::new(request, self.config)
+    }
+}
+
+#[cfg(feature = "libass")]
+impl Drop for LibassSubtitleRenderer {
+    fn drop(&mut self) {
+        unsafe {
+            libass_ffi::ass_free_track(self.track.as_ptr());
+            libass_ffi::ass_renderer_done(self.renderer.as_ptr());
+            libass_ffi::ass_library_done(self.library.as_ptr());
+        }
+    }
+}
+
+#[cfg(feature = "libass")]
+impl SubtitleRenderer for LibassSubtitleRenderer {
+    fn backend(&self) -> SubtitleRenderBackend {
+        SubtitleRenderBackend::Libass
+    }
+
+    fn render(&mut self, request: SubtitleRenderRequest) -> Result<SubtitleRenderOutput> {
+        let viewport = request.viewport;
+        let frame_width = libass_dimension(viewport.width, "frame width")?;
+        let frame_height = libass_dimension(viewport.height, "frame height")?;
+        let storage_width = libass_dimension(viewport.storage_width, "storage width")?;
+        let storage_height = libass_dimension(viewport.storage_height, "storage height")?;
+        let timestamp_ms = duration_to_millis_i64(request.pts);
+
+        unsafe {
+            libass_ffi::ass_set_frame_size(self.renderer.as_ptr(), frame_width, frame_height);
+            libass_ffi::ass_set_storage_size(self.renderer.as_ptr(), storage_width, storage_height);
+            libass_ffi::ass_set_cache_limits(
+                self.renderer.as_ptr(),
+                self.config.glyph_cache_limit,
+                self.config.bitmap_cache_limit_mb,
+            );
+
+            let mut changed = 0;
+            let images = libass_ffi::ass_render_frame(
+                self.renderer.as_ptr(),
+                self.track.as_ptr(),
+                timestamp_ms,
+                &mut changed,
+            );
+            Ok(SubtitleRenderOutput::Alpha(import_libass_image_list(
+                request.pts,
+                viewport.width,
+                viewport.height,
+                images,
+                changed != 0,
+            )?))
+        }
+    }
+}
+
 pub struct LibassImageImporter;
 
 impl LibassImageImporter {
@@ -382,6 +572,52 @@ impl LibassImageImporter {
 
         Ok(set)
     }
+}
+
+#[cfg(feature = "libass")]
+fn libass_dimension(value: u32, label: &str) -> Result<libc::c_int> {
+    i32::try_from(value)
+        .map_err(|_| SubtitleError::Libass(format!("{label} exceeds libass integer range")))
+}
+
+#[cfg(feature = "libass")]
+unsafe fn import_libass_image_list(
+    pts: Duration,
+    frame_width: u32,
+    frame_height: u32,
+    first: *mut libass_ffi::AssImage,
+    changed: bool,
+) -> Result<SubtitleBitmapSet> {
+    let mut set = SubtitleBitmapSet::new(pts, frame_width, frame_height)
+        .with_color_space(SubtitleBitmapColorSpace::Video)
+        .with_changed(changed);
+    let mut current = first;
+    let mut count = 0usize;
+
+    while !current.is_null() {
+        if count >= RAW_ASS_IMAGE_LIST_LIMIT {
+            return Err(SubtitleError::BitmapListTooLong);
+        }
+        let image = unsafe { &*current };
+        if image.w > 0 && image.h > 0 {
+            let raw = RawAssImage {
+                w: image.w,
+                h: image.h,
+                stride: image.stride,
+                bitmap: image.bitmap.cast_const(),
+                color: image.color,
+                dst_x: image.dst_x,
+                dst_y: image.dst_y,
+                next: std::ptr::null(),
+                image_type: image.image_type,
+            };
+            set.push(unsafe { raw_ass_image_to_alpha_bitmap(&raw)? });
+        }
+        current = image.next;
+        count += 1;
+    }
+
+    Ok(set)
 }
 
 pub type SubtitleViewport = SubtitleRenderViewport;
@@ -826,6 +1062,21 @@ fn duration_to_millis_i64(value: Duration) -> i64 {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "libass")]
+    const SIMPLE_ASS_SCRIPT: &str = r#"[Script Info]
+ScriptType: v4.00+
+PlayResX: 640
+PlayResY: 360
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,32,&H00FFFFFF,&H000000FF,&H80000000,&H80000000,0,0,0,0,100,100,0,0,1,2,0,2,20,20,24,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,Hello libass
+"#;
+
     #[test]
     fn parses_srt_and_finds_active_cue() {
         let srt =
@@ -1046,5 +1297,45 @@ mod tests {
         assert_eq!(plane.y, 20);
         assert_eq!(plane.rgba[0..4], [0x80, 0x40, 0x20, 255]);
         assert_eq!(plane.rgba[4..8], [0x80, 0x40, 0x20, 128]);
+    }
+
+    #[cfg(feature = "libass")]
+    #[test]
+    fn libass_renderer_rejects_empty_script() {
+        let error =
+            LibassSubtitleRenderer::from_ass_script("", LibassRenderConfig::default()).unwrap_err();
+
+        assert!(matches!(error, SubtitleError::Libass(message) if message.contains("empty")));
+    }
+
+    #[cfg(feature = "libass")]
+    #[test]
+    fn libass_renderer_renders_ass_script_to_alpha_bitmaps() {
+        let config = LibassRenderConfig {
+            glyph_cache_limit: 64,
+            bitmap_cache_limit_mb: 16,
+        };
+        let mut renderer =
+            LibassSubtitleRenderer::from_ass_script(SIMPLE_ASS_SCRIPT, config).unwrap();
+        let request = SubtitleRenderRequest::new(Duration::from_millis(500), 640, 360);
+
+        assert_eq!(renderer.backend(), SubtitleRenderBackend::Libass);
+        assert_eq!(renderer.config(), config);
+        assert_eq!(
+            renderer.render_plan(request).operations,
+            LibassRenderPlan::new(request, config).operations
+        );
+
+        let output = renderer.render(request).unwrap();
+        let SubtitleRenderOutput::Alpha(bitmaps) = output else {
+            panic!("libass renderer should produce alpha bitmap output");
+        };
+
+        assert_eq!(bitmaps.pts, request.pts);
+        assert_eq!(bitmaps.frame_width, 640);
+        assert_eq!(bitmaps.frame_height, 360);
+        assert_eq!(bitmaps.color_space, SubtitleBitmapColorSpace::Video);
+        assert!(!bitmaps.parts.is_empty());
+        assert!(bitmaps.parts.iter().all(SubtitleAlphaBitmap::is_valid));
     }
 }
