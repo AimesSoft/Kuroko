@@ -359,6 +359,7 @@ impl MetalRendererImpl {
                 tone_map: tone_map_code(frame.pipeline.tone_map.operator),
                 source_peak_nits: frame.pipeline.source.nominal_peak_nits,
                 target_peak_nits: frame.pipeline.target.peak_nits,
+                _padding0: 0.0,
                 luma_coefficients: luma_coefficients(frame.pipeline.luma_coefficients()),
                 gamut_matrix_rows: frame.pipeline.gamut_matrix().row4s(),
             };
@@ -740,6 +741,7 @@ struct VideoUniforms {
     tone_map: u32,
     source_peak_nits: f32,
     target_peak_nits: f32,
+    _padding0: f32,
     luma_coefficients: [f32; 4],
     gamut_matrix_rows: [[f32; 4]; 3],
 }
@@ -808,6 +810,7 @@ struct VideoUniforms {
     uint tone_map;
     float source_peak_nits;
     float target_peak_nits;
+    float padding0;
     float4 luma_coefficients;
     float4 gamut_matrix_rows[3];
 };
@@ -931,6 +934,7 @@ fragment float4 kuroko_video_fragment(
     rgb.g = (y - kr * rgb.r - kb * rgb.b) / kg;
     rgb = transfer_to_linear(rgb, uniforms);
     rgb = apply_gamut_map(rgb, uniforms);
+    rgb = max(rgb, float3(0.0));
     rgb = tone_map_rgb(rgb, uniforms);
     rgb = linear_to_output(rgb, uniforms);
     return float4(clamp(rgb, 0.0, 1.0), 1.0);
@@ -1128,7 +1132,26 @@ mod tests {
         assert!(VIDEO_SHADER_SOURCE.contains("gamut_matrix_rows"));
         assert!(VIDEO_SHADER_SOURCE.contains("apply_gamut_map"));
         let gamut = VIDEO_SHADER_SOURCE.find("rgb = apply_gamut_map").unwrap();
+        let guard = gamut
+            + VIDEO_SHADER_SOURCE[gamut..]
+                .find("rgb = max(rgb, float3(0.0))")
+                .unwrap();
         let tone_map = VIDEO_SHADER_SOURCE.find("rgb = tone_map_rgb").unwrap();
         assert!(gamut < tone_map);
+        assert!(gamut < guard);
+        assert!(guard < tone_map);
+    }
+
+    #[test]
+    fn video_uniforms_keep_float4_fields_aligned() {
+        assert_eq!(std::mem::size_of::<super::VideoUniforms>(), 96);
+        assert_eq!(
+            std::mem::offset_of!(super::VideoUniforms, luma_coefficients),
+            32
+        );
+        assert_eq!(
+            std::mem::offset_of!(super::VideoUniforms, gamut_matrix_rows),
+            48
+        );
     }
 }
