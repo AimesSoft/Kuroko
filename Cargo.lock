@@ -1727,6 +1727,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wgpu_overlay_png"
+version = "0.0.1"
+dependencies = [
+ "kuroko",
+ "png",
+]
+
+[[package]]
 name = "wgpu_video_png"
 version = "0.0.1"
 dependencies = [

@@ -103,7 +103,7 @@ fn render_frame(renderer: &mut WgpuRenderer, frame: Frame, out: &str) {
         .upload_player_frame(&player_frame)
         .expect("upload decoded frame");
     let readback = renderer
-        .render_current_offscreen()
+        .render_current_offscreen(None)
         .expect("render current frame")
         .expect("a frame was uploaded");
     write_png(out, readback.width, readback.height, &readback.rgba);

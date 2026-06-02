@@ -149,6 +149,43 @@ fn tone_map_code(operator: ToneMapOperator) -> u32 {
     }
 }
 
+fn overlay_has_planes(frame: &OverlayFrame) -> bool {
+    !frame.subtitle_planes.is_empty()
+}
+
+/// Overlay quad uniforms, byte-compatible with the Metal `OverlayUniforms`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct OverlayUniforms {
+    pub rect: [f32; 4],
+    pub tex_rect: [f32; 4],
+    pub viewport: [f32; 2],
+    pub overlay_mode: u32,
+    pub reserved0: u32,
+    pub color: [f32; 4],
+}
+
+impl OverlayUniforms {
+    /// A straight-RGBA subtitle plane placed at pixel `rect` within the viewport.
+    fn rgba_plane(
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        viewport_w: u32,
+        viewport_h: u32,
+    ) -> Self {
+        Self {
+            rect: [x as f32, y as f32, width as f32, height as f32],
+            tex_rect: [0.0, 0.0, 1.0, 1.0],
+            viewport: [viewport_w.max(1) as f32, viewport_h.max(1) as f32],
+            overlay_mode: 0,
+            reserved0: 0,
+            color: [1.0, 1.0, 1.0, 1.0],
+        }
+    }
+}
+
 /// Lazily-built GPU objects for the NV12/P010 video pipeline, tied to the color
 /// target format the pipeline was compiled for.
 struct VideoPipeline {
@@ -156,6 +193,23 @@ struct VideoPipeline {
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     format: wgpu::TextureFormat,
+}
+
+/// Lazily-built GPU objects for the overlay (subtitle/danmaku) compositing pass,
+/// tied to the color target format it was compiled for.
+struct OverlayPipeline {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    format: wgpu::TextureFormat,
+}
+
+/// Per-plane GPU resources for one overlay draw. The texture and uniform buffer are
+/// retained so the bind group stays valid for the duration of the render pass.
+struct OverlayDraw {
+    bind_group: wgpu::BindGroup,
+    _texture: wgpu::Texture,
+    _uniform: wgpu::Buffer,
 }
 
 /// The currently uploaded video frame: GPU plane textures plus the color uniforms
@@ -181,6 +235,7 @@ pub struct WgpuRenderer {
     queue: wgpu::Queue,
     surface: Option<AttachedSurface>,
     video_pipeline: Option<VideoPipeline>,
+    overlay_pipeline: Option<OverlayPipeline>,
     current_video: Option<UploadedVideoFrame>,
     stats: WgpuRendererStats,
 }
@@ -216,6 +271,7 @@ impl WgpuRenderer {
             queue,
             surface: None,
             video_pipeline: None,
+            overlay_pipeline: None,
             current_video: None,
             stats: WgpuRendererStats::default(),
         })
@@ -381,7 +437,7 @@ impl WgpuRenderer {
         uniforms: VideoUniforms,
     ) -> Result<WgpuOffscreenReadback> {
         self.upload_nv12(width, height, luma, chroma, uniforms)?;
-        self.render_current_offscreen()?
+        self.render_current_offscreen(None)?
             .ok_or_else(|| PlayerError::Renderer("no current frame after upload".to_string()))
     }
 
@@ -444,13 +500,20 @@ impl WgpuRenderer {
         Ok(())
     }
 
-    /// Render the current video frame into an offscreen RGBA8 target and read it
-    /// back to host memory. Returns `None` if no frame has been uploaded.
-    pub fn render_current_offscreen(&mut self) -> Result<Option<WgpuOffscreenReadback>> {
+    /// Render the current video frame (optionally compositing `overlay`) into an
+    /// offscreen RGBA8 target and read it back. Returns `None` if no frame has been
+    /// uploaded.
+    pub fn render_current_offscreen(
+        &mut self,
+        overlay: Option<&OverlayFrame>,
+    ) -> Result<Option<WgpuOffscreenReadback>> {
         if self.current_video.is_none() {
             return Ok(None);
         }
         self.ensure_video_pipeline(OFFSCREEN_FORMAT);
+        if overlay.is_some_and(overlay_has_planes) {
+            self.ensure_overlay_pipeline(OFFSCREEN_FORMAT);
+        }
         let (width, height) = {
             let video = self.current_video.as_ref().expect("current video frame");
             (video.width, video.height)
@@ -470,7 +533,7 @@ impl WgpuRenderer {
             view_formats: &[],
         });
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
-        self.draw_current_video(&target_view)?;
+        self.draw_current_video(&target_view, overlay)?;
         let rgba = self.read_back_rgba8(&target, width, height)?;
         self.stats.rendered_frames += 1;
         Ok(Some(WgpuOffscreenReadback {
@@ -483,7 +546,11 @@ impl WgpuRenderer {
     /// Encode and submit a render pass drawing the current video frame into
     /// `target_view`. The caller must have uploaded a frame and the video pipeline
     /// must be initialized.
-    fn draw_current_video(&self, target_view: &wgpu::TextureView) -> Result<()> {
+    fn draw_current_video(
+        &self,
+        target_view: &wgpu::TextureView,
+        overlay: Option<&OverlayFrame>,
+    ) -> Result<()> {
         let video = self
             .current_video
             .as_ref()
@@ -492,6 +559,11 @@ impl WgpuRenderer {
             .video_pipeline
             .as_ref()
             .ok_or_else(|| PlayerError::Renderer("video pipeline not initialized".to_string()))?;
+
+        let overlay_draws = match overlay {
+            Some(frame) if overlay_has_planes(frame) => self.prepare_overlay_draws(frame)?,
+            _ => Vec::new(),
+        };
 
         let luma_view = video
             .luma
@@ -555,8 +627,110 @@ impl WgpuRenderer {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
+
+        if !overlay_draws.is_empty() {
+            let overlay_pipeline = self.overlay_pipeline.as_ref().ok_or_else(|| {
+                PlayerError::Renderer("overlay pipeline not initialized".to_string())
+            })?;
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("kuroko-wgpu-overlay-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // Load to preserve the video plane, then alpha-blend overlays.
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&overlay_pipeline.pipeline);
+            for draw in &overlay_draws {
+                pass.set_bind_group(0, &draw.bind_group, &[]);
+                pass.draw(0..4, 0..1);
+            }
+        }
+
         self.queue.submit(Some(encoder.finish()));
         Ok(())
+    }
+
+    /// Build per-plane GPU resources for the overlay's straight-RGBA subtitle planes.
+    fn prepare_overlay_draws(&self, frame: &OverlayFrame) -> Result<Vec<OverlayDraw>> {
+        let pipeline = self
+            .overlay_pipeline
+            .as_ref()
+            .ok_or_else(|| PlayerError::Renderer("overlay pipeline not initialized".to_string()))?;
+        let viewport_w = frame.viewport.width;
+        let viewport_h = frame.viewport.height;
+        let mut draws = Vec::with_capacity(frame.subtitle_planes.len());
+        for plane in &frame.subtitle_planes {
+            if plane.width == 0 || plane.height == 0 {
+                continue;
+            }
+            let expected = plane.width as usize * plane.height as usize * 4;
+            if plane.rgba.len() != expected {
+                return Err(PlayerError::Renderer(format!(
+                    "overlay subtitle plane has {} bytes, expected {expected} for {}x{} RGBA",
+                    plane.rgba.len(),
+                    plane.width,
+                    plane.height
+                )));
+            }
+            let texture = self.create_plane_texture(
+                "kuroko-wgpu-overlay-plane",
+                plane.width,
+                plane.height,
+                wgpu::TextureFormat::Rgba8Unorm,
+                &plane.rgba,
+                plane.width * 4,
+            );
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let uniforms = OverlayUniforms::rgba_plane(
+                plane.x,
+                plane.y,
+                plane.width,
+                plane.height,
+                viewport_w,
+                viewport_h,
+            );
+            let uniform = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("kuroko-wgpu-overlay-uniforms"),
+                    contents: bytemuck::bytes_of(&uniforms),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("kuroko-wgpu-overlay-bind-group"),
+                layout: &pipeline.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&pipeline.sampler),
+                    },
+                ],
+            });
+            draws.push(OverlayDraw {
+                bind_group,
+                _texture: texture,
+                _uniform: uniform,
+            });
+        }
+        Ok(draws)
     }
 
     fn create_plane_texture(
@@ -701,6 +875,120 @@ impl WgpuRenderer {
             ..Default::default()
         });
         self.video_pipeline = Some(VideoPipeline {
+            pipeline,
+            bind_group_layout,
+            sampler,
+            format,
+        });
+    }
+
+    fn ensure_overlay_pipeline(&mut self, format: wgpu::TextureFormat) {
+        if self
+            .overlay_pipeline
+            .as_ref()
+            .is_some_and(|overlay| overlay.format == format)
+        {
+            return;
+        }
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("kuroko-wgpu-overlay-shader"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("wgpu_overlay.wgsl").into()),
+            });
+        let bind_group_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("kuroko-wgpu-overlay-bgl"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("kuroko-wgpu-overlay-layout"),
+                bind_group_layouts: &[Some(&bind_group_layout)],
+                immediate_size: 0,
+            });
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("kuroko-wgpu-overlay-pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("kuroko_overlay_vertex"),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("kuroko_overlay_fragment"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        // Straight-alpha blending, matching the Metal overlay pipeline.
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::SrcAlpha,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("kuroko-wgpu-overlay-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        self.overlay_pipeline = Some(OverlayPipeline {
             pipeline,
             bind_group_layout,
             sampler,
@@ -866,19 +1154,20 @@ impl RendererBackend for WgpuRenderer {
                     .to_string(),
             )
         })?;
-        let source =
-            SourceColorState::new(frame.frame.color_primaries(), frame.frame.transfer_function())
-                .range(frame.frame.color_range())
-                .matrix(frame.frame.matrix_coefficients())
-                .hdr_metadata(frame.frame.hdr_metadata());
-        let pipeline = VideoRenderPipeline::new(source, TargetColorState::sdr(ColorPrimaries::Bt709));
+        let source = SourceColorState::new(
+            frame.frame.color_primaries(),
+            frame.frame.transfer_function(),
+        )
+        .range(frame.frame.color_range())
+        .matrix(frame.frame.matrix_coefficients())
+        .hdr_metadata(frame.frame.hdr_metadata());
+        let pipeline =
+            VideoRenderPipeline::new(source, TargetColorState::sdr(ColorPrimaries::Bt709));
         let uniforms = VideoUniforms::from_pipeline(&pipeline, false, false);
         self.upload_nv12(nv12.width, nv12.height, &nv12.luma, &nv12.chroma, uniforms)
     }
 
-    fn render_current_frame(&mut self, _overlay: Option<&OverlayFrame>) -> Result<bool> {
-        // Overlay compositing on the wgpu backend is a later slice; for now only
-        // the video plane is presented.
+    fn render_current_frame(&mut self, overlay: Option<&OverlayFrame>) -> Result<bool> {
         if self.current_video.is_none() {
             return Ok(false);
         }
@@ -888,6 +1177,9 @@ impl RendererBackend for WgpuRenderer {
             return Ok(false);
         };
         self.ensure_video_pipeline(format);
+        if overlay.is_some_and(overlay_has_planes) {
+            self.ensure_overlay_pipeline(format);
+        }
         let attached = self.surface.as_ref().expect("surface present");
         let frame = match attached.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture)
@@ -901,7 +1193,7 @@ impl RendererBackend for WgpuRenderer {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        self.draw_current_video(&view)?;
+        self.draw_current_video(&view, overlay)?;
         frame.present();
         self.stats.rendered_frames += 1;
         Ok(true)
