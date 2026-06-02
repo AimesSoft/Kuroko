@@ -42,7 +42,19 @@ typedef enum KurokoEventKind {
   KurokoEventKind_SurfaceAttached = 7,
   KurokoEventKind_SurfaceDetached = 8,
   KurokoEventKind_Error = 9,
+  KurokoEventKind_TrackSelectionChanged = 10,
 } KurokoEventKind;
+
+typedef enum KurokoTrackKind {
+  KurokoTrackKind_Video = 0,
+  KurokoTrackKind_Audio = 1,
+  KurokoTrackKind_Subtitle = 2,
+} KurokoTrackKind;
+
+typedef enum KurokoTrackSource {
+  KurokoTrackSource_Embedded = 0,
+  KurokoTrackSource_External = 1,
+} KurokoTrackSource;
 
 typedef enum KurokoWgpuSurfaceKind {
   KurokoWgpuSurfaceKind_Unknown = 0,
@@ -87,6 +99,23 @@ typedef struct KurokoTrackCounts {
   uint32_t subtitle;
 } KurokoTrackCounts;
 
+typedef struct KurokoTrackSelection {
+  int64_t video;
+  int64_t audio;
+  int64_t subtitle;
+} KurokoTrackSelection;
+
+typedef struct KurokoTrackInfo {
+  int64_t id;
+  KurokoTrackKind kind;
+  KurokoTrackSource source;
+  bool selected;
+  bool can_remove;
+  char *title;
+  char *language;
+  char *codec;
+} KurokoTrackInfo;
+
 typedef struct KurokoEvent {
   KurokoEventKind kind;
   KurokoStatus status;
@@ -123,6 +152,17 @@ KurokoStatus kuroko_add_external_subtitle(
     const char *uri,
     int64_t *out_track_id);
 KurokoStatus kuroko_remove_subtitle_track(KurokoHandle *handle, int64_t track_id);
+KurokoStatus kuroko_select_audio_track(KurokoHandle *handle, int64_t track_id);
+KurokoStatus kuroko_select_subtitle_track(KurokoHandle *handle, int64_t track_id);
+KurokoStatus kuroko_track_selection(
+    KurokoHandle *handle,
+    KurokoTrackSelection *out_selection);
+KurokoStatus kuroko_tracks(
+    KurokoHandle *handle,
+    KurokoTrackInfo *out_tracks,
+    uintptr_t capacity,
+    uintptr_t *out_len);
+void kuroko_track_info_free(KurokoTrackInfo *track);
 KurokoStatus kuroko_state(KurokoHandle *handle, KurokoState *out_state);
 KurokoStatus kuroko_poll_event(KurokoHandle *handle, KurokoEvent *out_event);
 
@@ -172,6 +212,20 @@ KurokoStatus kuroko_presenter_add_external_subtitle(
 KurokoStatus kuroko_presenter_remove_subtitle_track(
     KurokoPresenterHandle *handle,
     int64_t track_id);
+KurokoStatus kuroko_presenter_select_audio_track(
+    KurokoPresenterHandle *handle,
+    int64_t track_id);
+KurokoStatus kuroko_presenter_select_subtitle_track(
+    KurokoPresenterHandle *handle,
+    int64_t track_id);
+KurokoStatus kuroko_presenter_track_selection(
+    KurokoPresenterHandle *handle,
+    KurokoTrackSelection *out_selection);
+KurokoStatus kuroko_presenter_tracks(
+    KurokoPresenterHandle *handle,
+    KurokoTrackInfo *out_tracks,
+    uintptr_t capacity,
+    uintptr_t *out_len);
 
 KurokoStatus kuroko_presenter_attach_metal_layer(
     KurokoPresenterHandle *handle,

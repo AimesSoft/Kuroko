@@ -1457,13 +1457,10 @@ fn inspect_format_context(
         };
 
         let codec = unsafe { codec_name((*codecpar).codec_id) };
-        let track = TrackInfo {
-            id: unsafe { (*stream).index as i64 },
-            kind,
-            title: metadata_value(unsafe { (*stream).metadata }, "title"),
-            language: metadata_value(unsafe { (*stream).metadata }, "language"),
-            codec: codec.clone(),
-        };
+        let mut track = TrackInfo::embedded(unsafe { (*stream).index as i64 }, kind);
+        track.title = metadata_value(unsafe { (*stream).metadata }, "title");
+        track.language = metadata_value(unsafe { (*stream).metadata }, "language");
+        track.codec = codec.clone();
 
         if kind == TrackKind::Video {
             video.push(unsafe { video_probe(&track, codecpar) });
@@ -2069,13 +2066,10 @@ mod tests {
 
     #[test]
     fn subtitle_probe_marks_embedded_tracks_non_removable() {
-        let track = TrackInfo {
-            id: 3,
-            kind: TrackKind::Subtitle,
-            title: Some("Signs".to_string()),
-            language: Some("jpn".to_string()),
-            codec: Some("hdmv_pgs_subtitle".to_string()),
-        };
+        let mut track = TrackInfo::embedded(3, TrackKind::Subtitle);
+        track.title = Some("Signs".to_string());
+        track.language = Some("jpn".to_string());
+        track.codec = Some("hdmv_pgs_subtitle".to_string());
 
         let config = subtitle_probe(&track);
 

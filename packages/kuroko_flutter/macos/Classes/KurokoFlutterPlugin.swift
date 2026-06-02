@@ -22,6 +22,23 @@ private struct KurokoTrackCountsC {
   var subtitle: UInt32 = 0
 }
 
+private struct KurokoTrackSelectionC {
+  var video: Int64 = -1
+  var audio: Int64 = -1
+  var subtitle: Int64 = -1
+}
+
+private struct KurokoTrackInfoC {
+  var id: Int64 = -1
+  var kind: Int32 = 0
+  var source: Int32 = 0
+  var selected: UInt8 = 0
+  var canRemove: UInt8 = 0
+  var title: UnsafeMutablePointer<CChar>?
+  var language: UnsafeMutablePointer<CChar>?
+  var codec: UnsafeMutablePointer<CChar>?
+}
+
 private struct KurokoPresenterConfigC {
   var outputMode: Int32 = 0
   var edrHeadroom: Float = 1.0
@@ -100,12 +117,21 @@ private final class KurokoNativeLibrary {
   typealias OpenFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> Int32
   typealias CommandFn = @convention(c) (UnsafeMutableRawPointer?) -> Int32
   typealias SeekFn = @convention(c) (UnsafeMutableRawPointer?, UInt64) -> Int32
+  typealias SelectTrackFn = @convention(c) (UnsafeMutableRawPointer?, Int64) -> Int32
   typealias AddExternalSubtitleFn = @convention(c) (
     UnsafeMutableRawPointer?,
     UnsafePointer<CChar>?,
     UnsafeMutablePointer<Int64>?
   ) -> Int32
   typealias RemoveSubtitleTrackFn = @convention(c) (UnsafeMutableRawPointer?, Int64) -> Int32
+  typealias TrackSelectionFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutablePointer<KurokoTrackSelectionC>?) -> Int32
+  typealias TracksFn = @convention(c) (
+    UnsafeMutableRawPointer?,
+    UnsafeMutablePointer<KurokoTrackInfoC>?,
+    Int,
+    UnsafeMutablePointer<Int>?
+  ) -> Int32
+  typealias TrackInfoFreeFn = @convention(c) (UnsafeMutablePointer<KurokoTrackInfoC>?) -> Void
   typealias AttachMetalLayerFn = @convention(c) (UnsafeMutableRawPointer?, UInt64, UInt32, UInt32, Double) -> Int32
   typealias ResizeSurfaceFn = @convention(c) (UnsafeMutableRawPointer?, UInt32, UInt32, Double) -> Int32
   typealias RenderTickFn = @convention(c) (UnsafeMutableRawPointer?, Double, UnsafeMutableRawPointer?) -> Int32
@@ -122,8 +148,13 @@ private final class KurokoNativeLibrary {
   let stop: CommandFn
   let close: CommandFn
   let seek: SeekFn
+  let selectAudioTrack: SelectTrackFn
+  let selectSubtitleTrack: SelectTrackFn
   let addExternalSubtitle: AddExternalSubtitleFn
   let removeSubtitleTrack: RemoveSubtitleTrackFn
+  let trackSelection: TrackSelectionFn
+  let tracks: TracksFn
+  let freeTrackInfo: TrackInfoFreeFn
   let attachMetalLayer: AttachMetalLayerFn
   let resizeSurface: ResizeSurfaceFn
   let detachSurface: CommandFn
@@ -145,8 +176,13 @@ private final class KurokoNativeLibrary {
     stop = try Self.load("kuroko_presenter_stop", from: libraryHandle, as: CommandFn.self)
     close = try Self.load("kuroko_presenter_close", from: libraryHandle, as: CommandFn.self)
     seek = try Self.load("kuroko_presenter_seek", from: libraryHandle, as: SeekFn.self)
+    selectAudioTrack = try Self.load("kuroko_presenter_select_audio_track", from: libraryHandle, as: SelectTrackFn.self)
+    selectSubtitleTrack = try Self.load("kuroko_presenter_select_subtitle_track", from: libraryHandle, as: SelectTrackFn.self)
     addExternalSubtitle = try Self.load("kuroko_presenter_add_external_subtitle", from: libraryHandle, as: AddExternalSubtitleFn.self)
     removeSubtitleTrack = try Self.load("kuroko_presenter_remove_subtitle_track", from: libraryHandle, as: RemoveSubtitleTrackFn.self)
+    trackSelection = try Self.load("kuroko_presenter_track_selection", from: libraryHandle, as: TrackSelectionFn.self)
+    tracks = try Self.load("kuroko_presenter_tracks", from: libraryHandle, as: TracksFn.self)
+    freeTrackInfo = try Self.load("kuroko_track_info_free", from: libraryHandle, as: TrackInfoFreeFn.self)
     attachMetalLayer = try Self.load("kuroko_presenter_attach_metal_layer", from: libraryHandle, as: AttachMetalLayerFn.self)
     resizeSurface = try Self.load("kuroko_presenter_resize_surface", from: libraryHandle, as: ResizeSurfaceFn.self)
     detachSurface = try Self.load("kuroko_presenter_detach_surface", from: libraryHandle, as: CommandFn.self)
@@ -281,6 +317,52 @@ private final class KurokoPlayerHost {
     )
   }
 
+  func selectAudioTrack(trackId: Int64?) throws {
+    try check(
+      library.selectAudioTrack(handle, trackId ?? -1),
+      operation: "select_audio_track"
+    )
+  }
+
+  func selectSubtitleTrack(trackId: Int64?) throws {
+    try check(
+      library.selectSubtitleTrack(handle, trackId ?? -1),
+      operation: "select_subtitle_track"
+    )
+  }
+
+  func tracks() throws -> [[String: Any]] {
+    var count: Int = 0
+    try check(
+      library.tracks(handle, nil, 0, &count),
+      operation: "tracks_len"
+    )
+    if count <= 0 {
+      return []
+    }
+
+    var tracks = Array(repeating: KurokoTrackInfoC(), count: count)
+    var written: Int = 0
+    let status = tracks.withUnsafeMutableBufferPointer { buffer in
+      library.tracks(handle, buffer.baseAddress, buffer.count, &written)
+    }
+    try check(status, operation: "tracks")
+    let result = tracks.prefix(min(written, tracks.count)).map { $0.toFlutterMap() }
+    for index in tracks.indices {
+      library.freeTrackInfo(&tracks[index])
+    }
+    return result
+  }
+
+  func trackSelection() throws -> [String: Any] {
+    var selection = KurokoTrackSelectionC()
+    try check(
+      library.trackSelection(handle, &selection),
+      operation: "track_selection"
+    )
+    return selection.toFlutterMap()
+  }
+
   func attach(view: KurokoMetalSurfaceView) throws {
     attachedView = view
     view.attachedPlayerId = id
@@ -332,7 +414,7 @@ private final class KurokoPlayerHost {
         library.pollEvent(handle, UnsafeMutableRawPointer(pointer))
       }
       if status == 0 {
-        sendEvent(event.toFlutterMap(playerId: id))
+        sendEvent(event.toFlutterMap(playerId: id, host: self))
         continue
       }
       if status != 5 {
@@ -384,8 +466,8 @@ private final class KurokoPlayerHost {
 }
 
 private extension KurokoEventC {
-  func toFlutterMap(playerId: Int64) -> [String: Any] {
-    [
+  func toFlutterMap(playerId: Int64, host: KurokoPlayerHost? = nil) -> [String: Any] {
+    var map: [String: Any] = [
       "playerId": playerId,
       "kind": Int(kind),
       "status": Int(status),
@@ -404,6 +486,40 @@ private extension KurokoEventC {
         "audio": Int(tracks.audio),
         "subtitle": Int(tracks.subtitle),
       ],
+    ]
+    if kind == 4 || kind == 10 {
+      map["trackList"] = (try? host?.tracks()) ?? []
+      map["trackSelection"] = (try? host?.trackSelection()) ?? [
+        "video": -1,
+        "audio": -1,
+        "subtitle": -1,
+      ]
+    }
+    return map
+  }
+}
+
+private extension KurokoTrackSelectionC {
+  func toFlutterMap() -> [String: Any] {
+    [
+      "video": Int(video),
+      "audio": Int(audio),
+      "subtitle": Int(subtitle),
+    ]
+  }
+}
+
+private extension KurokoTrackInfoC {
+  func toFlutterMap() -> [String: Any] {
+    [
+      "id": Int(id),
+      "kind": Int(kind),
+      "source": Int(source),
+      "selected": selected != 0,
+      "canRemove": canRemove != 0,
+      "title": title.map { String(cString: $0) } as Any,
+      "language": language.map { String(cString: $0) } as Any,
+      "codec": codec.map { String(cString: $0) } as Any,
     ]
   }
 }
@@ -739,6 +855,19 @@ public final class KurokoFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHa
         let trackId = try requiredInt64(args["trackId"], name: "trackId")
         try host.removeSubtitleTrack(trackId: trackId)
         result(nil)
+      case "selectAudioTrack":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        try host.selectAudioTrack(trackId: optionalTrackId(args["trackId"]))
+        result(nil)
+      case "selectSubtitleTrack":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        try host.selectSubtitleTrack(trackId: optionalTrackId(args["trackId"]))
+        result(nil)
+      case "tracks":
+        let host = try playerHost(from: try dictionaryArgs(call.arguments))
+        result(try host.tracks())
       case "attachView":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
@@ -1065,6 +1194,16 @@ public final class KurokoFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHa
       throw KurokoPluginError.playerNotFound(playerId)
     }
     return host
+  }
+
+  private func optionalTrackId(_ value: Any?) throws -> Int64? {
+    if value == nil || value is NSNull {
+      return nil
+    }
+    guard let trackId = int64Value(value) else {
+      throw KurokoPluginError.invalidArguments("trackId must be an integer or null.")
+    }
+    return trackId >= 0 ? trackId : nil
   }
 
   private func startPollTimerIfNeeded() {

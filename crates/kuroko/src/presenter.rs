@@ -5,7 +5,7 @@ use crossbeam_channel::Receiver;
 use crate::apple::coreaudio::{CoreAudioOutput, CoreAudioOutputConfig};
 use crate::core::{
     MediaRequest, PlatformSurface, Player, PlayerAudioFrame, PlayerConfig, PlayerSubtitleFrame,
-    PlayerVideoFrame, RendererBackend, RendererBackendPreference,
+    PlayerVideoFrame, RendererBackend, RendererBackendPreference, TrackInfo, TrackSelection,
 };
 use crate::overlay::{OverlayFrame, OverlayTimeline, OverlayViewport};
 use crate::renderer::metal::{MetalRenderer, MetalRendererConfig};
@@ -137,6 +137,22 @@ impl PresenterRuntime {
 
     pub fn remove_subtitle_track(&self, track_id: i64) -> Result<()> {
         self.player.remove_subtitle_track(track_id)
+    }
+
+    pub fn select_audio_track(&self, track_id: Option<i64>) -> Result<()> {
+        self.player.select_audio_track(track_id)
+    }
+
+    pub fn select_subtitle_track(&self, track_id: Option<i64>) -> Result<()> {
+        self.player.select_subtitle_track(track_id)
+    }
+
+    pub fn tracks(&self) -> Vec<TrackInfo> {
+        self.player.tracks()
+    }
+
+    pub fn track_selection(&self) -> TrackSelection {
+        self.player.track_selection()
     }
 
     pub fn render_tick(&mut self, time_seconds: f64) -> Result<PresenterStats> {

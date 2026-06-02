@@ -4,13 +4,13 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use crate::audio::AudioClockSnapshot;
-use crate::core::{MediaRequest, TrackInfo, TrackKind, VideoParams};
+use crate::core::{MediaRequest, TrackInfo, TrackKind, TrackSelection, VideoParams};
 use crate::ffmpeg::{
     self, AudioResampler, Decoder, DecoderBackend, DecoderConfig, DecoderOutputFrame, Demuxer,
     Frame, PcmAudioFrame, PcmFormat, StreamSelection, SubtitleDecoder,
 };
 use crate::source::{self, source_from_uri_with_hint};
-use crate::subtitle::{DecodedSubtitleFrame, SubtitleTrackConfig};
+use crate::subtitle::{DecodedSubtitleFrame, SubtitleTrackConfig, SubtitleTrackSource};
 
 #[derive(Debug, Error)]
 pub enum PlaybackError {
@@ -24,6 +24,8 @@ pub enum PlaybackError {
     UnexpectedDecoderOutput,
     #[error("no subtitle track found")]
     NoSubtitleTrack,
+    #[error("track not found: kind={kind:?} id={track_id}")]
+    TrackNotFound { kind: TrackKind, track_id: i64 },
     #[error("subtitle track is not removable: {0}")]
     SubtitleTrackNotRemovable(i64),
 }
@@ -93,6 +95,16 @@ pub struct OpenedMediaInfo {
     pub subtitle_tracks: Vec<SubtitleTrackConfig>,
     pub video_decode_backend: Option<DecoderBackend>,
     pub audio_output: Option<PcmFormat>,
+}
+
+impl OpenedMediaInfo {
+    pub fn track_selection(&self) -> TrackSelection {
+        TrackSelection {
+            video: self.selected_video_track,
+            audio: self.selected_audio_track,
+            subtitle: self.selected_subtitle_track,
+        }
+    }
 }
 
 pub struct PlaybackSession {
@@ -169,7 +181,7 @@ impl PlaybackSession {
             demuxer.set_stream_selection(StreamSelection::only(selected_streams))?;
         }
 
-        let probe = demuxer.probe().clone();
+        let mut probe = demuxer.probe().clone();
         let video_params = selected_video_track.and_then(|stream_index| {
             probe
                 .video
@@ -177,6 +189,12 @@ impl PlaybackSession {
                 .find(|video| video.track_id == stream_index as i64)
                 .map(|video| video.params.clone())
         });
+        mark_selected_tracks(
+            &mut probe.tracks,
+            selected_video_track.map(i64::from),
+            selected_audio_track.map(i64::from),
+            opened_subtitle_track.map(i64::from),
+        );
         let info = OpenedMediaInfo {
             uri: probe.uri,
             duration: probe.duration,
@@ -210,6 +228,10 @@ impl PlaybackSession {
         &self.info
     }
 
+    pub fn track_selection(&self) -> TrackSelection {
+        self.info.track_selection()
+    }
+
     pub fn next_video_frame(&mut self) -> Result<Option<Frame>> {
         if self.video_decoder.is_none() {
             return Ok(None);
@@ -237,29 +259,36 @@ impl PlaybackSession {
         &mut self,
         media_time: Duration,
     ) -> Result<Option<DecodedSubtitleFrame>> {
-        if self.subtitle_decoder.is_none() && self.external_subtitles.is_empty() {
+        let Some(selected_track) = self.info.selected_subtitle_track else {
+            return Ok(None);
+        };
+        if self.subtitle_decoder.is_none()
+            && self.selected_external_subtitle(selected_track).is_none()
+        {
             return Ok(None);
         }
-        self.pump_external_subtitles(media_time)?;
+        self.pump_external_subtitles(selected_track, media_time)?;
         Ok(self.pop_ready_subtitle(media_time))
     }
 
     pub fn add_external_subtitle(
         &mut self,
         config: SubtitleTrackConfig,
-    ) -> Result<SubtitleTrackConfig> {
-        let external = ExternalSubtitleSession::open(config)?;
+        media_time: Duration,
+    ) -> Result<(SubtitleTrackConfig, Option<DecodedSubtitleFrame>)> {
+        let previous_subtitle = self.info.selected_subtitle_track;
+        let mut external = ExternalSubtitleSession::open(config)?;
+        external.seek(media_time)?;
         let track = external.track().clone();
-        self.info.tracks.push(TrackInfo {
-            id: track.id,
-            kind: TrackKind::Subtitle,
-            title: track.title.clone(),
-            language: track.language.clone(),
-            codec: None,
-        });
+        let mut info = TrackInfo::external(track.id, TrackKind::Subtitle);
+        info.title = track.title.clone();
+        info.language = track.language.clone();
+        info.selected = true;
+        self.info.tracks.push(info);
         self.info.subtitle_tracks.push(track.clone());
         self.external_subtitles.push(external);
-        Ok(track)
+        self.select_subtitle_track_internal(Some(track.id))?;
+        Ok((track, clear_subtitle_frame(previous_subtitle, media_time)))
     }
 
     pub fn remove_subtitle_track(
@@ -267,6 +296,7 @@ impl PlaybackSession {
         track_id: i64,
         media_time: Duration,
     ) -> Result<Option<DecodedSubtitleFrame>> {
+        let was_selected = self.info.selected_subtitle_track == Some(track_id);
         let Some(index) = self
             .external_subtitles
             .iter()
@@ -290,11 +320,74 @@ impl PlaybackSession {
         self.info
             .subtitle_tracks
             .retain(|track| track.id != track_id);
-        Ok(Some(DecodedSubtitleFrame::new(
-            track_id,
-            Some(media_time),
-            None,
-        )))
+        if was_selected {
+            self.info.selected_subtitle_track = None;
+            mark_selected_tracks(
+                &mut self.info.tracks,
+                self.info.selected_video_track,
+                self.info.selected_audio_track,
+                self.info.selected_subtitle_track,
+            );
+        }
+        Ok(clear_subtitle_frame(Some(track_id), media_time))
+    }
+
+    pub fn select_audio_track(&mut self, track_id: Option<i64>) -> Result<()> {
+        match track_id {
+            Some(id) => {
+                let stream_index = self.embedded_track_stream_index(id, TrackKind::Audio)?;
+                let parameters = self.demuxer.codec_parameters(stream_index)?;
+                let decoder = Decoder::open(parameters)?;
+                self.audio_decoder = Some(decoder);
+                self.info.selected_audio_track = Some(id);
+                self.info.audio_output = Some(self.audio_output);
+            }
+            None => {
+                self.audio_decoder = None;
+                self.info.selected_audio_track = None;
+                self.info.audio_output = None;
+            }
+        }
+        self.audio_resampler = None;
+        self.audio_frames.clear();
+        self.update_demux_selection()?;
+        self.mark_selected_tracks();
+        Ok(())
+    }
+
+    pub fn select_subtitle_track(
+        &mut self,
+        track_id: Option<i64>,
+        media_time: Duration,
+    ) -> Result<Option<DecodedSubtitleFrame>> {
+        let previous = self.info.selected_subtitle_track;
+        self.select_subtitle_track_internal(track_id)?;
+        Ok(clear_subtitle_frame(previous, media_time))
+    }
+
+    fn select_subtitle_track_internal(&mut self, track_id: Option<i64>) -> Result<()> {
+        match track_id {
+            Some(id) => match self.subtitle_track_source(id)? {
+                SubtitleTrackSource::Embedded { stream_index } => {
+                    let stream_index = stream_index_i32(stream_index, TrackKind::Subtitle, id)?;
+                    let decoder = self.demuxer.open_subtitle_decoder(stream_index)?;
+                    self.subtitle_decoder = Some(decoder);
+                    self.info.selected_subtitle_track = Some(id);
+                }
+                SubtitleTrackSource::External { .. } => {
+                    self.subtitle_decoder = None;
+                    self.info.selected_subtitle_track = Some(id);
+                }
+            },
+            None => {
+                self.subtitle_decoder = None;
+                self.info.selected_subtitle_track = None;
+            }
+        }
+        self.subtitle_frames.clear();
+        self.update_demux_selection()?;
+        self.mark_selected_tracks();
+        Ok(())
     }
 
     pub fn seek(&mut self, position: Duration) -> Result<()> {
@@ -319,8 +412,12 @@ impl PlaybackSession {
         Ok(())
     }
 
-    fn pump_external_subtitles(&mut self, media_time: Duration) -> Result<()> {
-        for external in &mut self.external_subtitles {
+    fn pump_external_subtitles(&mut self, track_id: i64, media_time: Duration) -> Result<()> {
+        if let Some(external) = self
+            .external_subtitles
+            .iter_mut()
+            .find(|track| track.track().id == track_id)
+        {
             external.pump_until(media_time)?;
         }
         Ok(())
@@ -332,6 +429,7 @@ impl PlaybackSession {
             .external_subtitles
             .iter()
             .enumerate()
+            .filter(|(_, external)| Some(external.track().id) == self.info.selected_subtitle_track)
             .filter_map(|(index, external)| external.peek_start().map(|start| (index, start)));
         let candidate = select_ready_subtitle(embedded_start, external_starts, media_time)?;
 
@@ -341,6 +439,73 @@ impl PlaybackSession {
                 self.external_subtitles[index].pop_front()
             }
         }
+    }
+
+    fn selected_external_subtitle(&self, track_id: i64) -> Option<&ExternalSubtitleSession> {
+        self.external_subtitles
+            .iter()
+            .find(|track| track.track().id == track_id)
+    }
+
+    fn embedded_track_stream_index(&self, track_id: i64, kind: TrackKind) -> Result<i32> {
+        let Some(track) = self
+            .info
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id && track.kind == kind)
+        else {
+            return Err(PlaybackError::TrackNotFound { kind, track_id });
+        };
+        stream_index_i32(track.id, kind, track_id)
+    }
+
+    fn subtitle_track_source(&self, track_id: i64) -> Result<SubtitleTrackSource> {
+        self.info
+            .subtitle_tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .map(|track| track.source.clone())
+            .ok_or(PlaybackError::TrackNotFound {
+                kind: TrackKind::Subtitle,
+                track_id,
+            })
+    }
+
+    fn update_demux_selection(&mut self) -> Result<()> {
+        let mut streams = Vec::new();
+        if let Some(track_id) = self.info.selected_video_track {
+            streams.push(self.embedded_track_stream_index(track_id, TrackKind::Video)?);
+        }
+        if let Some(track_id) = self.info.selected_audio_track {
+            streams.push(self.embedded_track_stream_index(track_id, TrackKind::Audio)?);
+        }
+        if let Some(track_id) = self.info.selected_subtitle_track {
+            if let SubtitleTrackSource::Embedded { stream_index } =
+                self.subtitle_track_source(track_id)?
+            {
+                streams.push(stream_index_i32(
+                    stream_index,
+                    TrackKind::Subtitle,
+                    track_id,
+                )?);
+            }
+        }
+        if streams.is_empty() {
+            self.demuxer.set_stream_selection(StreamSelection::all())?;
+        } else {
+            self.demuxer
+                .set_stream_selection(StreamSelection::only(streams))?;
+        }
+        Ok(())
+    }
+
+    fn mark_selected_tracks(&mut self) {
+        mark_selected_tracks(
+            &mut self.info.tracks,
+            self.info.selected_video_track,
+            self.info.selected_audio_track,
+            self.info.selected_subtitle_track,
+        );
     }
 
     fn pump_once(&mut self) -> Result<()> {
@@ -584,6 +749,32 @@ fn external_subtitle_title(uri: &str) -> Option<String> {
         .unwrap_or(uri)
         .trim();
     (!leaf.is_empty()).then_some(leaf.to_string())
+}
+
+fn mark_selected_tracks(
+    tracks: &mut [TrackInfo],
+    selected_video: Option<i64>,
+    selected_audio: Option<i64>,
+    selected_subtitle: Option<i64>,
+) {
+    for track in tracks {
+        track.selected = match track.kind {
+            TrackKind::Video => selected_video == Some(track.id),
+            TrackKind::Audio => selected_audio == Some(track.id),
+            TrackKind::Subtitle => selected_subtitle == Some(track.id),
+        };
+    }
+}
+
+fn clear_subtitle_frame(
+    track_id: Option<i64>,
+    media_time: Duration,
+) -> Option<DecodedSubtitleFrame> {
+    track_id.map(|track_id| DecodedSubtitleFrame::new(track_id, Some(media_time), None))
+}
+
+fn stream_index_i32(stream_index: i64, kind: TrackKind, track_id: i64) -> Result<i32> {
+    i32::try_from(stream_index).map_err(|_| PlaybackError::TrackNotFound { kind, track_id })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1075,11 +1266,26 @@ impl VideoPlaybackEngine {
         self.session.info()
     }
 
+    pub fn track_selection(&self) -> TrackSelection {
+        self.session.track_selection()
+    }
+
     pub fn add_external_subtitle(
         &mut self,
         config: SubtitleTrackConfig,
-    ) -> Result<SubtitleTrackConfig> {
-        self.session.add_external_subtitle(config)
+    ) -> Result<(SubtitleTrackConfig, Option<TimedSubtitleFrame>)> {
+        let media_time = self.media_time();
+        let (track, clear_frame) = self.session.add_external_subtitle(config, media_time)?;
+        self.pending_subtitle = None;
+        Ok((
+            track,
+            clear_frame.map(|frame| TimedSubtitleFrame {
+                frame,
+                pts: Some(media_time),
+                media_time,
+                late_by: None,
+            }),
+        ))
     }
 
     pub fn remove_subtitle_track(&mut self, track_id: i64) -> Result<Option<TimedSubtitleFrame>> {
@@ -1087,12 +1293,51 @@ impl VideoPlaybackEngine {
         let Some(frame) = self.session.remove_subtitle_track(track_id, media_time)? else {
             return Ok(None);
         };
+        self.pending_subtitle = None;
         Ok(Some(TimedSubtitleFrame {
             frame,
             pts: Some(media_time),
             media_time,
             late_by: None,
         }))
+    }
+
+    pub fn select_audio_track(&mut self, track_id: Option<i64>) -> Result<()> {
+        let media_time = self.media_time();
+        self.session.select_audio_track(track_id)?;
+        self.reset_streams_at(media_time)?;
+        Ok(())
+    }
+
+    pub fn select_subtitle_track(
+        &mut self,
+        track_id: Option<i64>,
+    ) -> Result<Option<TimedSubtitleFrame>> {
+        let media_time = self.media_time();
+        let frame = self.session.select_subtitle_track(track_id, media_time)?;
+        self.reset_streams_at(media_time)?;
+        Ok(frame.map(|frame| TimedSubtitleFrame {
+            frame,
+            pts: Some(media_time),
+            media_time,
+            late_by: None,
+        }))
+    }
+
+    fn reset_streams_at(&mut self, media_time: Duration) -> Result<()> {
+        self.session.seek(media_time)?;
+        self.clock.reset(
+            media_time,
+            self.state == PlaybackRunState::Playing,
+            Instant::now(),
+        );
+        self.pending_frame = None;
+        self.pending_audio = None;
+        self.pending_subtitle = None;
+        self.last_presented_pts = None;
+        self.eof = false;
+        self.waiting_for_first_frame = self.state == PlaybackRunState::Playing;
+        Ok(())
     }
 
     pub fn state(&self) -> PlaybackRunState {
@@ -1399,16 +1644,12 @@ mod tests {
 
     #[test]
     fn opened_media_info_keeps_probe_summary() {
+        let mut video_track = TrackInfo::embedded(0, TrackKind::Video);
+        video_track.codec = Some("hevc".to_string());
         let info = OpenedMediaInfo {
             uri: "file:///tmp/test.mp4".to_string(),
             duration: Some(Duration::from_secs(12)),
-            tracks: vec![TrackInfo {
-                id: 0,
-                kind: TrackKind::Video,
-                title: None,
-                language: None,
-                codec: Some("hevc".to_string()),
-            }],
+            tracks: vec![video_track],
             video_params: Some(VideoParams {
                 width: 3840,
                 height: 2160,

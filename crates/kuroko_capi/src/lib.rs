@@ -1,4 +1,4 @@
-use std::ffi::{CStr, c_char};
+use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Duration;
 
@@ -9,8 +9,8 @@ use kuroko::presenter::{PresenterConfig, PresenterRuntime, PresenterStats};
 use kuroko::renderer::metal::{MetalOutputMode, MetalRendererConfig};
 use kuroko::{
     FlutterTextureHandle, FlutterTextureKind, MediaRequest, MetalSurfaceHandle, PlatformSurface,
-    Player, PlayerConfig, PlayerEvent, PlayerState, TrackKind, TransferFunction, WgpuSurfaceHandle,
-    WgpuSurfaceKind,
+    Player, PlayerConfig, PlayerEvent, PlayerState, TrackInfo, TrackKind, TrackSelection,
+    TrackSource, TransferFunction, WgpuSurfaceHandle, WgpuSurfaceKind,
 };
 
 #[repr(C)]
@@ -50,6 +50,58 @@ pub enum KurokoEventKind {
     SurfaceAttached = 7,
     SurfaceDetached = 8,
     Error = 9,
+    TrackSelectionChanged = 10,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KurokoTrackKind {
+    Video = 0,
+    Audio = 1,
+    Subtitle = 2,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KurokoTrackSource {
+    Embedded = 0,
+    External = 1,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KurokoTrackSelection {
+    pub video: i64,
+    pub audio: i64,
+    pub subtitle: i64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KurokoTrackInfo {
+    pub id: i64,
+    pub kind: KurokoTrackKind,
+    pub source: KurokoTrackSource,
+    pub selected: bool,
+    pub can_remove: bool,
+    pub title: *mut c_char,
+    pub language: *mut c_char,
+    pub codec: *mut c_char,
+}
+
+impl Default for KurokoTrackInfo {
+    fn default() -> Self {
+        Self {
+            id: -1,
+            kind: KurokoTrackKind::Video,
+            source: KurokoTrackSource::Embedded,
+            selected: false,
+            can_remove: false,
+            title: std::ptr::null_mut(),
+            language: std::ptr::null_mut(),
+            codec: std::ptr::null_mut(),
+        }
+    }
 }
 
 #[repr(C)]
@@ -275,6 +327,70 @@ pub unsafe extern "C" fn kuroko_remove_subtitle_track(
     with_handle_mut(handle, |handle| {
         status_from_player_result(handle.player.remove_subtitle_track(track_id))
     })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_select_audio_track(
+    handle: *mut KurokoHandle,
+    track_id: i64,
+) -> KurokoStatus {
+    with_handle_mut(handle, |handle| {
+        status_from_player_result(handle.player.select_audio_track(track_id_option(track_id)))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_select_subtitle_track(
+    handle: *mut KurokoHandle,
+    track_id: i64,
+) -> KurokoStatus {
+    with_handle_mut(handle, |handle| {
+        status_from_player_result(
+            handle
+                .player
+                .select_subtitle_track(track_id_option(track_id)),
+        )
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_track_selection(
+    handle: *mut KurokoHandle,
+    out_selection: *mut KurokoTrackSelection,
+) -> KurokoStatus {
+    if out_selection.is_null() {
+        return KurokoStatus::NullPointer;
+    }
+    with_handle_mut(handle, |handle| {
+        unsafe { *out_selection = track_selection_to_c(handle.player.track_selection()) };
+        KurokoStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_tracks(
+    handle: *mut KurokoHandle,
+    out_tracks: *mut KurokoTrackInfo,
+    capacity: usize,
+    out_len: *mut usize,
+) -> KurokoStatus {
+    if out_len.is_null() || (capacity > 0 && out_tracks.is_null()) {
+        return KurokoStatus::NullPointer;
+    }
+    with_handle_mut(handle, |handle| {
+        write_tracks_to_c(&handle.player.tracks(), out_tracks, capacity, out_len)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_track_info_free(track: *mut KurokoTrackInfo) {
+    if track.is_null() {
+        return;
+    }
+    let track = unsafe { &mut *track };
+    free_c_string(&mut track.title);
+    free_c_string(&mut track.language);
+    free_c_string(&mut track.codec);
 }
 
 #[unsafe(no_mangle)]
@@ -597,11 +713,110 @@ pub unsafe extern "C" fn kuroko_presenter_remove_subtitle_track(
     })
 }
 
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_select_audio_track(
+    handle: *mut KurokoPresenterHandle,
+    track_id: i64,
+) -> KurokoStatus {
+    with_presenter_mut(handle, |handle| {
+        status_from_player_result(
+            handle
+                .presenter
+                .select_audio_track(track_id_option(track_id)),
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_select_subtitle_track(
+    handle: *mut KurokoPresenterHandle,
+    track_id: i64,
+) -> KurokoStatus {
+    with_presenter_mut(handle, |handle| {
+        status_from_player_result(
+            handle
+                .presenter
+                .select_subtitle_track(track_id_option(track_id)),
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_track_selection(
+    handle: *mut KurokoPresenterHandle,
+    out_selection: *mut KurokoTrackSelection,
+) -> KurokoStatus {
+    if out_selection.is_null() {
+        return KurokoStatus::NullPointer;
+    }
+    with_presenter_mut(handle, |handle| {
+        unsafe { *out_selection = track_selection_to_c(handle.presenter.track_selection()) };
+        KurokoStatus::Ok
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_tracks(
+    handle: *mut KurokoPresenterHandle,
+    out_tracks: *mut KurokoTrackInfo,
+    capacity: usize,
+    out_len: *mut usize,
+) -> KurokoStatus {
+    if out_len.is_null() || (capacity > 0 && out_tracks.is_null()) {
+        return KurokoStatus::NullPointer;
+    }
+    with_presenter_mut(handle, |handle| {
+        write_tracks_to_c(&handle.presenter.tracks(), out_tracks, capacity, out_len)
+    })
+}
+
 #[cfg(not(target_os = "macos"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_remove_subtitle_track(
     _handle: *mut std::ffi::c_void,
     _track_id: i64,
+) -> KurokoStatus {
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_select_audio_track(
+    _handle: *mut std::ffi::c_void,
+    _track_id: i64,
+) -> KurokoStatus {
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_select_subtitle_track(
+    _handle: *mut std::ffi::c_void,
+    _track_id: i64,
+) -> KurokoStatus {
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_track_selection(
+    _handle: *mut std::ffi::c_void,
+    _out_selection: *mut KurokoTrackSelection,
+) -> KurokoStatus {
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_tracks(
+    _handle: *mut std::ffi::c_void,
+    _out_tracks: *mut KurokoTrackInfo,
+    _capacity: usize,
+    _out_len: *mut usize,
 ) -> KurokoStatus {
     KurokoStatus::PlayerError
 }
@@ -731,6 +946,82 @@ fn status_from_player_result(result: kuroko::Result<()>) -> KurokoStatus {
     }
 }
 
+fn track_id_option(track_id: i64) -> Option<i64> {
+    (track_id >= 0).then_some(track_id)
+}
+
+fn write_tracks_to_c(
+    tracks: &[TrackInfo],
+    out_tracks: *mut KurokoTrackInfo,
+    capacity: usize,
+    out_len: *mut usize,
+) -> KurokoStatus {
+    unsafe { *out_len = tracks.len() };
+    if capacity == 0 {
+        return KurokoStatus::Ok;
+    }
+    let count = tracks.len().min(capacity);
+    for (index, track) in tracks.iter().take(count).enumerate() {
+        unsafe { *out_tracks.add(index) = track_info_to_c(track) };
+    }
+    KurokoStatus::Ok
+}
+
+fn track_info_to_c(track: &TrackInfo) -> KurokoTrackInfo {
+    KurokoTrackInfo {
+        id: track.id,
+        kind: track_kind_to_c(track.kind),
+        source: track_source_to_c(track.source),
+        selected: track.selected,
+        can_remove: track.can_remove,
+        title: option_string_to_c(track.title.as_deref()),
+        language: option_string_to_c(track.language.as_deref()),
+        codec: option_string_to_c(track.codec.as_deref()),
+    }
+}
+
+fn track_kind_to_c(kind: TrackKind) -> KurokoTrackKind {
+    match kind {
+        TrackKind::Video => KurokoTrackKind::Video,
+        TrackKind::Audio => KurokoTrackKind::Audio,
+        TrackKind::Subtitle => KurokoTrackKind::Subtitle,
+    }
+}
+
+fn track_source_to_c(source: TrackSource) -> KurokoTrackSource {
+    match source {
+        TrackSource::Embedded => KurokoTrackSource::Embedded,
+        TrackSource::External => KurokoTrackSource::External,
+    }
+}
+
+fn track_selection_to_c(selection: TrackSelection) -> KurokoTrackSelection {
+    KurokoTrackSelection {
+        video: selection.video.unwrap_or(-1),
+        audio: selection.audio.unwrap_or(-1),
+        subtitle: selection.subtitle.unwrap_or(-1),
+    }
+}
+
+fn option_string_to_c(value: Option<&str>) -> *mut c_char {
+    let Some(value) = value else {
+        return std::ptr::null_mut();
+    };
+    match CString::new(value) {
+        Ok(value) => value.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+fn free_c_string(ptr: &mut *mut c_char) {
+    if ptr.is_null() {
+        return;
+    }
+    let raw = *ptr;
+    *ptr = std::ptr::null_mut();
+    unsafe { drop(CString::from_raw(raw)) };
+}
+
 fn event_to_c(event: PlayerEvent) -> KurokoEvent {
     match event {
         PlayerEvent::StateChanged(state) => KurokoEvent {
@@ -763,6 +1054,10 @@ fn event_to_c(event: PlayerEvent) -> KurokoEvent {
                 ..KurokoEvent::default()
             }
         }
+        PlayerEvent::TrackSelectionChanged(_) => KurokoEvent {
+            kind: KurokoEventKind::TrackSelectionChanged,
+            ..KurokoEvent::default()
+        },
         PlayerEvent::BufferingChanged(buffering) => KurokoEvent {
             kind: KurokoEventKind::BufferingChanged,
             buffering,
@@ -878,26 +1173,72 @@ mod tests {
     #[test]
     fn c_event_counts_tracks() {
         let event = event_to_c(PlayerEvent::TracksChanged(vec![
-            kuroko::TrackInfo {
-                id: 0,
-                kind: TrackKind::Video,
-                title: None,
-                language: None,
-                codec: None,
-            },
-            kuroko::TrackInfo {
-                id: 1,
-                kind: TrackKind::Audio,
-                title: None,
-                language: None,
-                codec: None,
-            },
+            kuroko::TrackInfo::embedded(0, TrackKind::Video),
+            kuroko::TrackInfo::embedded(1, TrackKind::Audio),
         ]));
 
         assert_eq!(event.kind, KurokoEventKind::TracksChanged);
         assert_eq!(event.tracks.video, 1);
         assert_eq!(event.tracks.audio, 1);
         assert_eq!(event.tracks.subtitle, 0);
+    }
+
+    #[test]
+    fn c_event_reports_track_selection_changed() {
+        let event = event_to_c(PlayerEvent::TrackSelectionChanged(kuroko::TrackSelection {
+            video: Some(0),
+            audio: Some(1),
+            subtitle: None,
+        }));
+
+        assert_eq!(event.kind, KurokoEventKind::TrackSelectionChanged);
+    }
+
+    #[test]
+    fn c_track_info_maps_source_selection_and_strings() {
+        let mut track = kuroko::TrackInfo::external(1_000_001, TrackKind::Subtitle);
+        track.selected = true;
+        track.title = Some("Signs".to_string());
+        track.language = Some("jpn".to_string());
+        track.codec = Some("ass".to_string());
+
+        let mut c_track = track_info_to_c(&track);
+
+        assert_eq!(c_track.id, 1_000_001);
+        assert_eq!(c_track.kind, KurokoTrackKind::Subtitle);
+        assert_eq!(c_track.source, KurokoTrackSource::External);
+        assert!(c_track.selected);
+        assert!(c_track.can_remove);
+        assert_eq!(
+            unsafe { CStr::from_ptr(c_track.title).to_str().unwrap() },
+            "Signs"
+        );
+        assert_eq!(
+            unsafe { CStr::from_ptr(c_track.language).to_str().unwrap() },
+            "jpn"
+        );
+        assert_eq!(
+            unsafe { CStr::from_ptr(c_track.codec).to_str().unwrap() },
+            "ass"
+        );
+
+        unsafe { kuroko_track_info_free(&mut c_track) };
+        assert!(c_track.title.is_null());
+        assert!(c_track.language.is_null());
+        assert!(c_track.codec.is_null());
+    }
+
+    #[test]
+    fn c_track_selection_uses_negative_one_for_disabled_tracks() {
+        let selection = track_selection_to_c(kuroko::TrackSelection {
+            video: Some(0),
+            audio: None,
+            subtitle: Some(2),
+        });
+
+        assert_eq!(selection.video, 0);
+        assert_eq!(selection.audio, -1);
+        assert_eq!(selection.subtitle, 2);
     }
 
     #[test]

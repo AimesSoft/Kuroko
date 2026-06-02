@@ -108,6 +108,37 @@ class KurokoPlayer {
     });
   }
 
+  Future<void> selectAudioTrack(int? trackId) async {
+    final playerId = await ensureCreated();
+    await _invoke('selectAudioTrack', <String, Object?>{
+      'playerId': playerId,
+      'trackId': trackId,
+    });
+  }
+
+  Future<void> selectSubtitleTrack(int? trackId) async {
+    final playerId = await ensureCreated();
+    await _invoke('selectSubtitleTrack', <String, Object?>{
+      'playerId': playerId,
+      'trackId': trackId,
+    });
+  }
+
+  Future<List<KurokoTrackInfo>> tracks() async {
+    final playerId = await ensureCreated();
+    final rawTracks = await _channel.invokeMethod<List<dynamic>>(
+      'tracks',
+      <String, Object?>{'playerId': playerId},
+    );
+    if (rawTracks == null) {
+      return const <KurokoTrackInfo>[];
+    }
+    return rawTracks
+        .whereType<Map<dynamic, dynamic>>()
+        .map(KurokoTrackInfo.fromMap)
+        .toList(growable: false);
+  }
+
   Future<void> attachView(int viewId) async {
     final playerId = await ensureCreated();
     await _invoke('attachView', <String, Object?>{

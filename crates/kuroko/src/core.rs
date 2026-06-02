@@ -134,6 +134,18 @@ pub enum TrackKind {
     Subtitle,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackSource {
+    Embedded,
+    External,
+}
+
+impl Default for TrackSource {
+    fn default() -> Self {
+        Self::Embedded
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackInfo {
     pub id: i64,
@@ -141,6 +153,39 @@ pub struct TrackInfo {
     pub title: Option<String>,
     pub language: Option<String>,
     pub codec: Option<String>,
+    pub selected: bool,
+    pub source: TrackSource,
+    pub can_remove: bool,
+}
+
+impl TrackInfo {
+    pub fn embedded(id: i64, kind: TrackKind) -> Self {
+        Self {
+            id,
+            kind,
+            title: None,
+            language: None,
+            codec: None,
+            selected: false,
+            source: TrackSource::Embedded,
+            can_remove: false,
+        }
+    }
+
+    pub fn external(id: i64, kind: TrackKind) -> Self {
+        Self {
+            source: TrackSource::External,
+            can_remove: true,
+            ..Self::embedded(id, kind)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TrackSelection {
+    pub video: Option<i64>,
+    pub audio: Option<i64>,
+    pub subtitle: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +219,7 @@ pub enum PlayerEvent {
     DurationChanged(Option<Duration>),
     PositionChanged(Duration),
     TracksChanged(Vec<TrackInfo>),
+    TrackSelectionChanged(TrackSelection),
     BufferingChanged(bool),
     VideoParamsChanged(VideoParams),
     SurfaceAttached(PlatformSurface),
@@ -330,6 +376,8 @@ struct PlayerInner {
     media: Option<MediaRequest>,
     playback: Option<PlaybackRuntime>,
     surface: Option<PlatformSurface>,
+    tracks: Vec<TrackInfo>,
+    track_selection: TrackSelection,
     subscribers: Vec<Sender<PlayerEvent>>,
     video_frame_sender: Option<Sender<PlayerVideoFrame>>,
     audio_frame_sender: Option<Sender<PlayerAudioFrame>>,
@@ -344,6 +392,8 @@ enum PlaybackCommand {
     AudioClock(AudioClockSnapshot),
     AddExternalSubtitle(SubtitleTrackConfig),
     RemoveSubtitleTrack(i64),
+    SelectAudioTrack(Option<i64>),
+    SelectSubtitleTrack(Option<i64>),
     Shutdown,
 }
 
@@ -400,6 +450,8 @@ impl Player {
                 media: None,
                 playback: None,
                 surface: None,
+                tracks: Vec::new(),
+                track_selection: TrackSelection::default(),
                 subscribers: Vec::new(),
                 video_frame_sender: None,
                 audio_frame_sender: None,
@@ -483,9 +535,12 @@ impl Player {
             let mut inner = self.inner.lock().expect("player mutex poisoned");
             inner.media = Some(media);
             inner.playback = Some(runtime);
+            inner.tracks = info.tracks.clone();
+            inner.track_selection = info.track_selection();
         }
         self.emit(PlayerEvent::DurationChanged(info.duration));
-        self.emit(PlayerEvent::TracksChanged(info.tracks));
+        self.emit(PlayerEvent::TracksChanged(info.tracks.clone()));
+        self.emit(PlayerEvent::TrackSelectionChanged(info.track_selection()));
         if let Some(params) = info.video_params {
             self.emit(PlayerEvent::VideoParamsChanged(params));
         }
@@ -541,6 +596,31 @@ impl Player {
         self.send_playback_command(PlaybackCommand::RemoveSubtitleTrack(track_id))
     }
 
+    pub fn select_audio_track(&self, track_id: Option<i64>) -> Result<()> {
+        self.ensure_not_closed()?;
+        self.send_playback_command(PlaybackCommand::SelectAudioTrack(track_id))
+    }
+
+    pub fn select_subtitle_track(&self, track_id: Option<i64>) -> Result<()> {
+        self.ensure_not_closed()?;
+        self.send_playback_command(PlaybackCommand::SelectSubtitleTrack(track_id))
+    }
+
+    pub fn tracks(&self) -> Vec<TrackInfo> {
+        self.inner
+            .lock()
+            .expect("player mutex poisoned")
+            .tracks
+            .clone()
+    }
+
+    pub fn track_selection(&self) -> TrackSelection {
+        self.inner
+            .lock()
+            .expect("player mutex poisoned")
+            .track_selection
+    }
+
     pub fn stop(&self) -> Result<()> {
         self.ensure_not_closed()?;
         self.send_playback_command(PlaybackCommand::Stop)?;
@@ -561,7 +641,12 @@ impl Player {
 
     pub fn close(&self) -> Result<()> {
         self.replace_playback(None);
-        self.inner.lock().expect("player mutex poisoned").media = None;
+        {
+            let mut inner = self.inner.lock().expect("player mutex poisoned");
+            inner.media = None;
+            inner.tracks.clear();
+            inner.track_selection = TrackSelection::default();
+        }
         self.transition(PlayerState::Closed)
     }
 
@@ -757,10 +842,20 @@ fn handle_playback_command(
         }
         PlaybackCommand::AddExternalSubtitle(config) => {
             match engine.add_external_subtitle(config) {
-                Ok(_) => emit_from_worker(
-                    inner,
-                    PlayerEvent::TracksChanged(engine.info().tracks.clone()),
-                ),
+                Ok((_, clear_frame)) => {
+                    if let Some(frame) = clear_frame {
+                        emit_subtitle_frame_from_worker(
+                            inner,
+                            PlayerSubtitleFrame {
+                                frame: frame.frame,
+                                pts: frame.pts,
+                                media_time: frame.media_time,
+                                late_by: frame.late_by,
+                            },
+                        );
+                    }
+                    sync_track_state_from_worker(inner, engine);
+                }
                 Err(error) => emit_from_worker(
                     inner,
                     PlayerEvent::Error(PlayerError::Playback(error.to_string())),
@@ -779,12 +874,37 @@ fn handle_playback_command(
                             late_by: frame.late_by,
                         },
                     );
-                    emit_from_worker(
-                        inner,
-                        PlayerEvent::TracksChanged(engine.info().tracks.clone()),
-                    );
+                    sync_track_state_from_worker(inner, engine);
                 }
                 Ok(None) => {}
+                Err(error) => emit_from_worker(
+                    inner,
+                    PlayerEvent::Error(PlayerError::Playback(error.to_string())),
+                ),
+            }
+        }
+        PlaybackCommand::SelectAudioTrack(track_id) => match engine.select_audio_track(track_id) {
+            Ok(()) => sync_track_state_from_worker(inner, engine),
+            Err(error) => emit_from_worker(
+                inner,
+                PlayerEvent::Error(PlayerError::Playback(error.to_string())),
+            ),
+        },
+        PlaybackCommand::SelectSubtitleTrack(track_id) => {
+            match engine.select_subtitle_track(track_id) {
+                Ok(Some(frame)) => {
+                    emit_subtitle_frame_from_worker(
+                        inner,
+                        PlayerSubtitleFrame {
+                            frame: frame.frame,
+                            pts: frame.pts,
+                            media_time: frame.media_time,
+                            late_by: frame.late_by,
+                        },
+                    );
+                    sync_track_state_from_worker(inner, engine);
+                }
+                Ok(None) => sync_track_state_from_worker(inner, engine),
                 Err(error) => emit_from_worker(
                     inner,
                     PlayerEvent::Error(PlayerError::Playback(error.to_string())),
@@ -794,6 +914,26 @@ fn handle_playback_command(
         PlaybackCommand::Shutdown => return false,
     }
     true
+}
+
+fn sync_track_state_from_worker(inner: &Arc<Mutex<PlayerInner>>, engine: &VideoPlaybackEngine) {
+    let tracks = engine.info().tracks.clone();
+    let selection = engine.track_selection();
+    let mut events = Vec::new();
+    {
+        let mut inner = inner.lock().expect("player mutex poisoned");
+        if inner.tracks != tracks {
+            inner.tracks = tracks.clone();
+            events.push(PlayerEvent::TracksChanged(tracks));
+        }
+        if inner.track_selection != selection {
+            inner.track_selection = selection;
+            events.push(PlayerEvent::TrackSelectionChanged(selection));
+        }
+    }
+    for event in events {
+        emit_from_worker(inner, event);
+    }
 }
 
 fn playback_poll_interval(state: PlaybackRunState) -> Duration {
@@ -956,6 +1096,14 @@ mod tests {
 
         assert!(first.try_recv().is_err());
         assert!(second.try_recv().is_ok());
+    }
+
+    #[test]
+    fn player_track_cache_defaults_to_empty_selection() {
+        let player = Player::new(PlayerConfig::default());
+
+        assert!(player.tracks().is_empty());
+        assert_eq!(player.track_selection(), TrackSelection::default());
     }
 
     #[test]

@@ -20,6 +20,18 @@ enum KurokoEventKind {
   surfaceAttached,
   surfaceDetached,
   error,
+  trackSelectionChanged,
+}
+
+enum KurokoTrackKind {
+  video,
+  audio,
+  subtitle,
+}
+
+enum KurokoTrackSource {
+  embedded,
+  external,
 }
 
 class KurokoVideoParams {
@@ -85,6 +97,103 @@ class KurokoTrackCounts {
   }
 }
 
+class KurokoTrackSelection {
+  const KurokoTrackSelection({
+    this.video,
+    this.audio,
+    this.subtitle,
+  });
+
+  factory KurokoTrackSelection.fromMap(Map<dynamic, dynamic>? map) {
+    return KurokoTrackSelection(
+      video: _trackId(map?['video']),
+      audio: _trackId(map?['audio']),
+      subtitle: _trackId(map?['subtitle']),
+    );
+  }
+
+  final int? video;
+  final int? audio;
+  final int? subtitle;
+
+  static int? _trackId(Object? value) {
+    final id = _asInt(value);
+    return id >= 0 ? id : null;
+  }
+
+  static int _asInt(Object? value) {
+    if (value is int) {
+      return value;
+    }
+    if (value is num) {
+      return value.toInt();
+    }
+    return -1;
+  }
+}
+
+class KurokoTrackInfo {
+  const KurokoTrackInfo({
+    required this.id,
+    required this.kind,
+    required this.source,
+    required this.selected,
+    required this.canRemove,
+    this.title,
+    this.language,
+    this.codec,
+  });
+
+  factory KurokoTrackInfo.fromMap(Map<dynamic, dynamic> map) {
+    return KurokoTrackInfo(
+      id: _asInt(map['id']),
+      kind: _trackKindFromIndex(_asInt(map['kind'])),
+      source: _trackSourceFromIndex(_asInt(map['source'])),
+      selected: map['selected'] == true,
+      canRemove: map['canRemove'] == true,
+      title: map['title'] as String?,
+      language: map['language'] as String?,
+      codec: map['codec'] as String?,
+    );
+  }
+
+  final int id;
+  final KurokoTrackKind kind;
+  final KurokoTrackSource source;
+  final bool selected;
+  final bool canRemove;
+  final String? title;
+  final String? language;
+  final String? codec;
+
+  bool get isEmbedded => source == KurokoTrackSource.embedded;
+  bool get isExternal => source == KurokoTrackSource.external;
+
+  static int _asInt(Object? value) {
+    if (value is int) {
+      return value;
+    }
+    if (value is num) {
+      return value.toInt();
+    }
+    return 0;
+  }
+
+  static KurokoTrackKind _trackKindFromIndex(int index) {
+    if (index >= 0 && index < KurokoTrackKind.values.length) {
+      return KurokoTrackKind.values[index];
+    }
+    return KurokoTrackKind.video;
+  }
+
+  static KurokoTrackSource _trackSourceFromIndex(int index) {
+    if (index >= 0 && index < KurokoTrackSource.values.length) {
+      return KurokoTrackSource.values[index];
+    }
+    return KurokoTrackSource.embedded;
+  }
+}
+
 class KurokoPlayerEvent {
   const KurokoPlayerEvent({
     required this.playerId,
@@ -95,6 +204,8 @@ class KurokoPlayerEvent {
     required this.buffering,
     required this.video,
     required this.tracks,
+    required this.trackList,
+    required this.trackSelection,
     this.status = 0,
   });
 
@@ -110,6 +221,10 @@ class KurokoPlayerEvent {
       tracks: KurokoTrackCounts.fromMap(
         map['tracks'] as Map<dynamic, dynamic>?,
       ),
+      trackList: _trackListFromValue(map['trackList']),
+      trackSelection: KurokoTrackSelection.fromMap(
+        map['trackSelection'] as Map<dynamic, dynamic>?,
+      ),
       status: _asInt(map['status']),
     );
   }
@@ -122,6 +237,8 @@ class KurokoPlayerEvent {
   final bool buffering;
   final KurokoVideoParams video;
   final KurokoTrackCounts tracks;
+  final List<KurokoTrackInfo> trackList;
+  final KurokoTrackSelection trackSelection;
   final int status;
 
   static int _asInt(Object? value) {
@@ -146,5 +263,15 @@ class KurokoPlayerEvent {
       return KurokoPlaybackState.values[index];
     }
     return KurokoPlaybackState.error;
+  }
+
+  static List<KurokoTrackInfo> _trackListFromValue(Object? value) {
+    if (value is! List) {
+      return const <KurokoTrackInfo>[];
+    }
+    return value
+        .whereType<Map<dynamic, dynamic>>()
+        .map(KurokoTrackInfo.fromMap)
+        .toList(growable: false);
   }
 }
