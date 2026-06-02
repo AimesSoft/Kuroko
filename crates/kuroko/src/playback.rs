@@ -7,9 +7,10 @@ use crate::audio::AudioClockSnapshot;
 use crate::core::{MediaRequest, TrackInfo, TrackKind, VideoParams};
 use crate::ffmpeg::{
     self, AudioResampler, Decoder, DecoderBackend, DecoderConfig, DecoderOutputFrame, Demuxer,
-    Frame, PcmAudioFrame, PcmFormat, StreamSelection,
+    Frame, PcmAudioFrame, PcmFormat, StreamSelection, SubtitleDecoder,
 };
 use crate::source::{self, source_from_uri_with_hint};
+use crate::subtitle::{DecodedSubtitleFrame, SubtitleTrackConfig};
 
 #[derive(Debug, Error)]
 pub enum PlaybackError {
@@ -27,6 +28,7 @@ pub type Result<T> = std::result::Result<T, PlaybackError>;
 
 const VIDEO_FRAME_QUEUE_LIMIT: usize = 8;
 const AUDIO_FRAME_QUEUE_LIMIT: usize = 16;
+const SUBTITLE_FRAME_QUEUE_LIMIT: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoDecodePreference {
@@ -82,6 +84,8 @@ pub struct OpenedMediaInfo {
     pub video_params: Option<VideoParams>,
     pub selected_video_track: Option<i64>,
     pub selected_audio_track: Option<i64>,
+    pub selected_subtitle_track: Option<i64>,
+    pub subtitle_tracks: Vec<SubtitleTrackConfig>,
     pub video_decode_backend: Option<DecoderBackend>,
     pub audio_output: Option<PcmFormat>,
 }
@@ -90,11 +94,13 @@ pub struct PlaybackSession {
     demuxer: Demuxer,
     video_decoder: Option<Decoder>,
     audio_decoder: Option<Decoder>,
+    subtitle_decoder: Option<SubtitleDecoder>,
     audio_resampler: Option<AudioResampler>,
     audio_output: PcmFormat,
     info: OpenedMediaInfo,
     video_frames: VecDeque<Frame>,
     audio_frames: VecDeque<PcmAudioFrame>,
+    subtitle_frames: VecDeque<DecodedSubtitleFrame>,
     eof: bool,
 }
 
@@ -116,6 +122,12 @@ impl PlaybackSession {
             .iter()
             .find(|track| track.kind == TrackKind::Audio)
             .map(|track| track.id as i32);
+        let selected_subtitle_track = demuxer
+            .probe()
+            .tracks
+            .iter()
+            .find(|track| track.kind == TrackKind::Subtitle)
+            .map(|track| track.id as i32);
 
         let mut video_decoder = None;
         let mut selected_streams = Vec::new();
@@ -132,6 +144,20 @@ impl PlaybackSession {
             selected_streams.push(stream_index);
             let parameters = demuxer.codec_parameters(stream_index)?;
             audio_decoder = Some(Decoder::open(parameters)?);
+        }
+        let mut subtitle_decoder = None;
+        let mut opened_subtitle_track = None;
+        if let Some(stream_index) = selected_subtitle_track {
+            match demuxer.open_subtitle_decoder(stream_index) {
+                Ok(decoder) => {
+                    selected_streams.push(stream_index);
+                    opened_subtitle_track = Some(stream_index);
+                    subtitle_decoder = Some(decoder);
+                }
+                Err(error) => {
+                    eprintln!("Kuroko playback subtitle decoder open failed: {error}");
+                }
+            }
         }
         if !selected_streams.is_empty() {
             demuxer.set_stream_selection(StreamSelection::only(selected_streams))?;
@@ -152,6 +178,8 @@ impl PlaybackSession {
             video_params,
             selected_video_track: selected_video_track.map(i64::from),
             selected_audio_track: selected_audio_track.map(i64::from),
+            selected_subtitle_track: opened_subtitle_track.map(i64::from),
+            subtitle_tracks: probe.subtitles,
             video_decode_backend: video_decoder.as_ref().map(Decoder::backend),
             audio_output: audio_decoder.as_ref().map(|_| config.audio_output),
         };
@@ -160,11 +188,13 @@ impl PlaybackSession {
             demuxer,
             video_decoder,
             audio_decoder,
+            subtitle_decoder,
             audio_resampler: None,
             audio_output: config.audio_output,
             info,
             video_frames: VecDeque::new(),
             audio_frames: VecDeque::new(),
+            subtitle_frames: VecDeque::new(),
             eof: false,
         })
     }
@@ -196,6 +226,13 @@ impl PlaybackSession {
         Ok(self.audio_frames.pop_front())
     }
 
+    pub fn next_subtitle_frame(&mut self) -> Result<Option<DecodedSubtitleFrame>> {
+        if self.subtitle_decoder.is_none() {
+            return Ok(None);
+        }
+        Ok(self.subtitle_frames.pop_front())
+    }
+
     pub fn seek(&mut self, position: Duration) -> Result<()> {
         self.demuxer.seek(position)?;
         if let Some(decoder) = &mut self.video_decoder {
@@ -204,9 +241,13 @@ impl PlaybackSession {
         if let Some(decoder) = &mut self.audio_decoder {
             decoder.flush();
         }
+        if let Some(decoder) = &mut self.subtitle_decoder {
+            decoder.flush();
+        }
         self.audio_resampler = None;
         self.video_frames.clear();
         self.audio_frames.clear();
+        self.subtitle_frames.clear();
         self.eof = false;
         Ok(())
     }
@@ -242,6 +283,22 @@ impl PlaybackSession {
             }
             self.drain_audio_frames()?;
             trim_audio_queue(&mut self.audio_frames);
+            return Ok(());
+        }
+
+        if self
+            .subtitle_decoder
+            .as_ref()
+            .is_some_and(|decoder| packet.stream_index() == decoder.stream_index())
+        {
+            let decoder = self
+                .subtitle_decoder
+                .as_mut()
+                .expect("subtitle decoder exists");
+            if let Some(frame) = decoder.decode_packet(&packet)? {
+                self.subtitle_frames.push_back(frame);
+                trim_subtitle_queue(&mut self.subtitle_frames);
+            }
         }
         Ok(())
     }
@@ -729,6 +786,13 @@ pub struct TimedAudioFrame {
     pub late_by: Option<Duration>,
 }
 
+pub struct TimedSubtitleFrame {
+    pub frame: DecodedSubtitleFrame,
+    pub pts: Option<Duration>,
+    pub media_time: Duration,
+    pub late_by: Option<Duration>,
+}
+
 pub struct VideoPlaybackEngine {
     session: PlaybackSession,
     state: PlaybackRunState,
@@ -736,6 +800,7 @@ pub struct VideoPlaybackEngine {
     timing: PlaybackTimingConfig,
     pending_frame: Option<Frame>,
     pending_audio: Option<PcmAudioFrame>,
+    pending_subtitle: Option<DecodedSubtitleFrame>,
     last_presented_pts: Option<Duration>,
     eof: bool,
     waiting_for_first_frame: bool,
@@ -767,6 +832,7 @@ impl VideoPlaybackEngine {
             timing,
             pending_frame: None,
             pending_audio: None,
+            pending_subtitle: None,
             last_presented_pts: None,
             eof: false,
             waiting_for_first_frame: false,
@@ -805,6 +871,7 @@ impl VideoPlaybackEngine {
         self.clock.reset(Duration::ZERO, false, Instant::now());
         self.pending_frame = None;
         self.pending_audio = None;
+        self.pending_subtitle = None;
         self.last_presented_pts = None;
         self.state = PlaybackRunState::Stopped;
         self.eof = false;
@@ -820,6 +887,7 @@ impl VideoPlaybackEngine {
         );
         self.pending_frame = None;
         self.pending_audio = None;
+        self.pending_subtitle = None;
         self.last_presented_pts = None;
         self.eof = false;
         self.waiting_for_first_frame = self.state == PlaybackRunState::Playing;
@@ -885,6 +953,34 @@ impl VideoPlaybackEngine {
             self.sync_clock_to_audio(pts, now);
         }
         Ok(Some(TimedAudioFrame {
+            frame,
+            pts,
+            media_time,
+            late_by,
+        }))
+    }
+
+    pub fn tick_subtitle(&mut self) -> Result<Option<TimedSubtitleFrame>> {
+        if self.state != PlaybackRunState::Playing {
+            return Ok(None);
+        }
+        self.ensure_pending_subtitle()?;
+        let Some(frame) = self.pending_subtitle.as_ref() else {
+            return Ok(None);
+        };
+
+        let pts = frame.start;
+        let media_time = self.media_time();
+        if pts.is_some_and(|pts| pts > media_time) {
+            return Ok(None);
+        }
+
+        let frame = self
+            .pending_subtitle
+            .take()
+            .expect("pending subtitle exists");
+        let late_by = pts.and_then(|pts| media_time.checked_sub(pts));
+        Ok(Some(TimedSubtitleFrame {
             frame,
             pts,
             media_time,
@@ -966,6 +1062,14 @@ impl VideoPlaybackEngine {
         Ok(())
     }
 
+    fn ensure_pending_subtitle(&mut self) -> Result<()> {
+        if self.pending_subtitle.is_some() || self.eof {
+            return Ok(());
+        }
+        self.pending_subtitle = self.session.next_subtitle_frame()?;
+        Ok(())
+    }
+
     fn sync_clock_to_audio(&mut self, pts: Duration, now: Instant) {
         if self.timing.clock_mode != PlaybackClockMode::AudioMaster {
             return;
@@ -993,6 +1097,12 @@ fn trim_video_queue(frames: &mut VecDeque<Frame>) {
 
 fn trim_audio_queue(frames: &mut VecDeque<PcmAudioFrame>) {
     while frames.len() > AUDIO_FRAME_QUEUE_LIMIT {
+        let _ = frames.pop_front();
+    }
+}
+
+fn trim_subtitle_queue(frames: &mut VecDeque<DecodedSubtitleFrame>) {
+    while frames.len() > SUBTITLE_FRAME_QUEUE_LIMIT {
         let _ = frames.pop_front();
     }
 }
@@ -1054,6 +1164,8 @@ mod tests {
             }),
             selected_video_track: Some(0),
             selected_audio_track: Some(1),
+            selected_subtitle_track: Some(2),
+            subtitle_tracks: vec![crate::subtitle::SubtitleTrackConfig::embedded(2, 2)],
             video_decode_backend: Some(DecoderBackend::Software),
             audio_output: Some(PcmFormat::default()),
         };
@@ -1066,6 +1178,8 @@ mod tests {
         );
         assert_eq!(info.selected_video_track, Some(0));
         assert_eq!(info.selected_audio_track, Some(1));
+        assert_eq!(info.selected_subtitle_track, Some(2));
+        assert_eq!(info.subtitle_tracks.len(), 1);
         assert_eq!(info.video_decode_backend, Some(DecoderBackend::Software));
         assert_eq!(info.audio_output, Some(PcmFormat::default()));
     }

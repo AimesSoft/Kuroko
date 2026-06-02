@@ -4,8 +4,8 @@ use crossbeam_channel::Receiver;
 
 use crate::apple::coreaudio::{CoreAudioOutput, CoreAudioOutputConfig};
 use crate::core::{
-    MediaRequest, PlatformSurface, Player, PlayerAudioFrame, PlayerConfig, PlayerVideoFrame,
-    RendererBackend,
+    MediaRequest, PlatformSurface, Player, PlayerAudioFrame, PlayerConfig, PlayerSubtitleFrame,
+    PlayerVideoFrame, RendererBackend,
 };
 use crate::ffmpeg::Frame;
 use crate::overlay::{OverlayFrame, OverlayTimeline, OverlayViewport};
@@ -40,6 +40,7 @@ pub struct PresenterStats {
     pub rendered_video_frames: u64,
     pub rendered_test_frames: u64,
     pub pushed_audio_frames: u64,
+    pub decoded_subtitle_frames: u64,
     pub overlay_frames: u64,
     pub import_failures: u64,
     pub render_failures: u64,
@@ -51,10 +52,12 @@ pub struct PresenterRuntime {
     renderer: MetalRenderer,
     video_frames: Receiver<PlayerVideoFrame>,
     audio_frames: Receiver<PlayerAudioFrame>,
+    subtitle_frames: Receiver<PlayerSubtitleFrame>,
     audio_output: CoreAudioOutput,
     audio_started: bool,
     current_frame: Option<ImportedVideoFrame>,
     current_overlay: Option<OverlayFrame>,
+    current_subtitle: Option<PlayerSubtitleFrame>,
     overlay: OverlayTimeline,
     stats: PresenterStats,
 }
@@ -64,15 +67,18 @@ impl PresenterRuntime {
         let player = Player::new(config.player);
         let video_frames = player.subscribe_video_frames();
         let audio_frames = player.subscribe_audio_frames();
+        let subtitle_frames = player.subscribe_subtitle_frames();
         Ok(Self {
             player,
             renderer: MetalRenderer::with_config(config.renderer)?,
             video_frames,
             audio_frames,
+            subtitle_frames,
             audio_output: CoreAudioOutput::new(config.audio),
             audio_started: false,
             current_frame: None,
             current_overlay: None,
+            current_subtitle: None,
             overlay: config.overlay,
             stats: PresenterStats::default(),
         })
@@ -122,6 +128,7 @@ impl PresenterRuntime {
 
     pub fn render_tick(&mut self, time_seconds: f64) -> Result<PresenterStats> {
         self.pump_audio();
+        self.pump_subtitles();
         self.pump_video();
 
         if let Some(frame) = &self.current_frame {
@@ -178,17 +185,38 @@ impl PresenterRuntime {
     }
 
     fn update_overlay(&mut self, pts: Duration, width: usize, height: usize) {
-        let overlay = self.overlay.render(
+        let mut overlay = self.overlay.render(
             pts,
             OverlayViewport::new(
                 width.min(u32::MAX as usize) as u32,
                 height.min(u32::MAX as usize) as u32,
             ),
         );
+        if let Some(subtitle) = self.current_subtitle.as_ref() {
+            if subtitle_is_active(subtitle, pts) {
+                overlay
+                    .subtitle_planes
+                    .extend(subtitle.frame.bitmap.planes.iter().cloned());
+                overlay.subtitle_changed = true;
+            }
+        }
         if !overlay.is_empty() {
             self.stats.overlay_frames += 1;
         }
         self.current_overlay = Some(overlay);
+    }
+
+    fn pump_subtitles(&mut self) {
+        loop {
+            match self.subtitle_frames.try_recv() {
+                Ok(frame) => {
+                    self.stats.decoded_subtitle_frames += 1;
+                    self.current_subtitle = Some(frame);
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            }
+        }
     }
 
     fn pump_audio(&mut self) {
@@ -265,4 +293,61 @@ fn import_video_frame(renderer: &mut MetalRenderer, frame: &Frame) -> Result<Imp
         frame.hdr_metadata(),
     );
     Ok(imported)
+}
+
+fn subtitle_is_active(frame: &PlayerSubtitleFrame, pts: Duration) -> bool {
+    if frame.frame.is_empty() {
+        return false;
+    }
+    if frame.pts.is_some_and(|start| pts < start) {
+        return false;
+    }
+    if frame.frame.end.is_some_and(|end| pts >= end) {
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::subtitle::{DecodedSubtitleFrame, SubtitleBitmapPlane};
+
+    fn subtitle_frame(start: Duration, end: Option<Duration>) -> PlayerSubtitleFrame {
+        let mut frame = DecodedSubtitleFrame::new(2, Some(start), end);
+        frame.push_bitmap_plane(
+            SubtitleBitmapPlane {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                rgba: vec![255, 255, 255, 255],
+            },
+            false,
+        );
+        PlayerSubtitleFrame {
+            frame,
+            pts: Some(start),
+            media_time: start,
+            late_by: None,
+        }
+    }
+
+    #[test]
+    fn subtitle_active_window_respects_start_end_and_empty_frames() {
+        let active = subtitle_frame(Duration::from_secs(1), Some(Duration::from_secs(3)));
+
+        assert!(!subtitle_is_active(&active, Duration::from_millis(999)));
+        assert!(subtitle_is_active(&active, Duration::from_secs(1)));
+        assert!(subtitle_is_active(&active, Duration::from_millis(2999)));
+        assert!(!subtitle_is_active(&active, Duration::from_secs(3)));
+
+        let empty = PlayerSubtitleFrame {
+            frame: DecodedSubtitleFrame::new(2, Some(Duration::ZERO), None),
+            pts: Some(Duration::ZERO),
+            media_time: Duration::ZERO,
+            late_by: None,
+        };
+        assert!(!subtitle_is_active(&empty, Duration::ZERO));
+    }
 }

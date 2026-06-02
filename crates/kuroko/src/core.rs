@@ -10,6 +10,7 @@ use thiserror::Error;
 use crate::audio::AudioClockSnapshot;
 use crate::ffmpeg::{Frame, PcmAudioFrame};
 use crate::playback::{PlaybackRunState, PlaybackSessionConfig, VideoPlaybackEngine};
+use crate::subtitle::DecodedSubtitleFrame;
 
 static NEXT_PLAYER_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -37,6 +38,7 @@ pub struct PlayerConfig {
     pub renderer: RendererBackendPreference,
     pub video_frame_queue_capacity: usize,
     pub audio_frame_queue_capacity: usize,
+    pub subtitle_frame_queue_capacity: usize,
 }
 
 impl Default for PlayerConfig {
@@ -48,6 +50,7 @@ impl Default for PlayerConfig {
             renderer: RendererBackendPreference::default(),
             video_frame_queue_capacity: 3,
             audio_frame_queue_capacity: 8,
+            subtitle_frame_queue_capacity: 16,
         }
     }
 }
@@ -182,6 +185,14 @@ pub struct PlayerAudioFrame {
     pub frame: PcmAudioFrame,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlayerSubtitleFrame {
+    pub frame: DecodedSubtitleFrame,
+    pub pts: Option<Duration>,
+    pub media_time: Duration,
+    pub late_by: Option<Duration>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PlatformSurface {
     Metal(MetalSurfaceHandle),
@@ -304,6 +315,7 @@ struct PlayerInner {
     subscribers: Vec<Sender<PlayerEvent>>,
     video_frame_sender: Option<Sender<PlayerVideoFrame>>,
     audio_frame_sender: Option<Sender<PlayerAudioFrame>>,
+    subtitle_frame_sender: Option<Sender<PlayerSubtitleFrame>>,
 }
 
 enum PlaybackCommand {
@@ -371,6 +383,7 @@ impl Player {
                 subscribers: Vec::new(),
                 video_frame_sender: None,
                 audio_frame_sender: None,
+                subtitle_frame_sender: None,
             })),
         }
     }
@@ -414,6 +427,16 @@ impl Player {
             .lock()
             .expect("player mutex poisoned")
             .audio_frame_sender = Some(sender);
+        receiver
+    }
+
+    pub fn subscribe_subtitle_frames(&self) -> Receiver<PlayerSubtitleFrame> {
+        let capacity = self.config.subtitle_frame_queue_capacity.max(1);
+        let (sender, receiver) = bounded(capacity);
+        self.inner
+            .lock()
+            .expect("player mutex poisoned")
+            .subtitle_frame_sender = Some(sender);
         receiver
     }
 
@@ -675,6 +698,26 @@ fn run_playback_worker(
                     set_state_from_worker(&inner, PlayerState::Error);
                 }
             }
+
+            match engine.tick_subtitle() {
+                Ok(Some(frame)) => emit_subtitle_frame_from_worker(
+                    &inner,
+                    PlayerSubtitleFrame {
+                        frame: frame.frame,
+                        pts: frame.pts,
+                        media_time: frame.media_time,
+                        late_by: frame.late_by,
+                    },
+                ),
+                Ok(None) => {}
+                Err(error) => {
+                    emit_from_worker(
+                        &inner,
+                        PlayerEvent::Error(PlayerError::Playback(error.to_string())),
+                    );
+                    set_state_from_worker(&inner, PlayerState::Error);
+                }
+            }
         }
 
         if engine.state() == PlaybackRunState::Ended {
@@ -734,6 +777,17 @@ fn emit_audio_frame_from_worker(inner: &Arc<Mutex<PlayerInner>>, frame: PlayerAu
     match sender.try_send(frame) {
         Ok(()) | Err(crossbeam_channel::TrySendError::Full(_)) => {}
         Err(crossbeam_channel::TrySendError::Disconnected(_)) => inner.audio_frame_sender = None,
+    }
+}
+
+fn emit_subtitle_frame_from_worker(inner: &Arc<Mutex<PlayerInner>>, frame: PlayerSubtitleFrame) {
+    let mut inner = inner.lock().expect("player mutex poisoned");
+    let Some(sender) = inner.subtitle_frame_sender.as_ref() else {
+        return;
+    };
+    match sender.try_send(frame) {
+        Ok(()) | Err(crossbeam_channel::TrySendError::Full(_)) => {}
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => inner.subtitle_frame_sender = None,
     }
 }
 
@@ -818,6 +872,24 @@ mod tests {
             events.recv().unwrap(),
             PlayerEvent::SurfaceAttached(surface)
         );
+    }
+
+    #[test]
+    fn subscribe_subtitle_frames_replaces_previous_sender() {
+        let player = Player::new(PlayerConfig::default());
+        let first = player.subscribe_subtitle_frames();
+        let second = player.subscribe_subtitle_frames();
+        let frame = PlayerSubtitleFrame {
+            frame: crate::subtitle::DecodedSubtitleFrame::new(2, Some(Duration::ZERO), None),
+            pts: Some(Duration::ZERO),
+            media_time: Duration::ZERO,
+            late_by: None,
+        };
+
+        emit_subtitle_frame_from_worker(&player.inner, frame);
+
+        assert!(first.try_recv().is_err());
+        assert!(second.try_recv().is_ok());
     }
 
     #[test]
