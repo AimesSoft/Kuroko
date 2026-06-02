@@ -124,14 +124,14 @@ private final class KurokoNativeLibrary {
     UnsafeMutablePointer<Int64>?
   ) -> Int32
   typealias RemoveSubtitleTrackFn = @convention(c) (UnsafeMutableRawPointer?, Int64) -> Int32
-  typealias TrackSelectionFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutablePointer<KurokoTrackSelectionC>?) -> Int32
+  typealias TrackSelectionFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Int32
   typealias TracksFn = @convention(c) (
     UnsafeMutableRawPointer?,
-    UnsafeMutablePointer<KurokoTrackInfoC>?,
+    UnsafeMutableRawPointer?,
     Int,
     UnsafeMutablePointer<Int>?
   ) -> Int32
-  typealias TrackInfoFreeFn = @convention(c) (UnsafeMutablePointer<KurokoTrackInfoC>?) -> Void
+  typealias TrackInfoFreeFn = @convention(c) (UnsafeMutableRawPointer?) -> Void
   typealias AttachMetalLayerFn = @convention(c) (UnsafeMutableRawPointer?, UInt64, UInt32, UInt32, Double) -> Int32
   typealias ResizeSurfaceFn = @convention(c) (UnsafeMutableRawPointer?, UInt32, UInt32, Double) -> Int32
   typealias RenderTickFn = @convention(c) (UnsafeMutableRawPointer?, Double, UnsafeMutableRawPointer?) -> Int32
@@ -344,22 +344,24 @@ private final class KurokoPlayerHost {
     var tracks = Array(repeating: KurokoTrackInfoC(), count: count)
     var written: Int = 0
     let status = tracks.withUnsafeMutableBufferPointer { buffer in
-      library.tracks(handle, buffer.baseAddress, buffer.count, &written)
+      library.tracks(handle, UnsafeMutableRawPointer(buffer.baseAddress), buffer.count, &written)
     }
     try check(status, operation: "tracks")
     let result = tracks.prefix(min(written, tracks.count)).map { $0.toFlutterMap() }
     for index in tracks.indices {
-      library.freeTrackInfo(&tracks[index])
+      withUnsafeMutablePointer(to: &tracks[index]) { pointer in
+        library.freeTrackInfo(UnsafeMutableRawPointer(pointer))
+      }
     }
     return result
   }
 
   func trackSelection() throws -> [String: Any] {
     var selection = KurokoTrackSelectionC()
-    try check(
-      library.trackSelection(handle, &selection),
-      operation: "track_selection"
-    )
+    let status = withUnsafeMutablePointer(to: &selection) { pointer in
+      library.trackSelection(handle, UnsafeMutableRawPointer(pointer))
+    }
+    try check(status, operation: "track_selection")
     return selection.toFlutterMap()
   }
 
