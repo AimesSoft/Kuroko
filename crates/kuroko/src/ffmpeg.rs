@@ -949,6 +949,76 @@ impl Frame {
             })
         }
     }
+
+    /// Repack a software-decoded 4:2:0 frame into GPU-ready planes: NV12 for 8-bit
+    /// (yuv420p/nv12) or P010 (16-bit, MSB-aligned) for 10-bit (yuv420p10le/p010le).
+    /// Returns `None` for hardware frames or unsupported formats.
+    pub fn to_planar_frame(&self) -> Option<PlanarFrame> {
+        let format = self.raw_pixel_format();
+        if format == sys::AVPixelFormat_AV_PIX_FMT_YUV420P
+            || format == sys::AVPixelFormat_AV_PIX_FMT_NV12
+        {
+            let nv12 = self.to_nv12()?;
+            return Some(PlanarFrame {
+                format: PlanarPixelFormat::Nv12,
+                width: nv12.width,
+                height: nv12.height,
+                luma: nv12.luma,
+                chroma: nv12.chroma,
+            });
+        }
+
+        let width = self.width() as usize;
+        let height = self.height() as usize;
+        if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+            return None;
+        }
+        let chroma_width = width / 2;
+        let chroma_height = height / 2;
+
+        // SAFETY: `self.ptr` is a valid AVFrame. For 10-bit planar 4:2:0 the planes
+        // hold 16-bit little-endian samples spanning `linesize[i]` bytes per row; the
+        // helpers read only the visible region after checking pointers and strides.
+        unsafe {
+            let frame = &*self.ptr;
+            if format == sys::AVPixelFormat_AV_PIX_FMT_YUV420P10LE {
+                let luma =
+                    read_10bit_plane_as_p010(frame.data[0], frame.linesize[0], width, height)?;
+                let chroma = read_10bit_chroma_as_p010(
+                    frame.data[1],
+                    frame.linesize[1],
+                    frame.data[2],
+                    frame.linesize[2],
+                    chroma_width,
+                    chroma_height,
+                )?;
+                Some(PlanarFrame {
+                    format: PlanarPixelFormat::P010,
+                    width: width as u32,
+                    height: height as u32,
+                    luma,
+                    chroma,
+                })
+            } else if format == sys::AVPixelFormat_AV_PIX_FMT_P010LE {
+                let luma = copy_16bit_rows(frame.data[0], frame.linesize[0], width, height)?;
+                let chroma = copy_16bit_rows(
+                    frame.data[1],
+                    frame.linesize[1],
+                    chroma_width * 2,
+                    chroma_height,
+                )?;
+                Some(PlanarFrame {
+                    format: PlanarPixelFormat::P010,
+                    width: width as u32,
+                    height: height as u32,
+                    luma,
+                    chroma,
+                })
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// Tightly packed NV12 planes produced by [`Frame::to_nv12`]: an 8-bit luma plane
@@ -960,6 +1030,132 @@ pub struct Nv12Frame {
     pub height: u32,
     pub luma: Vec<u8>,
     pub chroma: Vec<u8>,
+}
+
+/// GPU upload format for a repacked planar frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanarPixelFormat {
+    /// 8-bit NV12: R8 luma + interleaved Rg8 chroma.
+    Nv12,
+    /// 10-bit P010 (values MSB-aligned in 16-bit LE): R16 luma + Rg16 chroma.
+    P010,
+}
+
+/// Tightly packed planar frame produced by [`Frame::to_planar_frame`]. `luma` and
+/// `chroma` hold raw bytes: 1 byte/sample for [`PlanarPixelFormat::Nv12`], 2 bytes
+/// (little-endian) for [`PlanarPixelFormat::P010`]. `chroma` is interleaved Cb/Cr at
+/// half resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanarFrame {
+    pub format: PlanarPixelFormat,
+    pub width: u32,
+    pub height: u32,
+    pub luma: Vec<u8>,
+    pub chroma: Vec<u8>,
+}
+
+/// Reads a 10-bit little-endian plane and rewrites it as P010 (value `<< 6`, so the
+/// 10 bits occupy the high bits of each 16-bit sample), tightly packed.
+///
+/// # Safety
+/// `ptr` must point to a plane with at least `stride` bytes per row for `height`
+/// rows and at least `width` 16-bit samples of valid data per row.
+unsafe fn read_10bit_plane_as_p010(
+    ptr: *mut u8,
+    stride: i32,
+    width: usize,
+    height: usize,
+) -> Option<Vec<u8>> {
+    let ptr = ptr as *const u8;
+    if ptr.is_null() {
+        return None;
+    }
+    let stride = stride.max(0) as usize;
+    if stride < width * 2 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(width * height * 2);
+    for row in 0..height {
+        let row_ptr = unsafe { ptr.add(row * stride) };
+        for col in 0..width {
+            let lo = unsafe { *row_ptr.add(col * 2) };
+            let hi = unsafe { *row_ptr.add(col * 2 + 1) };
+            let sample = (u16::from_le_bytes([lo, hi]) & 0x03FF) << 6;
+            out.extend_from_slice(&sample.to_le_bytes());
+        }
+    }
+    Some(out)
+}
+
+/// Interleaves two 10-bit LE chroma planes (Cb, Cr) into P010 (`value << 6`) order.
+///
+/// # Safety
+/// `u_ptr`/`v_ptr` must each point to at least `cw` 16-bit samples per row for `ch`
+/// rows, spanning the given strides.
+unsafe fn read_10bit_chroma_as_p010(
+    u_ptr: *mut u8,
+    u_stride: i32,
+    v_ptr: *mut u8,
+    v_stride: i32,
+    cw: usize,
+    ch: usize,
+) -> Option<Vec<u8>> {
+    let u_ptr = u_ptr as *const u8;
+    let v_ptr = v_ptr as *const u8;
+    if u_ptr.is_null() || v_ptr.is_null() {
+        return None;
+    }
+    let u_stride = u_stride.max(0) as usize;
+    let v_stride = v_stride.max(0) as usize;
+    if u_stride < cw * 2 || v_stride < cw * 2 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(cw * ch * 4);
+    for row in 0..ch {
+        let u_row = unsafe { u_ptr.add(row * u_stride) };
+        let v_row = unsafe { v_ptr.add(row * v_stride) };
+        for col in 0..cw {
+            let u = (u16::from_le_bytes([unsafe { *u_row.add(col * 2) }, unsafe {
+                *u_row.add(col * 2 + 1)
+            }]) & 0x03FF)
+                << 6;
+            let v = (u16::from_le_bytes([unsafe { *v_row.add(col * 2) }, unsafe {
+                *v_row.add(col * 2 + 1)
+            }]) & 0x03FF)
+                << 6;
+            out.extend_from_slice(&u.to_le_bytes());
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    Some(out)
+}
+
+/// Copies `samples_per_row` 16-bit samples per row for `rows` rows, resolving stride.
+///
+/// # Safety
+/// `ptr` must point to at least `stride` bytes per row for `rows` rows with at least
+/// `samples_per_row` 16-bit samples of valid data per row.
+unsafe fn copy_16bit_rows(
+    ptr: *mut u8,
+    stride: i32,
+    samples_per_row: usize,
+    rows: usize,
+) -> Option<Vec<u8>> {
+    let ptr = ptr as *const u8;
+    if ptr.is_null() {
+        return None;
+    }
+    let stride = stride.max(0) as usize;
+    let row_bytes = samples_per_row * 2;
+    if stride < row_bytes {
+        return None;
+    }
+    let mut out = Vec::with_capacity(row_bytes * rows);
+    for row in 0..rows {
+        let src = unsafe { std::slice::from_raw_parts(ptr.add(row * stride), row_bytes) };
+        out.extend_from_slice(src);
+    }
+    Some(out)
 }
 
 impl AudioResampler {

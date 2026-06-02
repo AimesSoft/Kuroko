@@ -6,6 +6,7 @@ use crate::core::{
     ColorPrimaries, PlatformSurface, PlayerError, PlayerVideoFrame, RendererBackend, Result,
     TransferFunction, WgpuSurfaceHandle, WgpuSurfaceKind,
 };
+use crate::ffmpeg::{PlanarFrame, PlanarPixelFormat};
 use crate::overlay::OverlayFrame;
 use crate::renderer::pipeline::{
     ColorRange, SourceColorState, TargetColorState, ToneMapOperator, VideoRenderPipeline,
@@ -237,6 +238,7 @@ pub struct WgpuRenderer {
     video_pipeline: Option<VideoPipeline>,
     overlay_pipeline: Option<OverlayPipeline>,
     current_video: Option<UploadedVideoFrame>,
+    supports_16bit_norm: bool,
     stats: WgpuRendererStats,
 }
 
@@ -254,9 +256,21 @@ impl WgpuRenderer {
         }))
         .map_err(|error| PlayerError::Renderer(format!("wgpu adapter request failed: {error}")))?;
 
+        // 16-bit normalized textures (R16Unorm/Rg16Unorm) are needed for P010/10-bit
+        // upload. They are not in the WebGPU baseline, so request the feature only when
+        // the adapter advertises it (true on Metal/Vulkan/DX12 native backends).
+        let supports_16bit_norm = adapter
+            .features()
+            .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
+        let required_features = if supports_16bit_norm {
+            wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+        } else {
+            wgpu::Features::empty()
+        };
+
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("kuroko-wgpu-device"),
-            required_features: wgpu::Features::empty(),
+            required_features,
             required_limits: wgpu::Limits::default(),
             memory_hints: wgpu::MemoryHints::default(),
             experimental_features: wgpu::ExperimentalFeatures::default(),
@@ -273,12 +287,18 @@ impl WgpuRenderer {
             video_pipeline: None,
             overlay_pipeline: None,
             current_video: None,
+            supports_16bit_norm,
             stats: WgpuRendererStats::default(),
         })
     }
 
     pub fn surface(&self) -> Option<WgpuSurfaceHandle> {
         self.surface.as_ref().map(|attached| attached.handle)
+    }
+
+    /// Whether the adapter supports 16-bit normalized textures (needed for P010).
+    pub fn supports_16bit_norm(&self) -> bool {
+        self.supports_16bit_norm
     }
 
     pub fn stats(&self) -> WgpuRendererStats {
@@ -452,25 +472,62 @@ impl WgpuRenderer {
         chroma: &[u8],
         uniforms: VideoUniforms,
     ) -> Result<()> {
+        self.upload_planar(
+            PlanarFrame {
+                format: PlanarPixelFormat::Nv12,
+                width,
+                height,
+                luma: luma.to_vec(),
+                chroma: chroma.to_vec(),
+            },
+            uniforms,
+        )
+    }
+
+    /// Upload a repacked planar frame (8-bit NV12 or 10-bit P010) as the current
+    /// video frame. P010 requires the `TEXTURE_FORMAT_16BIT_NORM` adapter feature.
+    pub fn upload_planar(&mut self, frame: PlanarFrame, uniforms: VideoUniforms) -> Result<()> {
+        let width = frame.width;
+        let height = frame.height;
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return Err(PlayerError::Renderer(
-                "NV12 frame dimensions must be non-zero and even".to_string(),
+                "planar frame dimensions must be non-zero and even".to_string(),
             ));
         }
-        let expected_luma = (width * height) as usize;
+        let (luma_format, chroma_format, bytes_per_sample) = match frame.format {
+            PlanarPixelFormat::Nv12 => {
+                (wgpu::TextureFormat::R8Unorm, wgpu::TextureFormat::Rg8Unorm, 1u32)
+            }
+            PlanarPixelFormat::P010 => {
+                if !self.supports_16bit_norm {
+                    return Err(PlayerError::Renderer(
+                        "wgpu adapter lacks TEXTURE_FORMAT_16BIT_NORM required for P010/10-bit"
+                            .to_string(),
+                    ));
+                }
+                (
+                    wgpu::TextureFormat::R16Unorm,
+                    wgpu::TextureFormat::Rg16Unorm,
+                    2u32,
+                )
+            }
+        };
         let chroma_width = width / 2;
         let chroma_height = height / 2;
-        let expected_chroma = (chroma_width * chroma_height * 2) as usize;
-        if luma.len() != expected_luma {
+        let expected_luma = (width * height * bytes_per_sample) as usize;
+        let expected_chroma = (chroma_width * chroma_height * 2 * bytes_per_sample) as usize;
+        if frame.luma.len() != expected_luma {
             return Err(PlayerError::Renderer(format!(
-                "NV12 luma plane is {} bytes, expected {expected_luma}",
-                luma.len()
+                "{:?} luma plane is {} bytes, expected {expected_luma}",
+                frame.format,
+                frame.luma.len()
             )));
         }
-        if chroma.len() != expected_chroma {
+        if frame.chroma.len() != expected_chroma {
             return Err(PlayerError::Renderer(format!(
-                "NV12 chroma plane is {} bytes, expected {expected_chroma}",
-                chroma.len()
+                "{:?} chroma plane is {} bytes, expected {expected_chroma}",
+                frame.format,
+                frame.chroma.len()
             )));
         }
 
@@ -478,17 +535,17 @@ impl WgpuRenderer {
             "kuroko-wgpu-luma",
             width,
             height,
-            wgpu::TextureFormat::R8Unorm,
-            luma,
-            width,
+            luma_format,
+            &frame.luma,
+            width * bytes_per_sample,
         );
         let chroma_texture = self.create_plane_texture(
             "kuroko-wgpu-chroma",
             chroma_width,
             chroma_height,
-            wgpu::TextureFormat::Rg8Unorm,
-            chroma,
-            chroma_width * 2,
+            chroma_format,
+            &frame.chroma,
+            chroma_width * 2 * bytes_per_sample,
         );
         self.current_video = Some(UploadedVideoFrame {
             luma: luma_texture,
@@ -1145,15 +1202,17 @@ impl RendererBackend for WgpuRenderer {
     }
 
     fn upload_player_frame(&mut self, frame: &PlayerVideoFrame) -> Result<()> {
-        // Software path: repack the decoded planes to NV12 and upload. A hardware
-        // frame (e.g. VideoToolbox) has no CPU planes here; that needs the
-        // per-platform zero-copy interop bridge (a later slice).
-        let nv12 = frame.frame.to_nv12().ok_or_else(|| {
+        // Software path: repack the decoded planes (8-bit NV12 or 10-bit P010) and
+        // upload. A hardware frame (e.g. VideoToolbox) has no CPU planes here; that
+        // needs the per-platform zero-copy interop bridge (a later slice).
+        let planar = frame.frame.to_planar_frame().ok_or_else(|| {
             PlayerError::Renderer(
-                "wgpu: frame is not software 8-bit 4:2:0 (hardware frame or unsupported format)"
+                "wgpu: frame is not software 4:2:0 8-bit/10-bit (hardware frame or unsupported \
+                 format)"
                     .to_string(),
             )
         })?;
+        let is_p010 = matches!(planar.format, PlanarPixelFormat::P010);
         let source = SourceColorState::new(
             frame.frame.color_primaries(),
             frame.frame.transfer_function(),
@@ -1163,8 +1222,8 @@ impl RendererBackend for WgpuRenderer {
         .hdr_metadata(frame.frame.hdr_metadata());
         let pipeline =
             VideoRenderPipeline::new(source, TargetColorState::sdr(ColorPrimaries::Bt709));
-        let uniforms = VideoUniforms::from_pipeline(&pipeline, false, false);
-        self.upload_nv12(nv12.width, nv12.height, &nv12.luma, &nv12.chroma, uniforms)
+        let uniforms = VideoUniforms::from_pipeline(&pipeline, is_p010, false);
+        self.upload_planar(planar, uniforms)
     }
 
     fn render_current_frame(&mut self, overlay: Option<&OverlayFrame>) -> Result<bool> {
@@ -1476,6 +1535,52 @@ mod tests {
         // so the presenter falls back to a test frame.
         let backend: &mut dyn RendererBackend = &mut renderer;
         assert!(!backend.render_current_frame(None).unwrap());
+    }
+
+    #[test]
+    fn wgpu_uploads_and_renders_p010_frame() {
+        let mut renderer = WgpuRenderer::new().unwrap();
+        if !renderer.supports_16bit_norm() {
+            // Backend without TEXTURE_FORMAT_16BIT_NORM cannot do P010; skip.
+            return;
+        }
+
+        // 4x4 P010 frame: bright luma, neutral chroma. Samples are 10-bit values
+        // MSB-aligned in 16-bit LE (code << 6), matching `Frame::to_planar_frame`.
+        let luma_sample: u16 = 700 << 6;
+        let chroma_sample: u16 = 512 << 6;
+        let luma: Vec<u8> = std::iter::repeat(luma_sample)
+            .take(4 * 4)
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let chroma: Vec<u8> = std::iter::repeat(chroma_sample)
+            .take(2 * 2 * 2)
+            .flat_map(u16::to_le_bytes)
+            .collect();
+
+        let uniforms =
+            VideoUniforms::from_pipeline(&VideoRenderPipeline::sdr_default(), true, false);
+        renderer
+            .upload_planar(
+                PlanarFrame {
+                    format: PlanarPixelFormat::P010,
+                    width: 4,
+                    height: 4,
+                    luma,
+                    chroma,
+                },
+                uniforms,
+            )
+            .unwrap();
+
+        let readback = renderer
+            .render_current_offscreen(None)
+            .unwrap()
+            .expect("p010 frame rendered");
+        assert_eq!(readback.width, 4);
+        assert_eq!(readback.height, 4);
+        // A bright luma frame must not render fully black.
+        assert!(readback.rgba.iter().any(|&byte| byte > 0));
     }
 
     #[test]
