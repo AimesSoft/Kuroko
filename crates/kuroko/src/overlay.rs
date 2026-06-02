@@ -5,12 +5,12 @@ use std::time::Duration;
 use crate::danmaku::{DanmakuLayoutBox, DanmakuLayoutConfig, DanmakuTimeline};
 #[cfg(feature = "libass")]
 use crate::subtitle::{
-    LibassRenderConfig, LibassSubtitleRenderer, SubtitleError, SubtitleRenderOutput,
-    SubtitleRenderRequest, SubtitleRenderer,
+    LibassRenderConfig, LibassSubtitleRenderer, SubtitleError, SubtitleRenderRequest,
+    SubtitleRenderer,
 };
 use crate::subtitle::{
-    Result as SubtitleResult, SubtitleBitmapPlane, SubtitleFrame, SubtitleRendererCore,
-    SubtitleTimeline, SubtitleViewport,
+    Result as SubtitleResult, SubtitleAlphaBitmap, SubtitleBitmapPlane, SubtitleFrameChange,
+    SubtitleRenderOutput, SubtitleRendererCore, SubtitleTimeline, SubtitleViewport,
 };
 use crate::text::TextShaper;
 
@@ -34,12 +34,16 @@ pub struct OverlayFrame {
     pub pts: Duration,
     pub viewport: OverlayViewport,
     pub subtitle_planes: Vec<SubtitleBitmapPlane>,
+    pub subtitle_alpha_planes: Vec<SubtitleAlphaBitmap>,
+    pub subtitle_changed: bool,
     pub danmaku_boxes: Vec<DanmakuLayoutBox>,
 }
 
 impl OverlayFrame {
     pub fn is_empty(&self) -> bool {
-        self.subtitle_planes.is_empty() && self.danmaku_boxes.is_empty()
+        self.subtitle_planes.is_empty()
+            && self.subtitle_alpha_planes.is_empty()
+            && self.danmaku_boxes.is_empty()
     }
 }
 
@@ -63,23 +67,31 @@ impl OverlaySubtitleRenderer {
         &mut self,
         pts: Duration,
         viewport: OverlayViewport,
-    ) -> SubtitleResult<SubtitleFrame> {
+    ) -> SubtitleResult<(SubtitleRenderOutput, bool)> {
         match self {
-            Self::DebugTimeline(renderer) => Ok(renderer
-                .render(pts, SubtitleViewport::new(viewport.width, viewport.height))
-                .frame),
+            Self::DebugTimeline(renderer) => {
+                let result =
+                    renderer.render(pts, SubtitleViewport::new(viewport.width, viewport.height));
+                Ok((
+                    SubtitleRenderOutput::Rgba(result.frame),
+                    result.change == SubtitleFrameChange::Changed,
+                ))
+            }
             #[cfg(feature = "libass")]
             Self::Libass(renderer) => {
                 let mut renderer = renderer
                     .lock()
                     .map_err(|_| SubtitleError::Libass("renderer lock poisoned".to_string()))?;
-                renderer
-                    .render(SubtitleRenderRequest::new(
-                        pts,
-                        viewport.width,
-                        viewport.height,
-                    ))
-                    .map(SubtitleRenderOutput::into_rgba_frame)
+                let output = renderer.render(SubtitleRenderRequest::new(
+                    pts,
+                    viewport.width,
+                    viewport.height,
+                ))?;
+                let changed = match &output {
+                    SubtitleRenderOutput::Rgba(_) => true,
+                    SubtitleRenderOutput::Alpha(bitmaps) => bitmaps.changed,
+                };
+                Ok((output, changed))
             }
         }
     }
@@ -132,17 +144,23 @@ impl OverlayTimeline {
     }
 
     pub fn render(&mut self, pts: Duration, viewport: OverlayViewport) -> OverlayFrame {
-        let subtitle_planes = self
+        let (subtitle_planes, subtitle_alpha_planes, subtitle_changed) = match self
             .subtitles
             .as_mut()
-            .and_then(|renderer| match renderer.render(pts, viewport) {
-                Ok(frame) => Some(frame.planes),
-                Err(error) => {
-                    eprintln!("Kuroko overlay subtitle render failed: {error}");
-                    None
-                }
-            })
-            .unwrap_or_default();
+            .map(|renderer| renderer.render(pts, viewport))
+        {
+            Some(Ok((SubtitleRenderOutput::Rgba(frame), changed))) => {
+                (frame.planes, Vec::new(), changed)
+            }
+            Some(Ok((SubtitleRenderOutput::Alpha(bitmaps), changed))) => {
+                (Vec::new(), bitmaps.parts, changed)
+            }
+            Some(Err(error)) => {
+                eprintln!("Kuroko overlay subtitle render failed: {error}");
+                (Vec::new(), Vec::new(), true)
+            }
+            None => (Vec::new(), Vec::new(), false),
+        };
 
         let danmaku_boxes = self
             .danmaku
@@ -159,6 +177,8 @@ impl OverlayTimeline {
             pts,
             viewport,
             subtitle_planes,
+            subtitle_alpha_planes,
+            subtitle_changed,
             danmaku_boxes,
         }
     }
@@ -215,8 +235,26 @@ Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,Overlay libass
 
         assert!(!frame.is_empty());
         assert_eq!(frame.subtitle_planes.len(), 1);
+        assert!(frame.subtitle_alpha_planes.is_empty());
+        assert!(frame.subtitle_changed);
         assert_eq!(frame.danmaku_boxes.len(), 1);
         assert_eq!(frame.danmaku_boxes[0].item_id, 7);
+    }
+
+    #[test]
+    fn overlay_timeline_reports_unchanged_debug_subtitles() {
+        let subtitles = SubtitleTimeline::new(vec![SubtitleCue {
+            start: Duration::from_secs(1),
+            end: Duration::from_secs(3),
+            text: "hello".to_string(),
+        }]);
+        let mut timeline = OverlayTimeline::default().with_subtitles(subtitles);
+
+        let first = timeline.render(Duration::from_secs(2), OverlayViewport::new(640, 360));
+        let second = timeline.render(Duration::from_secs(2), OverlayViewport::new(640, 360));
+
+        assert!(first.subtitle_changed);
+        assert!(!second.subtitle_changed);
     }
 
     #[cfg(feature = "libass")]
@@ -230,12 +268,15 @@ Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,Overlay libass
 
         assert_eq!(frame.pts, Duration::from_millis(500));
         assert_eq!(frame.viewport, OverlayViewport::new(640, 360));
-        assert!(!frame.subtitle_planes.is_empty());
+        assert!(frame.subtitle_planes.is_empty());
+        assert!(!frame.subtitle_alpha_planes.is_empty());
+        assert!(frame.subtitle_changed);
         assert!(frame.danmaku_boxes.is_empty());
         assert!(
-            frame.subtitle_planes.iter().all(|plane| {
-                plane.rgba.len() == plane.width as usize * plane.height as usize * 4
-            })
+            frame
+                .subtitle_alpha_planes
+                .iter()
+                .all(SubtitleAlphaBitmap::is_valid)
         );
     }
 }

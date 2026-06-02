@@ -48,6 +48,8 @@ fn run_check(layer: *mut c_void) -> Result<(), String> {
             height: 32,
             rgba: solid_rgba(240, 32, [255, 255, 255, 220]),
         }],
+        subtitle_alpha_planes: Vec::new(),
+        subtitle_changed: true,
         danmaku_boxes: Vec::new(),
     };
     let info = renderer

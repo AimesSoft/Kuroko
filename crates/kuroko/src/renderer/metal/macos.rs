@@ -46,6 +46,7 @@ use crate::renderer::metal::{
     fourcc_string,
 };
 use crate::renderer::pipeline::{ColorRange, ToneMapOperator};
+use crate::subtitle::{AssColor, SubtitleAlphaBitmap};
 
 const CV_PIXEL_FORMAT_420_YP_CB_CR10_BI_PLANAR_VIDEO_RANGE: u32 =
     kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
@@ -102,6 +103,7 @@ pub struct MetalRendererImpl {
     video_pipeline: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
     overlay_pipeline: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
     video_sampler: Option<Retained<ProtocolObject<dyn MTLSamplerState>>>,
+    overlay_alpha_atlas_cache: Option<OverlayAlphaAtlasCache>,
     stats: MetalRendererStats,
 }
 
@@ -123,6 +125,7 @@ impl MetalRendererImpl {
             video_pipeline: None,
             overlay_pipeline: None,
             video_sampler: None,
+            overlay_alpha_atlas_cache: None,
             stats: MetalRendererStats::default(),
         })
     }
@@ -174,6 +177,7 @@ impl MetalRendererImpl {
         layer.setWantsExtendedDynamicRangeContent(self.output_mode.is_edr());
         self.video_pipeline = None;
         self.overlay_pipeline = None;
+        self.overlay_alpha_atlas_cache = None;
     }
 
     pub fn record_prepared_overlay_frame(&mut self, info: PreparedOverlayFrameInfo) {
@@ -422,7 +426,9 @@ impl MetalRendererImpl {
         overlay: OverlayRenderFrame<'_>,
     ) -> Result<()> {
         let _ = crate::renderer::metal::inspect_overlay_frame(overlay.frame)?;
-        if overlay.frame.subtitle_planes.is_empty() {
+        if overlay.frame.subtitle_planes.is_empty()
+            && overlay.frame.subtitle_alpha_planes.is_empty()
+        {
             return Ok(());
         }
 
@@ -448,12 +454,12 @@ impl MetalRendererImpl {
                 encoder.setFragmentTexture_atIndex(Some(&*texture), 0);
                 encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
                 encoder.setVertexBytes_length_atIndex(
-                    NonNull::new(
-                        (&uniforms as *const OverlayUniforms)
-                            .cast::<c_void>()
-                            .cast_mut(),
-                    )
-                    .expect("overlay uniform pointer is non-null"),
+                    overlay_uniform_pointer(&uniforms),
+                    mem::size_of::<OverlayUniforms>(),
+                    0,
+                );
+                encoder.setFragmentBytes_length_atIndex(
+                    overlay_uniform_pointer(&uniforms),
                     mem::size_of::<OverlayUniforms>(),
                     0,
                 );
@@ -464,7 +470,80 @@ impl MetalRendererImpl {
                 );
             }
         }
+        if !overlay.frame.subtitle_alpha_planes.is_empty() {
+            let atlas = self.prepare_overlay_alpha_atlas(
+                &overlay.frame.subtitle_alpha_planes,
+                overlay.frame.subtitle_changed,
+            )?;
+            let texture = atlas.texture.clone();
+            let placements = atlas.placements.clone();
+            let atlas_width = atlas.width;
+            let atlas_height = atlas.height;
+            for placement in &placements {
+                let bitmap = &overlay.frame.subtitle_alpha_planes[placement.bitmap_index];
+                let uniforms = OverlayUniforms::from_alpha_atlas_bitmap(
+                    bitmap,
+                    placement,
+                    atlas_width,
+                    atlas_height,
+                    viewport.width,
+                    viewport.height,
+                );
+                unsafe {
+                    encoder.setRenderPipelineState(&pipeline);
+                    encoder.setFragmentTexture_atIndex(Some(&*texture), 0);
+                    encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
+                    encoder.setVertexBytes_length_atIndex(
+                        overlay_uniform_pointer(&uniforms),
+                        mem::size_of::<OverlayUniforms>(),
+                        0,
+                    );
+                    encoder.setFragmentBytes_length_atIndex(
+                        overlay_uniform_pointer(&uniforms),
+                        mem::size_of::<OverlayUniforms>(),
+                        0,
+                    );
+                    encoder.drawPrimitives_vertexStart_vertexCount(
+                        MTLPrimitiveType::TriangleStrip,
+                        0,
+                        4,
+                    );
+                }
+            }
+        }
         Ok(())
+    }
+
+    fn prepare_overlay_alpha_atlas(
+        &mut self,
+        bitmaps: &[SubtitleAlphaBitmap],
+        changed: bool,
+    ) -> Result<&OverlayAlphaAtlasCache> {
+        if !changed {
+            if let Some(cache) = &self.overlay_alpha_atlas_cache {
+                if cache.can_reuse_for(bitmaps) {
+                    self.stats.overlay_alpha_atlas_reuses += 1;
+                    return Ok(self
+                        .overlay_alpha_atlas_cache
+                        .as_ref()
+                        .expect("overlay atlas cache exists"));
+                }
+            }
+        }
+
+        let Some(plan) = OverlayAlphaAtlasPlan::pack(bitmaps)? else {
+            self.overlay_alpha_atlas_cache = None;
+            return Err(PlayerError::Renderer(
+                "cannot prepare empty overlay alpha atlas".to_string(),
+            ));
+        };
+        let texture = self.create_overlay_alpha_atlas_texture(&plan)?;
+        self.overlay_alpha_atlas_cache = Some(OverlayAlphaAtlasCache::new(texture, plan, bitmaps));
+        self.stats.overlay_alpha_atlas_uploads += 1;
+        Ok(self
+            .overlay_alpha_atlas_cache
+            .as_ref()
+            .expect("overlay atlas cache exists"))
     }
 
     fn create_overlay_texture(
@@ -504,6 +583,46 @@ impl MetalRendererImpl {
                 NonNull::new(rgba.as_ptr().cast::<c_void>().cast_mut())
                     .expect("overlay rgba pointer is non-null"),
                 width * 4,
+            );
+        }
+        Ok(texture)
+    }
+
+    fn create_overlay_alpha_atlas_texture(
+        &self,
+        atlas: &OverlayAlphaAtlasPlan,
+    ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
+        let descriptor = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::R8Unorm,
+                atlas.width,
+                atlas.height,
+                false,
+            )
+        };
+        descriptor.setUsage(MTLTextureUsage::ShaderRead);
+        descriptor.setResourceOptions(MTLResourceOptions::StorageModeShared);
+        let texture = self
+            .device
+            .newTextureWithDescriptor(&descriptor)
+            .ok_or_else(|| {
+                PlayerError::Renderer("newTextureWithDescriptor returned nil".to_string())
+            })?;
+        let region = MTLRegion {
+            origin: objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            size: objc2_metal::MTLSize {
+                width: atlas.width,
+                height: atlas.height,
+                depth: 1,
+            },
+        };
+        unsafe {
+            texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                region,
+                0,
+                NonNull::new(atlas.pixels.as_ptr().cast::<c_void>().cast_mut())
+                    .expect("overlay atlas pointer is non-null"),
+                atlas.stride,
             );
         }
         Ok(texture)
@@ -801,8 +920,11 @@ fn luma_coefficients(coeffs: crate::renderer::pipeline::LumaCoefficients) -> [f3
 #[derive(Debug, Clone, Copy)]
 struct OverlayUniforms {
     rect: [f32; 4],
+    tex_rect: [f32; 4],
     viewport: [f32; 2],
-    _padding: [f32; 2],
+    overlay_mode: u32,
+    _reserved0: u32,
+    color: [f32; 4],
 }
 
 impl OverlayUniforms {
@@ -816,9 +938,234 @@ impl OverlayUniforms {
     ) -> Self {
         Self {
             rect: [x as f32, y as f32, width as f32, height as f32],
+            tex_rect: [0.0, 0.0, 1.0, 1.0],
             viewport: [viewport_width.max(1) as f32, viewport_height.max(1) as f32],
-            _padding: [0.0; 2],
+            overlay_mode: 0,
+            _reserved0: 0,
+            color: [1.0, 1.0, 1.0, 1.0],
         }
+    }
+
+    fn from_alpha_atlas_bitmap(
+        bitmap: &SubtitleAlphaBitmap,
+        placement: &OverlayAlphaAtlasPlacement,
+        atlas_width: usize,
+        atlas_height: usize,
+        viewport_width: u32,
+        viewport_height: u32,
+    ) -> Self {
+        let color = AssColor::from_libass_rgba(bitmap.color_rgba);
+        let atlas_width = atlas_width.max(1) as f32;
+        let atlas_height = atlas_height.max(1) as f32;
+        Self {
+            rect: [
+                bitmap.placement.x as f32,
+                bitmap.placement.y as f32,
+                bitmap.placement.width as f32,
+                bitmap.placement.height as f32,
+            ],
+            tex_rect: [
+                placement.x as f32 / atlas_width,
+                placement.y as f32 / atlas_height,
+                bitmap.placement.width as f32 / atlas_width,
+                bitmap.placement.height as f32 / atlas_height,
+            ],
+            viewport: [viewport_width.max(1) as f32, viewport_height.max(1) as f32],
+            overlay_mode: 1,
+            _reserved0: 0,
+            color: [
+                color.red as f32 / 255.0,
+                color.green as f32 / 255.0,
+                color.blue as f32 / 255.0,
+                color.alpha as f32 / 255.0,
+            ],
+        }
+    }
+}
+
+fn overlay_uniform_pointer(uniforms: &OverlayUniforms) -> NonNull<c_void> {
+    NonNull::new(
+        (uniforms as *const OverlayUniforms)
+            .cast::<c_void>()
+            .cast_mut(),
+    )
+    .expect("overlay uniform pointer is non-null")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OverlayAlphaAtlasPlacement {
+    bitmap_index: usize,
+    x: usize,
+    y: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OverlayAlphaAtlasPlan {
+    width: usize,
+    height: usize,
+    stride: usize,
+    pixels: Vec<u8>,
+    placements: Vec<OverlayAlphaAtlasPlacement>,
+}
+
+struct OverlayAlphaAtlasCache {
+    texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    width: usize,
+    height: usize,
+    placements: Vec<OverlayAlphaAtlasPlacement>,
+    signature: OverlayAlphaAtlasSignature,
+}
+
+impl OverlayAlphaAtlasCache {
+    fn new(
+        texture: Retained<ProtocolObject<dyn MTLTexture>>,
+        plan: OverlayAlphaAtlasPlan,
+        bitmaps: &[SubtitleAlphaBitmap],
+    ) -> Self {
+        Self {
+            texture,
+            width: plan.width,
+            height: plan.height,
+            placements: plan.placements,
+            signature: OverlayAlphaAtlasSignature::from_bitmaps(bitmaps),
+        }
+    }
+
+    fn can_reuse_for(&self, bitmaps: &[SubtitleAlphaBitmap]) -> bool {
+        self.signature == OverlayAlphaAtlasSignature::from_bitmaps(bitmaps)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OverlayAlphaAtlasSignature {
+    bitmaps: Vec<OverlayAlphaBitmapSignature>,
+}
+
+impl OverlayAlphaAtlasSignature {
+    fn from_bitmaps(bitmaps: &[SubtitleAlphaBitmap]) -> Self {
+        Self {
+            bitmaps: bitmaps
+                .iter()
+                .map(OverlayAlphaBitmapSignature::from_bitmap)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OverlayAlphaBitmapSignature {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    stride: usize,
+    color_rgba: u32,
+    alpha_len: usize,
+    alpha_hash: u64,
+}
+
+impl OverlayAlphaBitmapSignature {
+    fn from_bitmap(bitmap: &SubtitleAlphaBitmap) -> Self {
+        Self {
+            x: bitmap.placement.x,
+            y: bitmap.placement.y,
+            width: bitmap.placement.width,
+            height: bitmap.placement.height,
+            stride: bitmap.stride,
+            color_rgba: bitmap.color_rgba,
+            alpha_len: bitmap.alpha.len(),
+            alpha_hash: hash_alpha_bitmap(bitmap),
+        }
+    }
+}
+
+fn hash_alpha_bitmap(bitmap: &SubtitleAlphaBitmap) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET;
+    let width = bitmap.placement.width as usize;
+    let height = bitmap.placement.height as usize;
+    for row in 0..height {
+        let row_start = row.saturating_mul(bitmap.stride);
+        let row_end = row_start.saturating_add(width);
+        let Some(bytes) = bitmap.alpha.get(row_start..row_end) else {
+            break;
+        };
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    hash
+}
+
+impl OverlayAlphaAtlasPlan {
+    fn pack(bitmaps: &[SubtitleAlphaBitmap]) -> Result<Option<Self>> {
+        let total_width = bitmaps.iter().try_fold(0usize, |sum, bitmap| {
+            let width = bitmap.placement.width as usize;
+            sum.checked_add(width).ok_or_else(|| {
+                PlayerError::Renderer("overlay alpha atlas width overflow".to_string())
+            })
+        })?;
+        let max_height = bitmaps
+            .iter()
+            .map(|bitmap| bitmap.placement.height as usize)
+            .max()
+            .unwrap_or(0);
+        if total_width == 0 || max_height == 0 {
+            return Ok(None);
+        }
+
+        let width = total_width;
+        let height = max_height;
+        let len = width.checked_mul(height).ok_or_else(|| {
+            PlayerError::Renderer("overlay alpha atlas size overflow".to_string())
+        })?;
+        let mut pixels = vec![0u8; len];
+        let mut placements = Vec::with_capacity(bitmaps.len());
+        let mut cursor_x = 0usize;
+
+        for (bitmap_index, bitmap) in bitmaps.iter().enumerate() {
+            let bitmap_width = bitmap.placement.width as usize;
+            let bitmap_height = bitmap.placement.height as usize;
+            if bitmap_width == 0 || bitmap_height == 0 {
+                continue;
+            }
+            if !bitmap.is_valid() {
+                return Err(PlayerError::Renderer(format!(
+                    "subtitle alpha bitmap has {} bytes, expected at least {} for {}x{} stride {}",
+                    bitmap.alpha.len(),
+                    bitmap.required_len(),
+                    bitmap.placement.width,
+                    bitmap.placement.height,
+                    bitmap.stride
+                )));
+            }
+
+            for row in 0..bitmap_height {
+                let src_start = row * bitmap.stride;
+                let src_end = src_start + bitmap_width;
+                let dst_start = row * width + cursor_x;
+                let dst_end = dst_start + bitmap_width;
+                pixels[dst_start..dst_end].copy_from_slice(&bitmap.alpha[src_start..src_end]);
+            }
+
+            placements.push(OverlayAlphaAtlasPlacement {
+                bitmap_index,
+                x: cursor_x,
+                y: 0,
+            });
+            cursor_x += bitmap_width;
+        }
+
+        Ok(Some(Self {
+            width,
+            height,
+            stride: width,
+            pixels,
+            placements,
+        }))
     }
 }
 
@@ -1013,8 +1360,11 @@ fragment float4 kuroko_video_fragment(
 
 struct OverlayUniforms {
     float4 rect;
+    float4 tex_rect;
     float2 viewport;
-    float2 padding;
+    uint overlay_mode;
+    uint reserved0;
+    float4 color;
 };
 
 vertex VertexOut kuroko_overlay_vertex(
@@ -1041,15 +1391,20 @@ vertex VertexOut kuroko_overlay_vertex(
 
     VertexOut out;
     out.position = float4(ndc, 0.0, 1.0);
-    out.tex_coord = tex_coords[vertex_id];
+    out.tex_coord = uniforms.tex_rect.xy + tex_coords[vertex_id] * uniforms.tex_rect.zw;
     return out;
 }
 
 fragment float4 kuroko_overlay_fragment(
     VertexOut in [[stage_in]],
     texture2d<float, access::sample> overlay_texture [[texture(0)]],
-    sampler overlay_sampler [[sampler(0)]]) {
-    return overlay_texture.sample(overlay_sampler, in.tex_coord);
+    sampler overlay_sampler [[sampler(0)]],
+    constant OverlayUniforms& uniforms [[buffer(0)]]) {
+    float4 sampled = overlay_texture.sample(overlay_sampler, in.tex_coord);
+    if (uniforms.overlay_mode == 1) {
+        return float4(uniforms.color.rgb, uniforms.color.a * sampled.r);
+    }
+    return sampled;
 }
 "#;
 
@@ -1245,6 +1600,139 @@ mod tests {
         let gamut = VIDEO_SHADER_SOURCE.find("rgb = apply_gamut_map").unwrap();
         let tone_map = VIDEO_SHADER_SOURCE.find("rgb = tone_map_nits").unwrap();
         assert!(gamut < tone_map);
+    }
+
+    #[test]
+    fn overlay_shader_supports_libass_alpha_masks() {
+        assert!(VIDEO_SHADER_SOURCE.contains("overlay_mode"));
+        assert!(VIDEO_SHADER_SOURCE.contains("tex_rect"));
+        assert!(VIDEO_SHADER_SOURCE.contains("constant OverlayUniforms& uniforms [[buffer(0)]]"));
+        assert!(VIDEO_SHADER_SOURCE.contains(
+            "out.tex_coord = uniforms.tex_rect.xy + tex_coords[vertex_id] * uniforms.tex_rect.zw"
+        ));
+        assert!(VIDEO_SHADER_SOURCE.contains("uniforms.color.a * sampled.r"));
+    }
+
+    #[test]
+    fn overlay_uniforms_keep_color_aligned() {
+        assert_eq!(std::mem::size_of::<super::OverlayUniforms>(), 64);
+        assert_eq!(std::mem::offset_of!(super::OverlayUniforms, tex_rect), 16);
+        assert_eq!(
+            std::mem::offset_of!(super::OverlayUniforms, overlay_mode),
+            40
+        );
+        assert_eq!(std::mem::offset_of!(super::OverlayUniforms, color), 48);
+    }
+
+    #[test]
+    fn overlay_uniforms_decode_libass_color() {
+        let bitmap = crate::subtitle::SubtitleAlphaBitmap::new(
+            crate::subtitle::SubtitleBitmapPlacement::new(12, 34, 56, 78),
+            56,
+            0x8040207f,
+            vec![255; 56 * 78],
+        );
+        let placement = super::OverlayAlphaAtlasPlacement {
+            bitmap_index: 0,
+            x: 10,
+            y: 5,
+        };
+
+        let uniforms = super::OverlayUniforms::from_alpha_atlas_bitmap(
+            &bitmap, &placement, 200, 100, 640, 360,
+        );
+
+        assert_eq!(uniforms.rect, [12.0, 34.0, 56.0, 78.0]);
+        assert_eq!(uniforms.tex_rect, [0.05, 0.05, 0.28, 0.78]);
+        assert_eq!(uniforms.overlay_mode, 1);
+        assert!((uniforms.color[0] - (128.0 / 255.0)).abs() < 0.0001);
+        assert!((uniforms.color[1] - (64.0 / 255.0)).abs() < 0.0001);
+        assert!((uniforms.color[2] - (32.0 / 255.0)).abs() < 0.0001);
+        assert!((uniforms.color[3] - (128.0 / 255.0)).abs() < 0.0001);
+    }
+
+    #[test]
+    fn overlay_alpha_atlas_packs_masks_in_one_r8_image() {
+        let first = crate::subtitle::SubtitleAlphaBitmap::new(
+            crate::subtitle::SubtitleBitmapPlacement::new(0, 0, 2, 2),
+            3,
+            0xffffff00,
+            vec![1, 2, 99, 3, 4],
+        );
+        let second = crate::subtitle::SubtitleAlphaBitmap::new(
+            crate::subtitle::SubtitleBitmapPlacement::new(8, 8, 1, 3),
+            1,
+            0xff000000,
+            vec![5, 6, 7],
+        );
+
+        let atlas = super::OverlayAlphaAtlasPlan::pack(&[first, second])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(atlas.width, 3);
+        assert_eq!(atlas.height, 3);
+        assert_eq!(atlas.stride, 3);
+        assert_eq!(atlas.pixels, vec![1, 2, 5, 3, 4, 6, 0, 0, 7]);
+        assert_eq!(atlas.placements.len(), 2);
+        assert_eq!(atlas.placements[0].bitmap_index, 0);
+        assert_eq!(atlas.placements[0].x, 0);
+        assert_eq!(atlas.placements[1].bitmap_index, 1);
+        assert_eq!(atlas.placements[1].x, 2);
+    }
+
+    #[test]
+    fn overlay_alpha_atlas_signature_tracks_reusable_layout() {
+        let first = crate::subtitle::SubtitleAlphaBitmap::new(
+            crate::subtitle::SubtitleBitmapPlacement::new(0, 0, 2, 2),
+            2,
+            0xffffff00,
+            vec![1, 2, 3, 4],
+        );
+        let same_bitmap = crate::subtitle::SubtitleAlphaBitmap::new(
+            crate::subtitle::SubtitleBitmapPlacement::new(0, 0, 2, 2),
+            2,
+            0xffffff00,
+            vec![1, 2, 3, 4],
+        );
+        let moved = crate::subtitle::SubtitleAlphaBitmap::new(
+            crate::subtitle::SubtitleBitmapPlacement::new(1, 0, 2, 2),
+            2,
+            0xffffff00,
+            vec![1, 2, 3, 4],
+        );
+
+        let signature = super::OverlayAlphaAtlasSignature::from_bitmaps(&[first]);
+
+        assert_eq!(
+            signature,
+            super::OverlayAlphaAtlasSignature::from_bitmaps(&[same_bitmap])
+        );
+        assert_ne!(
+            signature,
+            super::OverlayAlphaAtlasSignature::from_bitmaps(&[moved])
+        );
+    }
+
+    #[test]
+    fn overlay_alpha_atlas_signature_tracks_alpha_content() {
+        let first = crate::subtitle::SubtitleAlphaBitmap::new(
+            crate::subtitle::SubtitleBitmapPlacement::new(0, 0, 2, 2),
+            2,
+            0xffffff00,
+            vec![1, 2, 3, 4],
+        );
+        let changed_alpha = crate::subtitle::SubtitleAlphaBitmap::new(
+            crate::subtitle::SubtitleBitmapPlacement::new(0, 0, 2, 2),
+            2,
+            0xffffff00,
+            vec![1, 2, 3, 5],
+        );
+
+        assert_ne!(
+            super::OverlayAlphaAtlasSignature::from_bitmaps(&[first]),
+            super::OverlayAlphaAtlasSignature::from_bitmaps(&[changed_alpha])
+        );
     }
 
     #[test]
