@@ -244,6 +244,40 @@ pub unsafe extern "C" fn kuroko_seek(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_add_external_subtitle(
+    handle: *mut KurokoHandle,
+    uri: *const c_char,
+    out_track_id: *mut i64,
+) -> KurokoStatus {
+    if out_track_id.is_null() {
+        return KurokoStatus::NullPointer;
+    }
+    with_handle_mut(handle, |handle| {
+        let uri = match c_string(uri) {
+            Ok(uri) => uri,
+            Err(status) => return status,
+        };
+        match handle.player.add_external_subtitle(uri) {
+            Ok(track) => {
+                unsafe { *out_track_id = track.id };
+                KurokoStatus::Ok
+            }
+            Err(_) => KurokoStatus::PlayerError,
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_remove_subtitle_track(
+    handle: *mut KurokoHandle,
+    track_id: i64,
+) -> KurokoStatus {
+    with_handle_mut(handle, |handle| {
+        status_from_player_result(handle.player.remove_subtitle_track(track_id))
+    })
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_attach_metal_layer(
     handle: *mut KurokoHandle,
     raw_layer: u64,
@@ -515,6 +549,61 @@ pub unsafe extern "C" fn kuroko_presenter_seek(
                 .seek(Duration::from_micros(position_micros)),
         )
     })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_add_external_subtitle(
+    handle: *mut KurokoPresenterHandle,
+    uri: *const c_char,
+    out_track_id: *mut i64,
+) -> KurokoStatus {
+    if out_track_id.is_null() {
+        return KurokoStatus::NullPointer;
+    }
+    with_presenter_mut(handle, |handle| {
+        let uri = match c_string(uri) {
+            Ok(uri) => uri,
+            Err(status) => return status,
+        };
+        match handle.presenter.add_external_subtitle(uri) {
+            Ok(track) => {
+                unsafe { *out_track_id = track.id };
+                KurokoStatus::Ok
+            }
+            Err(_) => KurokoStatus::PlayerError,
+        }
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_add_external_subtitle(
+    _handle: *mut std::ffi::c_void,
+    _uri: *const c_char,
+    _out_track_id: *mut i64,
+) -> KurokoStatus {
+    KurokoStatus::PlayerError
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_remove_subtitle_track(
+    handle: *mut KurokoPresenterHandle,
+    track_id: i64,
+) -> KurokoStatus {
+    with_presenter_mut(handle, |handle| {
+        status_from_player_result(handle.presenter.remove_subtitle_track(track_id))
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_remove_subtitle_track(
+    _handle: *mut std::ffi::c_void,
+    _track_id: i64,
+) -> KurokoStatus {
+    KurokoStatus::PlayerError
 }
 
 #[cfg(target_os = "macos")]
@@ -817,6 +906,29 @@ mod tests {
             unsafe { kuroko_play(std::ptr::null_mut()) },
             KurokoStatus::NullPointer
         );
+    }
+
+    #[test]
+    fn c_external_subtitle_api_rejects_null_pointers() {
+        let subtitle_uri = std::ffi::CString::new("/tmp/subs.srt").unwrap();
+        let handle = kuroko_create();
+        assert!(!handle.is_null());
+
+        let status = unsafe {
+            kuroko_add_external_subtitle(handle, subtitle_uri.as_ptr(), std::ptr::null_mut())
+        };
+        assert_eq!(status, KurokoStatus::NullPointer);
+
+        let mut track_id = 0;
+        let status = unsafe {
+            kuroko_add_external_subtitle(std::ptr::null_mut(), subtitle_uri.as_ptr(), &mut track_id)
+        };
+        assert_eq!(status, KurokoStatus::NullPointer);
+
+        let status = unsafe { kuroko_remove_subtitle_track(std::ptr::null_mut(), 1_000_001) };
+        assert_eq!(status, KurokoStatus::NullPointer);
+
+        unsafe { kuroko_destroy(handle) };
     }
 
     #[test]

@@ -65,4 +65,47 @@ void main() {
 
     await player.dispose();
   });
+
+  test('external subtitle add returns native track id', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(playerChannel, (MethodCall call) async {
+      playerCalls.add(call);
+      return switch (call.method) {
+        'create' => 7,
+        'addExternalSubtitle' => 1000001,
+        'dispose' => null,
+        _ => null,
+      };
+    });
+    final player = KurokoPlayer();
+
+    final trackId = await player.addExternalSubtitle('/tmp/subs.srt');
+
+    expect(trackId, 1000001);
+    final call = playerCalls.singleWhere(
+      (MethodCall call) => call.method == 'addExternalSubtitle',
+    );
+    expect(call.arguments, <String, Object?>{
+      'playerId': 7,
+      'uri': '/tmp/subs.srt',
+    });
+
+    await player.dispose();
+  });
+
+  test('external subtitle remove forwards track id', () async {
+    final player = KurokoPlayer();
+
+    await player.removeSubtitleTrack(1000001);
+
+    final call = playerCalls.singleWhere(
+      (MethodCall call) => call.method == 'removeSubtitleTrack',
+    );
+    expect(call.arguments, <String, Object?>{
+      'playerId': 7,
+      'trackId': 1000001,
+    });
+
+    await player.dispose();
+  });
 }

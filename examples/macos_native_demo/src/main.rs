@@ -1,8 +1,6 @@
 use std::cell::RefCell;
 use std::env;
 use std::ffi::c_void;
-#[cfg(feature = "libass")]
-use std::fs;
 use std::process;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -11,14 +9,11 @@ use kuroko::danmaku::{DanmakuItem, DanmakuMode, DanmakuTimeline};
 use kuroko::overlay::OverlayTimeline;
 use kuroko::presenter::{PresenterConfig, PresenterRuntime};
 use kuroko::renderer::metal::{MetalOutputMode, MetalRendererConfig};
-#[cfg(feature = "libass")]
-use kuroko::subtitle::LibassRenderConfig;
 use kuroko::subtitle::{SubtitleCue, SubtitleTimeline};
 use kuroko::{MediaRequest, MetalSurfaceHandle, PlatformSurface};
 
 static MEDIA_URI: OnceLock<String> = OnceLock::new();
-#[cfg(feature = "libass")]
-static ASS_SUBTITLE_PATH: OnceLock<String> = OnceLock::new();
+static SUBTITLE_PATH: OnceLock<String> = OnceLock::new();
 static SMOKE_SECONDS: OnceLock<f64> = OnceLock::new();
 static EDR_HEADROOM: OnceLock<f32> = OnceLock::new();
 
@@ -54,12 +49,25 @@ impl DemoState {
             self.load_attempted = true;
             if let Some(uri) = MEDIA_URI.get() {
                 match self.presenter.open(MediaRequest::new(uri)) {
-                    Ok(()) => match self.presenter.play() {
-                        Ok(()) => {
-                            eprintln!("Kuroko demo opened media through presenter runtime")
+                    Ok(()) => {
+                        if let Some(path) = SUBTITLE_PATH.get() {
+                            match self.presenter.add_external_subtitle(path) {
+                                Ok(track) => eprintln!(
+                                    "Kuroko demo added external subtitle track #{}: {path}",
+                                    track.id
+                                ),
+                                Err(error) => {
+                                    eprintln!("Kuroko demo external subtitle add failed: {error}")
+                                }
+                            }
                         }
-                        Err(error) => eprintln!("Kuroko demo play failed: {error}"),
-                    },
+                        match self.presenter.play() {
+                            Ok(()) => {
+                                eprintln!("Kuroko demo opened media through presenter runtime")
+                            }
+                            Err(error) => eprintln!("Kuroko demo play failed: {error}"),
+                        }
+                    }
                     Err(error) => eprintln!("Kuroko demo video load failed: {error}"),
                 }
             }
@@ -87,24 +95,6 @@ fn demo_renderer_config() -> MetalRendererConfig {
 }
 
 fn demo_overlay_timeline() -> OverlayTimeline {
-    #[cfg(feature = "libass")]
-    if let Some(path) = ASS_SUBTITLE_PATH.get() {
-        match fs::read(path) {
-            Ok(script) => {
-                match OverlayTimeline::default()
-                    .with_ass_subtitles(script, LibassRenderConfig::default())
-                {
-                    Ok(timeline) => {
-                        eprintln!("Kuroko demo loaded ASS subtitle through libass: {path}");
-                        return timeline.with_danmaku(demo_danmaku_timeline());
-                    }
-                    Err(error) => eprintln!("Kuroko demo libass subtitle load failed: {error}"),
-                }
-            }
-            Err(error) => eprintln!("Kuroko demo ASS subtitle read failed: {error}"),
-        }
-    }
-
     let subtitles = SubtitleTimeline::new(vec![SubtitleCue {
         start: Duration::from_millis(500),
         end: Duration::from_secs(4),
@@ -172,18 +162,13 @@ fn main() {
     let options = parse_args(&args).unwrap_or_else(|error| {
         eprintln!("{error}");
         eprintln!(
-            "usage: cargo run -p macos_native_demo -- [--edr [HEADROOM]] [--smoke-seconds N] [--ass-subtitle PATH] [media-path-or-uri]"
+            "usage: cargo run -p macos_native_demo -- [--edr [HEADROOM]] [--smoke-seconds N] [--subtitle PATH] [--ass-subtitle PATH] [media-path-or-uri]"
         );
         process::exit(2);
     });
-    #[cfg(feature = "libass")]
-    if let Some(path) = options.ass_subtitle_path {
-        ASS_SUBTITLE_PATH
-            .set(path)
-            .expect("ASS subtitle path is set once");
+    if let Some(path) = options.subtitle_path {
+        SUBTITLE_PATH.set(path).expect("subtitle path is set once");
     }
-    #[cfg(not(feature = "libass"))]
-    let _ = options.ass_subtitle_path;
 
     if let Some(headroom) = options.edr_headroom {
         EDR_HEADROOM
@@ -208,15 +193,14 @@ struct DemoOptions {
     media_uri: Option<String>,
     smoke_seconds: Option<f64>,
     edr_headroom: Option<f32>,
-    ass_subtitle_path: Option<String>,
+    subtitle_path: Option<String>,
 }
 
 fn parse_args(args: &[String]) -> Result<DemoOptions, String> {
     let mut media_uri = None;
     let mut smoke_seconds = None;
     let mut edr_headroom = None;
-    #[cfg(feature = "libass")]
-    let mut ass_subtitle_path = None;
+    let mut subtitle_path = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -248,24 +232,13 @@ fn parse_args(args: &[String]) -> Result<DemoOptions, String> {
                 }
                 smoke_seconds = Some(seconds);
             }
-            "--ass-subtitle" => {
+            "--subtitle" | "--ass-subtitle" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
-                    return Err("--ass-subtitle requires a path".to_string());
+                    return Err(format!("{} requires a path", args[index - 1]));
                 };
-                #[cfg(not(feature = "libass"))]
-                {
-                    let _ = value;
-                    return Err(
-                        "--ass-subtitle requires building macos_native_demo with --features libass"
-                            .to_string(),
-                    );
-                }
-                #[cfg(feature = "libass")]
-                {
-                    if ass_subtitle_path.replace(value.to_string()).is_some() {
-                        return Err("ASS subtitle path was provided more than once".to_string());
-                    }
+                if subtitle_path.replace(value.to_string()).is_some() {
+                    return Err("subtitle path was provided more than once".to_string());
                 }
             }
             "--" => {
@@ -293,10 +266,7 @@ fn parse_args(args: &[String]) -> Result<DemoOptions, String> {
         media_uri,
         smoke_seconds,
         edr_headroom,
-        #[cfg(feature = "libass")]
-        ass_subtitle_path,
-        #[cfg(not(feature = "libass"))]
-        ass_subtitle_path: None,
+        subtitle_path,
     })
 }
 
@@ -317,7 +287,7 @@ mod tests {
         assert_eq!(options.media_uri.as_deref(), Some("/tmp/movie.mp4"));
         assert_eq!(options.smoke_seconds, Some(1.5));
         assert_eq!(options.edr_headroom, None);
-        assert_eq!(options.ass_subtitle_path, None);
+        assert_eq!(options.subtitle_path, None);
     }
 
     #[test]
@@ -357,9 +327,22 @@ mod tests {
         assert!(error.contains("positive"));
     }
 
-    #[cfg(feature = "libass")]
     #[test]
-    fn parse_args_accepts_ass_subtitle_path() {
+    fn parse_args_accepts_subtitle_path() {
+        let args = vec![
+            "--subtitle".to_string(),
+            "/tmp/subs.srt".to_string(),
+            "/tmp/movie.mp4".to_string(),
+        ];
+
+        let options = parse_args(&args).unwrap();
+
+        assert_eq!(options.subtitle_path.as_deref(), Some("/tmp/subs.srt"));
+        assert_eq!(options.media_uri.as_deref(), Some("/tmp/movie.mp4"));
+    }
+
+    #[test]
+    fn parse_args_keeps_ass_subtitle_alias() {
         let args = vec![
             "--ass-subtitle".to_string(),
             "/tmp/subs.ass".to_string(),
@@ -368,17 +351,7 @@ mod tests {
 
         let options = parse_args(&args).unwrap();
 
-        assert_eq!(options.ass_subtitle_path.as_deref(), Some("/tmp/subs.ass"));
+        assert_eq!(options.subtitle_path.as_deref(), Some("/tmp/subs.ass"));
         assert_eq!(options.media_uri.as_deref(), Some("/tmp/movie.mp4"));
-    }
-
-    #[cfg(not(feature = "libass"))]
-    #[test]
-    fn parse_args_rejects_ass_subtitle_without_feature() {
-        let args = vec!["--ass-subtitle".to_string(), "/tmp/subs.ass".to_string()];
-
-        let error = parse_args(&args).unwrap_err();
-
-        assert!(error.contains("--features libass"));
     }
 }

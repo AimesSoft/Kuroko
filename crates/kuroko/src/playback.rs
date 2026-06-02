@@ -22,6 +22,10 @@ pub enum PlaybackError {
     NoVideoTrack,
     #[error("selected decoder output is not a video frame")]
     UnexpectedDecoderOutput,
+    #[error("no subtitle track found")]
+    NoSubtitleTrack,
+    #[error("subtitle track is not removable: {0}")]
+    SubtitleTrackNotRemovable(i64),
 }
 
 pub type Result<T> = std::result::Result<T, PlaybackError>;
@@ -29,6 +33,7 @@ pub type Result<T> = std::result::Result<T, PlaybackError>;
 const VIDEO_FRAME_QUEUE_LIMIT: usize = 8;
 const AUDIO_FRAME_QUEUE_LIMIT: usize = 16;
 const SUBTITLE_FRAME_QUEUE_LIMIT: usize = 32;
+const EXTERNAL_SUBTITLE_LOOKAHEAD: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoDecodePreference {
@@ -95,6 +100,7 @@ pub struct PlaybackSession {
     video_decoder: Option<Decoder>,
     audio_decoder: Option<Decoder>,
     subtitle_decoder: Option<SubtitleDecoder>,
+    external_subtitles: Vec<ExternalSubtitleSession>,
     audio_resampler: Option<AudioResampler>,
     audio_output: PcmFormat,
     info: OpenedMediaInfo,
@@ -189,6 +195,7 @@ impl PlaybackSession {
             video_decoder,
             audio_decoder,
             subtitle_decoder,
+            external_subtitles: Vec::new(),
             audio_resampler: None,
             audio_output: config.audio_output,
             info,
@@ -226,11 +233,68 @@ impl PlaybackSession {
         Ok(self.audio_frames.pop_front())
     }
 
-    pub fn next_subtitle_frame(&mut self) -> Result<Option<DecodedSubtitleFrame>> {
-        if self.subtitle_decoder.is_none() {
+    pub fn next_subtitle_frame(
+        &mut self,
+        media_time: Duration,
+    ) -> Result<Option<DecodedSubtitleFrame>> {
+        if self.subtitle_decoder.is_none() && self.external_subtitles.is_empty() {
             return Ok(None);
         }
-        Ok(self.subtitle_frames.pop_front())
+        self.pump_external_subtitles(media_time)?;
+        Ok(self.pop_ready_subtitle(media_time))
+    }
+
+    pub fn add_external_subtitle(
+        &mut self,
+        config: SubtitleTrackConfig,
+    ) -> Result<SubtitleTrackConfig> {
+        let external = ExternalSubtitleSession::open(config)?;
+        let track = external.track().clone();
+        self.info.tracks.push(TrackInfo {
+            id: track.id,
+            kind: TrackKind::Subtitle,
+            title: track.title.clone(),
+            language: track.language.clone(),
+            codec: None,
+        });
+        self.info.subtitle_tracks.push(track.clone());
+        self.external_subtitles.push(external);
+        Ok(track)
+    }
+
+    pub fn remove_subtitle_track(
+        &mut self,
+        track_id: i64,
+        media_time: Duration,
+    ) -> Result<Option<DecodedSubtitleFrame>> {
+        let Some(index) = self
+            .external_subtitles
+            .iter()
+            .position(|track| track.track().id == track_id)
+        else {
+            let is_embedded = self
+                .info
+                .subtitle_tracks
+                .iter()
+                .any(|track| track.id == track_id && !track.can_remove());
+            return if is_embedded {
+                Err(PlaybackError::SubtitleTrackNotRemovable(track_id))
+            } else {
+                Ok(None)
+            };
+        };
+        self.external_subtitles.remove(index);
+        self.subtitle_frames
+            .retain(|frame| frame.track_id != track_id);
+        self.info.tracks.retain(|track| track.id != track_id);
+        self.info
+            .subtitle_tracks
+            .retain(|track| track.id != track_id);
+        Ok(Some(DecodedSubtitleFrame::new(
+            track_id,
+            Some(media_time),
+            None,
+        )))
     }
 
     pub fn seek(&mut self, position: Duration) -> Result<()> {
@@ -244,12 +308,39 @@ impl PlaybackSession {
         if let Some(decoder) = &mut self.subtitle_decoder {
             decoder.flush();
         }
+        for external in &mut self.external_subtitles {
+            external.seek(position)?;
+        }
         self.audio_resampler = None;
         self.video_frames.clear();
         self.audio_frames.clear();
         self.subtitle_frames.clear();
         self.eof = false;
         Ok(())
+    }
+
+    fn pump_external_subtitles(&mut self, media_time: Duration) -> Result<()> {
+        for external in &mut self.external_subtitles {
+            external.pump_until(media_time)?;
+        }
+        Ok(())
+    }
+
+    fn pop_ready_subtitle(&mut self, media_time: Duration) -> Option<DecodedSubtitleFrame> {
+        let embedded_start = self.subtitle_frames.front().map(decoded_subtitle_start);
+        let external_starts = self
+            .external_subtitles
+            .iter()
+            .enumerate()
+            .filter_map(|(index, external)| external.peek_start().map(|start| (index, start)));
+        let candidate = select_ready_subtitle(embedded_start, external_starts, media_time)?;
+
+        match candidate {
+            SubtitleQueueCandidate::Embedded { .. } => self.subtitle_frames.pop_front(),
+            SubtitleQueueCandidate::External { index, .. } => {
+                self.external_subtitles[index].pop_front()
+            }
+        }
     }
 
     fn pump_once(&mut self) -> Result<()> {
@@ -352,6 +443,147 @@ impl PlaybackSession {
             .convert(&frame)
             .map_err(PlaybackError::from)
     }
+}
+
+enum SubtitleQueueCandidate {
+    Embedded { start: Duration },
+    External { index: usize, start: Duration },
+}
+
+impl SubtitleQueueCandidate {
+    fn start(&self) -> Duration {
+        match self {
+            Self::Embedded { start } | Self::External { start, .. } => *start,
+        }
+    }
+}
+
+fn select_ready_subtitle(
+    embedded_start: Option<Duration>,
+    external_starts: impl IntoIterator<Item = (usize, Duration)>,
+    media_time: Duration,
+) -> Option<SubtitleQueueCandidate> {
+    let embedded = embedded_start
+        .filter(|start| *start <= media_time)
+        .map(|start| SubtitleQueueCandidate::Embedded { start });
+    external_starts
+        .into_iter()
+        .filter_map(|(index, start)| {
+            (start <= media_time).then_some(SubtitleQueueCandidate::External { index, start })
+        })
+        .chain(embedded)
+        .min_by_key(SubtitleQueueCandidate::start)
+}
+
+fn decoded_subtitle_start(frame: &DecodedSubtitleFrame) -> Duration {
+    frame.start.unwrap_or(Duration::ZERO)
+}
+
+struct ExternalSubtitleSession {
+    demuxer: Demuxer,
+    decoder: SubtitleDecoder,
+    track: SubtitleTrackConfig,
+    frames: VecDeque<DecodedSubtitleFrame>,
+    eof: bool,
+}
+
+impl ExternalSubtitleSession {
+    fn open(mut config: SubtitleTrackConfig) -> Result<Self> {
+        let uri = match &config.source {
+            crate::subtitle::SubtitleTrackSource::External { uri } => uri.clone(),
+            crate::subtitle::SubtitleTrackSource::Embedded { stream_index } => {
+                return Err(PlaybackError::SubtitleTrackNotRemovable(*stream_index));
+            }
+        };
+        let source = source_from_uri_with_hint(&uri, crate::core::MediaSourceHint::Auto)?;
+        let mut demuxer = Demuxer::open_source(source)?;
+        let stream_index = demuxer
+            .probe()
+            .tracks
+            .iter()
+            .find(|track| track.kind == TrackKind::Subtitle)
+            .map(|track| track.id as i32)
+            .ok_or(PlaybackError::NoSubtitleTrack)?;
+        let decoder = demuxer.open_subtitle_decoder(stream_index)?;
+        demuxer.set_stream_selection(StreamSelection::only([stream_index]))?;
+
+        if let Some(probed) = demuxer
+            .probe()
+            .subtitles
+            .iter()
+            .find(|track| track.source.is_embedded())
+        {
+            config.language = config.language.or_else(|| probed.language.clone());
+            config.title = config.title.or_else(|| probed.title.clone());
+        }
+        if config.title.is_none() {
+            config.title = external_subtitle_title(&uri);
+        }
+
+        Ok(Self {
+            demuxer,
+            decoder,
+            track: config,
+            frames: VecDeque::new(),
+            eof: false,
+        })
+    }
+
+    fn track(&self) -> &SubtitleTrackConfig {
+        &self.track
+    }
+
+    fn pump_until(&mut self, media_time: Duration) -> Result<()> {
+        let lookahead = media_time.saturating_add(EXTERNAL_SUBTITLE_LOOKAHEAD);
+        while self.frames.len() < SUBTITLE_FRAME_QUEUE_LIMIT && !self.eof {
+            if self
+                .frames
+                .back()
+                .and_then(|frame| frame.start)
+                .is_some_and(|start| start > lookahead)
+            {
+                break;
+            }
+
+            match self.demuxer.read_packet()? {
+                Some(packet) => {
+                    if let Some(frame) = self.decoder.decode_packet(&packet)? {
+                        self.frames.push_back(frame.with_track_id(self.track.id));
+                    }
+                }
+                None => self.eof = true,
+            }
+        }
+        Ok(())
+    }
+
+    fn peek_start(&self) -> Option<Duration> {
+        self.frames
+            .front()
+            .and_then(|frame| frame.start)
+            .or_else(|| self.frames.front().map(|_| Duration::ZERO))
+    }
+
+    fn pop_front(&mut self) -> Option<DecodedSubtitleFrame> {
+        self.frames.pop_front()
+    }
+
+    fn seek(&mut self, position: Duration) -> Result<()> {
+        self.demuxer.seek(position)?;
+        self.decoder.flush();
+        self.frames.clear();
+        self.eof = false;
+        Ok(())
+    }
+}
+
+fn external_subtitle_title(uri: &str) -> Option<String> {
+    let leaf = uri
+        .rsplit_once('/')
+        .map(|(_, leaf)| leaf)
+        .unwrap_or(uri)
+        .trim();
+    (!leaf.is_empty()).then_some(leaf.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -843,6 +1075,26 @@ impl VideoPlaybackEngine {
         self.session.info()
     }
 
+    pub fn add_external_subtitle(
+        &mut self,
+        config: SubtitleTrackConfig,
+    ) -> Result<SubtitleTrackConfig> {
+        self.session.add_external_subtitle(config)
+    }
+
+    pub fn remove_subtitle_track(&mut self, track_id: i64) -> Result<Option<TimedSubtitleFrame>> {
+        let media_time = self.media_time();
+        let Some(frame) = self.session.remove_subtitle_track(track_id, media_time)? else {
+            return Ok(None);
+        };
+        Ok(Some(TimedSubtitleFrame {
+            frame,
+            pts: Some(media_time),
+            media_time,
+            late_by: None,
+        }))
+    }
+
     pub fn state(&self) -> PlaybackRunState {
         self.state
     }
@@ -964,13 +1216,13 @@ impl VideoPlaybackEngine {
         if self.state != PlaybackRunState::Playing {
             return Ok(None);
         }
-        self.ensure_pending_subtitle()?;
+        let media_time = self.media_time();
+        self.ensure_pending_subtitle(media_time)?;
         let Some(frame) = self.pending_subtitle.as_ref() else {
             return Ok(None);
         };
 
         let pts = frame.start;
-        let media_time = self.media_time();
         if pts.is_some_and(|pts| pts > media_time) {
             return Ok(None);
         }
@@ -1062,11 +1314,11 @@ impl VideoPlaybackEngine {
         Ok(())
     }
 
-    fn ensure_pending_subtitle(&mut self) -> Result<()> {
+    fn ensure_pending_subtitle(&mut self, media_time: Duration) -> Result<()> {
         if self.pending_subtitle.is_some() || self.eof {
             return Ok(());
         }
-        self.pending_subtitle = self.session.next_subtitle_frame()?;
+        self.pending_subtitle = self.session.next_subtitle_frame(media_time)?;
         Ok(())
     }
 
@@ -1143,6 +1395,7 @@ fn add_signed_duration(base: Duration, delta_nanos: i128) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn opened_media_info_keeps_probe_summary() {
@@ -1182,6 +1435,78 @@ mod tests {
         assert_eq!(info.subtitle_tracks.len(), 1);
         assert_eq!(info.video_decode_backend, Some(DecoderBackend::Software));
         assert_eq!(info.audio_output, Some(PcmFormat::default()));
+    }
+
+    #[test]
+    fn subtitle_queue_selects_ready_external_before_future_embedded() {
+        let candidate = select_ready_subtitle(
+            Some(Duration::from_secs(10)),
+            [(3, Duration::from_secs(1))],
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            candidate,
+            SubtitleQueueCandidate::External {
+                index: 3,
+                start
+            } if start == Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn subtitle_queue_selects_earliest_ready_candidate() {
+        let candidate = select_ready_subtitle(
+            Some(Duration::from_secs(1)),
+            [(0, Duration::from_secs(2))],
+            Duration::from_secs(3),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            candidate,
+            SubtitleQueueCandidate::Embedded { start } if start == Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn subtitle_queue_waits_when_no_candidate_is_ready() {
+        assert!(
+            select_ready_subtitle(
+                Some(Duration::from_secs(5)),
+                [(0, Duration::from_secs(6))],
+                Duration::from_secs(4),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn external_subtitle_session_decodes_text_frames_with_external_track_id() {
+        let path = std::env::temp_dir().join(format!(
+            "kuroko-external-subtitle-{}.srt",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            "1\n00:00:01,000 --> 00:00:03,000\nExternal subtitle\n",
+        )
+        .unwrap();
+        let config = SubtitleTrackConfig::external(1_000_007, path.to_string_lossy());
+
+        let mut external = ExternalSubtitleSession::open(config).unwrap();
+        external.pump_until(Duration::from_secs(2)).unwrap();
+        let frame = external.pop_front().unwrap();
+
+        assert_eq!(external.track().id, 1_000_007);
+        assert_eq!(frame.track_id, 1_000_007);
+        assert_eq!(frame.start, Some(Duration::from_secs(1)));
+        assert_eq!(frame.end, Some(Duration::from_secs(3)));
+        assert_eq!(frame.text.len(), 1);
+        assert_eq!(frame.text[0].display_text(), "External subtitle");
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]

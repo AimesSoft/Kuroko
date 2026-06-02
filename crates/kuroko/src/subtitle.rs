@@ -93,6 +93,26 @@ pub enum SubtitleTextFormat {
     Ass,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtitleFileFormat {
+    Srt,
+    WebVtt,
+    Ass,
+}
+
+impl SubtitleFileFormat {
+    pub fn from_path(path: impl AsRef<str>) -> Option<Self> {
+        let path = path.as_ref();
+        let extension = path.rsplit_once('.')?.1.to_ascii_lowercase();
+        match extension.as_str() {
+            "srt" => Some(Self::Srt),
+            "vtt" | "webvtt" => Some(Self::WebVtt),
+            "ass" | "ssa" => Some(Self::Ass),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubtitleTextSegment {
     pub format: SubtitleTextFormat,
@@ -112,6 +132,13 @@ impl SubtitleTextSegment {
     pub fn with_forced(mut self, forced: bool) -> Self {
         self.forced = forced;
         self
+    }
+
+    pub fn display_text(&self) -> String {
+        match self.format {
+            SubtitleTextFormat::PlainText => self.text.trim().to_string(),
+            SubtitleTextFormat::Ass => ass_segment_display_text(&self.text),
+        }
     }
 }
 
@@ -154,6 +181,33 @@ impl DecodedSubtitleFrame {
     pub fn push_bitmap_plane(&mut self, plane: SubtitleBitmapPlane, forced: bool) {
         self.forced |= forced;
         self.bitmap.planes.push(plane);
+    }
+
+    pub fn with_track_id(mut self, track_id: i64) -> Self {
+        self.track_id = track_id;
+        self
+    }
+
+    pub fn has_text(&self) -> bool {
+        self.text.iter().any(|segment| !segment.text.is_empty())
+    }
+
+    pub fn text_cues(&self, fallback_end: Duration) -> Vec<SubtitleCue> {
+        let Some(start) = self.start else {
+            return Vec::new();
+        };
+        let end = self.end.unwrap_or(fallback_end).max(start);
+        self.text
+            .iter()
+            .filter_map(|segment| {
+                let text = segment.display_text();
+                (!text.is_empty()).then_some(SubtitleCue { start, end, text })
+            })
+            .collect()
+    }
+
+    pub fn to_ass_script(&self, fallback_end: Duration) -> Option<String> {
+        decoded_subtitle_frames_to_ass_script([self], fallback_end)
     }
 }
 
@@ -1052,6 +1106,73 @@ pub fn parse_ass_events(input: &str) -> Result<SubtitleTimeline> {
     Ok(SubtitleTimeline::new(cues))
 }
 
+pub fn parse_subtitle_text_file(
+    format: SubtitleFileFormat,
+    input: &str,
+) -> Result<SubtitleTimeline> {
+    match format {
+        SubtitleFileFormat::Srt => parse_srt(input),
+        SubtitleFileFormat::WebVtt => parse_webvtt(input),
+        SubtitleFileFormat::Ass => parse_ass_events(input),
+    }
+}
+
+pub fn decoded_subtitle_frames_to_timeline<'a>(
+    frames: impl IntoIterator<Item = &'a DecodedSubtitleFrame>,
+    fallback_end: Duration,
+) -> SubtitleTimeline {
+    let cues = frames
+        .into_iter()
+        .flat_map(|frame| frame.text_cues(fallback_end))
+        .collect();
+    SubtitleTimeline::new(cues)
+}
+
+pub fn decoded_subtitle_frames_to_ass_script<'a>(
+    frames: impl IntoIterator<Item = &'a DecodedSubtitleFrame>,
+    fallback_end: Duration,
+) -> Option<String> {
+    let mut events = String::new();
+    for frame in frames {
+        if !frame.has_text() {
+            continue;
+        }
+        let start = frame.start.unwrap_or(Duration::ZERO);
+        let end = frame.end.unwrap_or(fallback_end).max(start);
+        for segment in &frame.text {
+            if segment.text.trim().is_empty() {
+                continue;
+            }
+            match segment.format {
+                SubtitleTextFormat::Ass if is_ass_dialogue_line(&segment.text) => {
+                    events.push_str(segment.text.trim());
+                    events.push('\n');
+                }
+                SubtitleTextFormat::Ass => {
+                    let text = ass_segment_display_text(&segment.text);
+                    if !text.is_empty() {
+                        push_ass_dialogue(&mut events, start, end, &text);
+                    }
+                }
+                SubtitleTextFormat::PlainText => {
+                    let text = segment.text.trim();
+                    if !text.is_empty() {
+                        push_ass_dialogue(&mut events, start, end, text);
+                    }
+                }
+            }
+        }
+    }
+
+    if events.is_empty() {
+        return None;
+    }
+
+    let mut script = String::from(DEFAULT_ASS_SCRIPT_HEADER);
+    script.push_str(&events);
+    Some(script)
+}
+
 fn parse_timed_text_cue(time_line: &str, text: &str) -> Result<SubtitleCue> {
     let (start, end) = time_line
         .split_once("-->")
@@ -1115,6 +1236,81 @@ fn clean_ass_text(value: &str) -> String {
     }
     output.trim().to_string()
 }
+
+fn ass_segment_display_text(value: &str) -> String {
+    let value = value.trim();
+    if let Some(dialogue) = strip_ass_dialogue_prefix(value) {
+        let fields = dialogue.splitn(10, ',').collect::<Vec<_>>();
+        return fields
+            .get(9)
+            .map(|text| clean_ass_text(text))
+            .unwrap_or_default();
+    }
+    let fields = value.splitn(9, ',').collect::<Vec<_>>();
+    if fields.len() == 9 && fields[0].trim().parse::<i64>().is_ok() {
+        return clean_ass_text(fields[8]);
+    }
+    clean_ass_text(value)
+}
+
+fn is_ass_dialogue_line(value: &str) -> bool {
+    strip_ass_dialogue_prefix(value).is_some()
+}
+
+fn strip_ass_dialogue_prefix(value: &str) -> Option<&str> {
+    let value = value.trim_start();
+    let (prefix, rest) = value.split_once(':')?;
+    prefix
+        .eq_ignore_ascii_case("Dialogue")
+        .then_some(rest.trim_start())
+}
+
+fn push_ass_dialogue(output: &mut String, start: Duration, end: Duration, text: &str) {
+    output.push_str("Dialogue: 0,");
+    output.push_str(&format_ass_timestamp(start));
+    output.push(',');
+    output.push_str(&format_ass_timestamp(end));
+    output.push_str(",Default,,0,0,0,,");
+    output.push_str(&escape_ass_text(text));
+    output.push('\n');
+}
+
+fn format_ass_timestamp(value: Duration) -> String {
+    let centiseconds = value.as_millis().saturating_add(5) / 10;
+    let seconds_total = centiseconds / 100;
+    let hours = seconds_total / 3600;
+    let minutes = (seconds_total / 60) % 60;
+    let seconds = seconds_total % 60;
+    let centiseconds = centiseconds % 100;
+    format!("{hours}:{minutes:02}:{seconds:02}.{centiseconds:02}")
+}
+
+fn escape_ass_text(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\n' => output.push_str("\\N"),
+            '\\' => output.push_str("\\\\"),
+            '{' => output.push_str("\\{"),
+            '}' => output.push_str("\\}"),
+            _ => output.push(ch),
+        }
+    }
+    output
+}
+
+const DEFAULT_ASS_SCRIPT_HEADER: &str = r#"[Script Info]
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H80000000,&H80000000,0,0,0,0,100,100,0,0,1,2,0,2,48,48,54,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"#;
 
 fn debug_rgba_plane(width: u32, height: u32) -> Vec<u8> {
     let mut rgba = vec![0u8; width as usize * height as usize * 4];
@@ -1215,12 +1411,105 @@ Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,Hello libass
     }
 
     #[test]
+    fn subtitle_file_format_detects_text_subtitle_extensions() {
+        assert_eq!(
+            SubtitleFileFormat::from_path("/tmp/movie.en.srt"),
+            Some(SubtitleFileFormat::Srt)
+        );
+        assert_eq!(
+            SubtitleFileFormat::from_path("/tmp/movie.VTT"),
+            Some(SubtitleFileFormat::WebVtt)
+        );
+        assert_eq!(
+            SubtitleFileFormat::from_path("/tmp/movie.ass"),
+            Some(SubtitleFileFormat::Ass)
+        );
+        assert_eq!(SubtitleFileFormat::from_path("/tmp/movie.sup"), None);
+    }
+
+    #[test]
+    fn parse_subtitle_text_file_dispatches_by_format() {
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\nHello\n";
+        let timeline = parse_subtitle_text_file(SubtitleFileFormat::Srt, srt).unwrap();
+
+        assert_eq!(timeline.cues().len(), 1);
+        assert_eq!(timeline.cues()[0].text, "Hello");
+    }
+
+    #[test]
     fn parses_ass_dialogue() {
         let ass = "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\i1}Hi\\Nthere";
         let timeline = parse_ass_events(ass).unwrap();
 
         assert_eq!(timeline.cues().len(), 1);
         assert_eq!(timeline.cues()[0].text, "Hi\nthere");
+    }
+
+    #[test]
+    fn decoded_plain_text_subtitle_can_become_ass_script() {
+        let mut frame = DecodedSubtitleFrame::new(
+            2,
+            Some(Duration::from_millis(1250)),
+            Some(Duration::from_millis(2500)),
+        );
+        frame.push_text(SubtitleTextSegment::new(
+            SubtitleTextFormat::PlainText,
+            "hello\nworld",
+        ));
+
+        let script = frame.to_ass_script(Duration::from_secs(5)).unwrap();
+
+        assert!(script.contains("[Script Info]"));
+        assert!(script.contains("Dialogue: 0,0:00:01.25,0:00:02.50"));
+        assert!(script.contains("hello\\Nworld"));
+    }
+
+    #[test]
+    fn decoded_ass_dialogue_preserves_event_line_for_libass() {
+        let mut frame = DecodedSubtitleFrame::new(
+            2,
+            Some(Duration::from_secs(1)),
+            Some(Duration::from_secs(2)),
+        );
+        frame.push_text(SubtitleTextSegment::new(
+            SubtitleTextFormat::Ass,
+            "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\i1}Hi",
+        ));
+
+        let script = frame.to_ass_script(Duration::from_secs(5)).unwrap();
+
+        assert!(script.contains("Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\i1}Hi"));
+        assert_eq!(frame.text[0].display_text(), "Hi");
+    }
+
+    #[test]
+    fn decoded_lavc_ass_payload_uses_payload_text_field() {
+        let segment = SubtitleTextSegment::new(
+            SubtitleTextFormat::Ass,
+            "0,0,Default,,0,0,0,,External subtitle",
+        );
+
+        assert_eq!(segment.display_text(), "External subtitle");
+    }
+
+    #[test]
+    fn decoded_text_frames_can_become_debug_timeline() {
+        let mut frame = DecodedSubtitleFrame::new(
+            2,
+            Some(Duration::from_secs(1)),
+            Some(Duration::from_secs(3)),
+        );
+        frame.push_text(SubtitleTextSegment::new(
+            SubtitleTextFormat::Ass,
+            "{\\b1}Hello",
+        ));
+
+        let timeline = decoded_subtitle_frames_to_timeline([&frame], Duration::from_secs(5));
+
+        assert_eq!(timeline.cues().len(), 1);
+        assert_eq!(timeline.cues()[0].text, "Hello");
+        assert_eq!(timeline.cues()[0].start, Duration::from_secs(1));
+        assert_eq!(timeline.cues()[0].end, Duration::from_secs(3));
     }
 
     #[test]

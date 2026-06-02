@@ -1,6 +1,10 @@
 use std::ffi::c_void;
 
-use crate::core::{ColorPrimaries, PlatformSurface, RendererBackend, Result, TransferFunction};
+use crate::core::{
+    ColorPrimaries, PlatformSurface, PlayerError, PlayerVideoFrame, RendererBackend, Result,
+    TransferFunction,
+};
+use crate::ffmpeg::Frame;
 use crate::overlay::OverlayFrame;
 use crate::renderer::pipeline::{
     ColorRange, HdrMetadata, MatrixCoefficients, SourceColorState, VideoRenderPipeline,
@@ -33,6 +37,7 @@ pub struct MetalRenderer {
     inner: macos::MetalRendererImpl,
     #[cfg(not(target_os = "macos"))]
     _unsupported: (),
+    current_frame: Option<ImportedVideoFrame>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -277,6 +282,7 @@ impl MetalRenderer {
         {
             Ok(Self {
                 inner: macos::MetalRendererImpl::new(config)?,
+                current_frame: None,
             })
         }
         #[cfg(not(target_os = "macos"))]
@@ -388,6 +394,29 @@ impl MetalRenderer {
             self.inner.record_prepared_overlay_frame(info);
         }
         Ok(info)
+    }
+
+    fn import_player_frame(&mut self, frame: &Frame) -> Result<ImportedVideoFrame> {
+        let pixel_buffer = frame.videotoolbox_pixel_buffer().ok_or_else(|| {
+            PlayerError::Renderer(
+                "decoded frame is not backed by VideoToolbox CVPixelBuffer".to_string(),
+            )
+        })?;
+        let mut imported = unsafe {
+            self.import_video_frame_textures(VideoFrameTextureSource::new(
+                pixel_buffer.raw(),
+                pixel_buffer.width(),
+                pixel_buffer.height(),
+            ))
+        }?;
+        imported.set_source_color_metadata(
+            frame.color_primaries(),
+            frame.transfer_function(),
+            frame.color_range(),
+            frame.matrix_coefficients(),
+            frame.hdr_metadata(),
+        );
+        Ok(imported)
     }
 
     pub fn stats(&self) -> MetalRendererStats {
@@ -509,6 +538,27 @@ impl RendererBackend for MetalRenderer {
                 "Metal renderer is only available on macOS for v0".to_string(),
             ))
         }
+    }
+
+    fn upload_player_frame(&mut self, frame: &PlayerVideoFrame) -> Result<()> {
+        let imported = self.import_player_frame(&frame.frame)?;
+        self.current_frame = Some(imported);
+        Ok(())
+    }
+
+    fn render_current_frame(&mut self, overlay: Option<&OverlayFrame>) -> Result<bool> {
+        let Some(frame) = self.current_frame.take() else {
+            return Ok(false);
+        };
+        let result = match overlay {
+            Some(overlay) => self.render_video_frame_with_overlay(
+                VideoRenderFrame::new(&frame),
+                OverlayRenderFrame::new(overlay),
+            ),
+            None => self.render_video_frame(VideoRenderFrame::new(&frame)),
+        };
+        self.current_frame = Some(frame);
+        result.map(|()| true)
     }
 }
 

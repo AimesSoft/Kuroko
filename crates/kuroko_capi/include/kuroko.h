@@ -118,6 +118,11 @@ KurokoStatus kuroko_pause(KurokoHandle *handle);
 KurokoStatus kuroko_stop(KurokoHandle *handle);
 KurokoStatus kuroko_close(KurokoHandle *handle);
 KurokoStatus kuroko_seek(KurokoHandle *handle, uint64_t position_micros);
+KurokoStatus kuroko_add_external_subtitle(
+    KurokoHandle *handle,
+    const char *uri,
+    int64_t *out_track_id);
+KurokoStatus kuroko_remove_subtitle_track(KurokoHandle *handle, int64_t track_id);
 KurokoStatus kuroko_state(KurokoHandle *handle, KurokoState *out_state);
 KurokoStatus kuroko_poll_event(KurokoHandle *handle, KurokoEvent *out_event);
 
@@ -160,6 +165,13 @@ KurokoStatus kuroko_presenter_pause(KurokoPresenterHandle *handle);
 KurokoStatus kuroko_presenter_stop(KurokoPresenterHandle *handle);
 KurokoStatus kuroko_presenter_close(KurokoPresenterHandle *handle);
 KurokoStatus kuroko_presenter_seek(KurokoPresenterHandle *handle, uint64_t position_micros);
+KurokoStatus kuroko_presenter_add_external_subtitle(
+    KurokoPresenterHandle *handle,
+    const char *uri,
+    int64_t *out_track_id);
+KurokoStatus kuroko_presenter_remove_subtitle_track(
+    KurokoPresenterHandle *handle,
+    int64_t track_id);
 
 KurokoStatus kuroko_presenter_attach_metal_layer(
     KurokoPresenterHandle *handle,

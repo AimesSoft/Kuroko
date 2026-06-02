@@ -100,6 +100,12 @@ private final class KurokoNativeLibrary {
   typealias OpenFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> Int32
   typealias CommandFn = @convention(c) (UnsafeMutableRawPointer?) -> Int32
   typealias SeekFn = @convention(c) (UnsafeMutableRawPointer?, UInt64) -> Int32
+  typealias AddExternalSubtitleFn = @convention(c) (
+    UnsafeMutableRawPointer?,
+    UnsafePointer<CChar>?,
+    UnsafeMutablePointer<Int64>?
+  ) -> Int32
+  typealias RemoveSubtitleTrackFn = @convention(c) (UnsafeMutableRawPointer?, Int64) -> Int32
   typealias AttachMetalLayerFn = @convention(c) (UnsafeMutableRawPointer?, UInt64, UInt32, UInt32, Double) -> Int32
   typealias ResizeSurfaceFn = @convention(c) (UnsafeMutableRawPointer?, UInt32, UInt32, Double) -> Int32
   typealias RenderTickFn = @convention(c) (UnsafeMutableRawPointer?, Double, UnsafeMutableRawPointer?) -> Int32
@@ -116,6 +122,8 @@ private final class KurokoNativeLibrary {
   let stop: CommandFn
   let close: CommandFn
   let seek: SeekFn
+  let addExternalSubtitle: AddExternalSubtitleFn
+  let removeSubtitleTrack: RemoveSubtitleTrackFn
   let attachMetalLayer: AttachMetalLayerFn
   let resizeSurface: ResizeSurfaceFn
   let detachSurface: CommandFn
@@ -137,6 +145,8 @@ private final class KurokoNativeLibrary {
     stop = try Self.load("kuroko_presenter_stop", from: libraryHandle, as: CommandFn.self)
     close = try Self.load("kuroko_presenter_close", from: libraryHandle, as: CommandFn.self)
     seek = try Self.load("kuroko_presenter_seek", from: libraryHandle, as: SeekFn.self)
+    addExternalSubtitle = try Self.load("kuroko_presenter_add_external_subtitle", from: libraryHandle, as: AddExternalSubtitleFn.self)
+    removeSubtitleTrack = try Self.load("kuroko_presenter_remove_subtitle_track", from: libraryHandle, as: RemoveSubtitleTrackFn.self)
     attachMetalLayer = try Self.load("kuroko_presenter_attach_metal_layer", from: libraryHandle, as: AttachMetalLayerFn.self)
     resizeSurface = try Self.load("kuroko_presenter_resize_surface", from: libraryHandle, as: ResizeSurfaceFn.self)
     detachSurface = try Self.load("kuroko_presenter_detach_surface", from: libraryHandle, as: CommandFn.self)
@@ -251,6 +261,24 @@ private final class KurokoPlayerHost {
 
   func seek(positionMicros: UInt64) throws {
     try check(library.seek(handle, positionMicros), operation: "seek")
+  }
+
+  func addExternalSubtitle(uri: String) throws -> Int64 {
+    var trackId: Int64 = 0
+    try uri.withCString { cString in
+      try check(
+        library.addExternalSubtitle(handle, cString, &trackId),
+        operation: "add_external_subtitle"
+      )
+    }
+    return trackId
+  }
+
+  func removeSubtitleTrack(trackId: Int64) throws {
+    try check(
+      library.removeSubtitleTrack(handle, trackId),
+      operation: "remove_subtitle_track"
+    )
   }
 
   func attach(view: KurokoMetalSurfaceView) throws {
@@ -697,6 +725,19 @@ public final class KurokoFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHa
         let host = try playerHost(from: args)
         let positionMicros = try requiredUInt64(args["positionMicros"], name: "positionMicros")
         try host.seek(positionMicros: positionMicros)
+        result(nil)
+      case "addExternalSubtitle":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        guard let uri = args["uri"] as? String, !uri.isEmpty else {
+          throw KurokoPluginError.invalidArguments("uri is required.")
+        }
+        result(try host.addExternalSubtitle(uri: uri))
+      case "removeSubtitleTrack":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        let trackId = try requiredInt64(args["trackId"], name: "trackId")
+        try host.removeSubtitleTrack(trackId: trackId)
         result(nil)
       case "attachView":
         let args = try dictionaryArgs(call.arguments)

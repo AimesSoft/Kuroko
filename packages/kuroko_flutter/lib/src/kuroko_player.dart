@@ -88,6 +88,26 @@ class KurokoPlayer {
     });
   }
 
+  Future<int> addExternalSubtitle(String uri) async {
+    final playerId = await ensureCreated();
+    final trackId = await _channel.invokeMethod<int>(
+      'addExternalSubtitle',
+      <String, Object?>{'playerId': playerId, 'uri': uri},
+    );
+    if (trackId == null) {
+      throw StateError('Kuroko external subtitle add returned no track id.');
+    }
+    return trackId;
+  }
+
+  Future<void> removeSubtitleTrack(int trackId) async {
+    final playerId = await ensureCreated();
+    await _invoke('removeSubtitleTrack', <String, Object?>{
+      'playerId': playerId,
+      'trackId': trackId,
+    });
+  }
+
   Future<void> attachView(int viewId) async {
     final playerId = await ensureCreated();
     await _invoke('attachView', <String, Object?>{

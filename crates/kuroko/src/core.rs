@@ -9,10 +9,13 @@ use thiserror::Error;
 
 use crate::audio::AudioClockSnapshot;
 use crate::ffmpeg::{Frame, PcmAudioFrame};
+use crate::overlay::OverlayFrame;
 use crate::playback::{PlaybackRunState, PlaybackSessionConfig, VideoPlaybackEngine};
-use crate::subtitle::DecodedSubtitleFrame;
+use crate::subtitle::{DecodedSubtitleFrame, SubtitleTrackConfig};
 
 static NEXT_PLAYER_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_EXTERNAL_SUBTITLE_TRACK_ID: AtomicU64 = AtomicU64::new(1);
+const EXTERNAL_SUBTITLE_TRACK_ID_BASE: i64 = 1_000_000;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PlayerError {
@@ -83,6 +86,11 @@ impl Default for PlayerId {
         let id = NEXT_PLAYER_ID.fetch_add(1, Ordering::Relaxed).max(1);
         Self(NonZeroU64::new(id).expect("player id is non-zero"))
     }
+}
+
+fn next_external_subtitle_track_id() -> i64 {
+    let offset = NEXT_EXTERNAL_SUBTITLE_TRACK_ID.fetch_add(1, Ordering::Relaxed);
+    EXTERNAL_SUBTITLE_TRACK_ID_BASE.saturating_add(offset.min(i64::MAX as u64) as i64)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,6 +313,16 @@ pub trait RendererBackend {
     fn detach_surface(&mut self) -> Result<()>;
     fn resize_surface(&mut self, width: u32, height: u32, scale: f64) -> Result<()>;
     fn render_test_frame(&mut self, time_seconds: f64) -> Result<()>;
+
+    /// Import/upload a freshly decoded video frame and retain it as the current
+    /// frame to display. The backend owns the imported representation (Metal
+    /// textures, wgpu textures, ...) so the presenter stays backend-agnostic.
+    fn upload_player_frame(&mut self, frame: &PlayerVideoFrame) -> Result<()>;
+
+    /// Render the current frame (optionally compositing `overlay`) to the attached
+    /// surface. Returns `false` if there is no current frame to draw, letting the
+    /// caller fall back to a test frame.
+    fn render_current_frame(&mut self, overlay: Option<&OverlayFrame>) -> Result<bool>;
 }
 
 struct PlayerInner {
@@ -324,6 +342,8 @@ enum PlaybackCommand {
     Seek(Duration),
     Stop,
     AudioClock(AudioClockSnapshot),
+    AddExternalSubtitle(SubtitleTrackConfig),
+    RemoveSubtitleTrack(i64),
     Shutdown,
 }
 
@@ -507,6 +527,20 @@ impl Player {
         Ok(())
     }
 
+    pub fn add_external_subtitle(&self, uri: impl Into<String>) -> Result<SubtitleTrackConfig> {
+        self.ensure_not_closed()?;
+        let uri = uri.into();
+        let id = next_external_subtitle_track_id();
+        let config = SubtitleTrackConfig::external(id, uri);
+        self.send_playback_command(PlaybackCommand::AddExternalSubtitle(config.clone()))?;
+        Ok(config)
+    }
+
+    pub fn remove_subtitle_track(&self, track_id: i64) -> Result<()> {
+        self.ensure_not_closed()?;
+        self.send_playback_command(PlaybackCommand::RemoveSubtitleTrack(track_id))
+    }
+
     pub fn stop(&self) -> Result<()> {
         self.ensure_not_closed()?;
         self.send_playback_command(PlaybackCommand::Stop)?;
@@ -613,50 +647,18 @@ fn run_playback_worker(
     let mut last_position_event = None;
     loop {
         match commands.recv_timeout(playback_poll_interval(engine.state())) {
-            Ok(PlaybackCommand::Play) => engine.play(),
-            Ok(PlaybackCommand::Pause) => engine.pause(),
-            Ok(PlaybackCommand::Seek(position)) => {
-                if let Err(error) = engine.seek(position) {
-                    emit_from_worker(
-                        &inner,
-                        PlayerEvent::Error(PlayerError::Playback(error.to_string())),
-                    );
-                    set_state_from_worker(&inner, PlayerState::Error);
-                    continue;
+            Ok(command) => {
+                if !handle_playback_command(engine, &inner, command) {
+                    return;
                 }
             }
-            Ok(PlaybackCommand::Stop) => {
-                engine.stop();
-            }
-            Ok(PlaybackCommand::AudioClock(snapshot)) => {
-                let _ = engine.sync_to_audio_clock(snapshot);
-            }
-            Ok(PlaybackCommand::Shutdown) => return,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
 
         while let Ok(command) = commands.try_recv() {
-            match command {
-                PlaybackCommand::Play => engine.play(),
-                PlaybackCommand::Pause => engine.pause(),
-                PlaybackCommand::Seek(position) => {
-                    if let Err(error) = engine.seek(position) {
-                        emit_from_worker(
-                            &inner,
-                            PlayerEvent::Error(PlayerError::Playback(error.to_string())),
-                        );
-                        set_state_from_worker(&inner, PlayerState::Error);
-                        continue;
-                    }
-                }
-                PlaybackCommand::Stop => {
-                    engine.stop();
-                }
-                PlaybackCommand::AudioClock(snapshot) => {
-                    let _ = engine.sync_to_audio_clock(snapshot);
-                }
-                PlaybackCommand::Shutdown => return,
+            if !handle_playback_command(engine, &inner, command) {
+                return;
             }
         }
 
@@ -728,6 +730,70 @@ fn run_playback_worker(
             emit_from_worker(&inner, PlayerEvent::PositionChanged(position));
         }
     }
+}
+
+fn handle_playback_command(
+    engine: &mut VideoPlaybackEngine,
+    inner: &Arc<Mutex<PlayerInner>>,
+    command: PlaybackCommand,
+) -> bool {
+    match command {
+        PlaybackCommand::Play => engine.play(),
+        PlaybackCommand::Pause => engine.pause(),
+        PlaybackCommand::Seek(position) => {
+            if let Err(error) = engine.seek(position) {
+                emit_from_worker(
+                    inner,
+                    PlayerEvent::Error(PlayerError::Playback(error.to_string())),
+                );
+                set_state_from_worker(inner, PlayerState::Error);
+            }
+        }
+        PlaybackCommand::Stop => {
+            engine.stop();
+        }
+        PlaybackCommand::AudioClock(snapshot) => {
+            let _ = engine.sync_to_audio_clock(snapshot);
+        }
+        PlaybackCommand::AddExternalSubtitle(config) => {
+            match engine.add_external_subtitle(config) {
+                Ok(_) => emit_from_worker(
+                    inner,
+                    PlayerEvent::TracksChanged(engine.info().tracks.clone()),
+                ),
+                Err(error) => emit_from_worker(
+                    inner,
+                    PlayerEvent::Error(PlayerError::Playback(error.to_string())),
+                ),
+            }
+        }
+        PlaybackCommand::RemoveSubtitleTrack(track_id) => {
+            match engine.remove_subtitle_track(track_id) {
+                Ok(Some(frame)) => {
+                    emit_subtitle_frame_from_worker(
+                        inner,
+                        PlayerSubtitleFrame {
+                            frame: frame.frame,
+                            pts: frame.pts,
+                            media_time: frame.media_time,
+                            late_by: frame.late_by,
+                        },
+                    );
+                    emit_from_worker(
+                        inner,
+                        PlayerEvent::TracksChanged(engine.info().tracks.clone()),
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => emit_from_worker(
+                    inner,
+                    PlayerEvent::Error(PlayerError::Playback(error.to_string())),
+                ),
+            }
+        }
+        PlaybackCommand::Shutdown => return false,
+    }
+    true
 }
 
 fn playback_poll_interval(state: PlaybackRunState) -> Duration {
