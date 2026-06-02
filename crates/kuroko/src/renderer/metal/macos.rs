@@ -292,7 +292,13 @@ impl MetalRendererImpl {
                     "renderCommandEncoderWithDescriptor returned nil".to_string(),
                 ));
             };
-            self.draw_overlay_planes(&encoder, overlay)?;
+            let layout = VideoPresentationLayout::aspect_fit(
+                overlay.frame.viewport.width,
+                overlay.frame.viewport.height,
+                self.stats.drawable_width,
+                self.stats.drawable_height,
+            );
+            self.draw_overlay_planes(&encoder, overlay, layout)?;
             encoder.endEncoding();
             let drawable_ref: &ProtocolObject<dyn MTLDrawable> =
                 ProtocolObject::from_ref(&*drawable);
@@ -370,6 +376,12 @@ impl MetalRendererImpl {
                 ));
             };
 
+            let layout = VideoPresentationLayout::aspect_fit(
+                frame.frame.info.width as u32,
+                frame.frame.info.height as u32,
+                self.stats.drawable_width,
+                self.stats.drawable_height,
+            );
             let uniforms = VideoUniforms {
                 is_p010: matches!(frame.frame.info.format, ImportedVideoFormat::P010) as u32,
                 full_range: matches!(frame.pipeline.source.range, ColorRange::Full) as u32,
@@ -379,6 +391,8 @@ impl MetalRendererImpl {
                 edr_output: self.output_mode.is_edr() as u32,
                 _reserved0: 0,
                 _reserved1: 0,
+                rect: layout.target_rect,
+                viewport: layout.video_viewport(),
                 nits: [
                     frame.pipeline.source.nominal_peak_nits,
                     frame.pipeline.target.peak_nits,
@@ -392,6 +406,16 @@ impl MetalRendererImpl {
             encoder.setFragmentTexture_atIndex(Some(luma), 0);
             encoder.setFragmentTexture_atIndex(Some(chroma), 1);
             encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
+            encoder.setVertexBytes_length_atIndex(
+                NonNull::new(
+                    (&uniforms as *const VideoUniforms)
+                        .cast::<c_void>()
+                        .cast_mut(),
+                )
+                .expect("uniform pointer is non-null"),
+                mem::size_of::<VideoUniforms>(),
+                0,
+            );
             encoder.setFragmentBytes_length_atIndex(
                 NonNull::new(
                     (&uniforms as *const VideoUniforms)
@@ -402,10 +426,10 @@ impl MetalRendererImpl {
                 mem::size_of::<VideoUniforms>(),
                 0,
             );
-            encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+            encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
 
             if let Some(overlay) = overlay {
-                self.draw_overlay_planes(&encoder, overlay)?;
+                self.draw_overlay_planes(&encoder, overlay, layout)?;
             }
 
             encoder.endEncoding();
@@ -424,6 +448,7 @@ impl MetalRendererImpl {
         &mut self,
         encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
         overlay: OverlayRenderFrame<'_>,
+        layout: VideoPresentationLayout,
     ) -> Result<()> {
         let _ = crate::renderer::metal::inspect_overlay_frame(overlay.frame)?;
         if overlay.frame.subtitle_planes.is_empty()
@@ -434,21 +459,14 @@ impl MetalRendererImpl {
 
         let pipeline = self.overlay_pipeline_state()?;
         let sampler = self.video_sampler_state()?;
-        let viewport = overlay.frame.viewport;
         for plane in &overlay.frame.subtitle_planes {
             let texture = self.create_overlay_texture(
                 plane.width as usize,
                 plane.height as usize,
                 &plane.rgba,
             )?;
-            let uniforms = OverlayUniforms::from_plane(
-                plane.x,
-                plane.y,
-                plane.width,
-                plane.height,
-                viewport.width,
-                viewport.height,
-            );
+            let uniforms =
+                OverlayUniforms::from_plane(plane.x, plane.y, plane.width, plane.height, layout);
             unsafe {
                 encoder.setRenderPipelineState(&pipeline);
                 encoder.setFragmentTexture_atIndex(Some(&*texture), 0);
@@ -486,8 +504,7 @@ impl MetalRendererImpl {
                     placement,
                     atlas_width,
                     atlas_height,
-                    viewport.width,
-                    viewport.height,
+                    layout,
                 );
                 unsafe {
                     encoder.setRenderPipelineState(&pipeline);
@@ -882,9 +899,65 @@ struct VideoUniforms {
     edr_output: u32,
     _reserved0: u32,
     _reserved1: u32,
+    rect: [f32; 4],
+    viewport: [f32; 4],
     nits: [f32; 4],
     luma_coefficients: [f32; 4],
     gamut_matrix_rows: [[f32; 4]; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VideoPresentationLayout {
+    source_width: f32,
+    source_height: f32,
+    drawable_width: f32,
+    drawable_height: f32,
+    target_rect: [f32; 4],
+}
+
+impl VideoPresentationLayout {
+    fn aspect_fit(
+        source_width: u32,
+        source_height: u32,
+        drawable_width: u32,
+        drawable_height: u32,
+    ) -> Self {
+        let source_width = source_width.max(1) as f32;
+        let source_height = source_height.max(1) as f32;
+        let drawable_width = drawable_width.max(1) as f32;
+        let drawable_height = drawable_height.max(1) as f32;
+        let scale = (drawable_width / source_width).min(drawable_height / source_height);
+        let width = source_width * scale;
+        let height = source_height * scale;
+        let x = (drawable_width - width) * 0.5;
+        let y = (drawable_height - height) * 0.5;
+        Self {
+            source_width,
+            source_height,
+            drawable_width,
+            drawable_height,
+            target_rect: [x, y, width, height],
+        }
+    }
+
+    fn video_viewport(self) -> [f32; 4] {
+        [self.drawable_width, self.drawable_height, 0.0, 0.0]
+    }
+
+    fn overlay_viewport(self) -> [f32; 2] {
+        [self.drawable_width, self.drawable_height]
+    }
+
+    fn map_source_rect(self, x: f32, y: f32, width: f32, height: f32) -> [f32; 4] {
+        let scale_x = self.target_rect[2] / self.source_width;
+        let scale_y = self.target_rect[3] / self.source_height;
+        [
+            self.target_rect[0] + x * scale_x,
+            self.target_rect[1] + y * scale_y,
+            width * scale_x,
+            height * scale_y,
+        ]
+    }
 }
 
 fn metal_pixel_format(format: MetalDrawablePixelFormat) -> MTLPixelFormat {
@@ -933,13 +1006,12 @@ impl OverlayUniforms {
         y: i32,
         width: u32,
         height: u32,
-        viewport_width: u32,
-        viewport_height: u32,
+        layout: VideoPresentationLayout,
     ) -> Self {
         Self {
-            rect: [x as f32, y as f32, width as f32, height as f32],
+            rect: layout.map_source_rect(x as f32, y as f32, width as f32, height as f32),
             tex_rect: [0.0, 0.0, 1.0, 1.0],
-            viewport: [viewport_width.max(1) as f32, viewport_height.max(1) as f32],
+            viewport: layout.overlay_viewport(),
             overlay_mode: 0,
             _reserved0: 0,
             color: [1.0, 1.0, 1.0, 1.0],
@@ -951,26 +1023,25 @@ impl OverlayUniforms {
         placement: &OverlayAlphaAtlasPlacement,
         atlas_width: usize,
         atlas_height: usize,
-        viewport_width: u32,
-        viewport_height: u32,
+        layout: VideoPresentationLayout,
     ) -> Self {
         let color = AssColor::from_libass_rgba(bitmap.color_rgba);
         let atlas_width = atlas_width.max(1) as f32;
         let atlas_height = atlas_height.max(1) as f32;
         Self {
-            rect: [
+            rect: layout.map_source_rect(
                 bitmap.placement.x as f32,
                 bitmap.placement.y as f32,
                 bitmap.placement.width as f32,
                 bitmap.placement.height as f32,
-            ],
+            ),
             tex_rect: [
                 placement.x as f32 / atlas_width,
                 placement.y as f32 / atlas_height,
                 bitmap.placement.width as f32 / atlas_width,
                 bitmap.placement.height as f32 / atlas_height,
             ],
-            viewport: [viewport_width.max(1) as f32, viewport_height.max(1) as f32],
+            viewport: layout.overlay_viewport(),
             overlay_mode: 1,
             _reserved0: 0,
             color: [
@@ -1187,6 +1258,8 @@ struct VideoUniforms {
     uint edr_output;
     uint reserved0;
     uint reserved1;
+    float4 rect;
+    float4 viewport;
     float4 nits;
     float4 luma_coefficients;
     float4 gamut_matrix_rows[3];
@@ -1313,19 +1386,28 @@ RangeExpandedYCbCr expand_ycbcr_range(float y, float2 cbcr, constant VideoUnifor
     return RangeExpandedYCbCr { y, cbcr };
 }
 
-vertex VertexOut kuroko_video_vertex(uint vertex_id [[vertex_id]]) {
-    constexpr float2 positions[3] = {
-        float2(-1.0, -1.0),
-        float2( 3.0, -1.0),
-        float2(-1.0,  3.0),
-    };
-    constexpr float2 tex_coords[3] = {
+vertex VertexOut kuroko_video_vertex(
+    uint vertex_id [[vertex_id]],
+    constant VideoUniforms& uniforms [[buffer(0)]]) {
+    constexpr float2 unit_positions[4] = {
+        float2(0.0, 0.0),
+        float2(1.0, 0.0),
         float2(0.0, 1.0),
-        float2(2.0, 1.0),
-        float2(0.0, -1.0),
+        float2(1.0, 1.0),
     };
+    constexpr float2 tex_coords[4] = {
+        float2(0.0, 0.0),
+        float2(1.0, 0.0),
+        float2(0.0, 1.0),
+        float2(1.0, 1.0),
+    };
+    float2 pixel = uniforms.rect.xy + unit_positions[vertex_id] * uniforms.rect.zw;
+    float2 ndc = float2(
+        pixel.x / max(uniforms.viewport.x, 1.0) * 2.0 - 1.0,
+        1.0 - pixel.y / max(uniforms.viewport.y, 1.0) * 2.0
+    );
     VertexOut out;
-    out.position = float4(positions[vertex_id], 0.0, 1.0);
+    out.position = float4(ndc, 0.0, 1.0);
     out.tex_coord = tex_coords[vertex_id];
     return out;
 }
@@ -1556,6 +1638,14 @@ mod tests {
     }
 
     #[test]
+    fn video_shader_maps_video_quad_from_presentation_layout() {
+        assert!(VIDEO_SHADER_SOURCE.contains("float4 rect"));
+        assert!(VIDEO_SHADER_SOURCE.contains("float4 viewport"));
+        assert!(VIDEO_SHADER_SOURCE.contains("uniforms.rect.xy"));
+        assert!(VIDEO_SHADER_SOURCE.contains("uniforms.rect.zw"));
+    }
+
+    #[test]
     fn video_shader_has_edr_output_headroom_clamp() {
         assert!(VIDEO_SHADER_SOURCE.contains("edr_output"));
         assert!(
@@ -1637,10 +1727,10 @@ mod tests {
             x: 10,
             y: 5,
         };
+        let layout = super::VideoPresentationLayout::aspect_fit(640, 360, 640, 360);
 
-        let uniforms = super::OverlayUniforms::from_alpha_atlas_bitmap(
-            &bitmap, &placement, 200, 100, 640, 360,
-        );
+        let uniforms =
+            super::OverlayUniforms::from_alpha_atlas_bitmap(&bitmap, &placement, 200, 100, layout);
 
         assert_eq!(uniforms.rect, [12.0, 34.0, 56.0, 78.0]);
         assert_eq!(uniforms.tex_rect, [0.05, 0.05, 0.28, 0.78]);
@@ -1737,17 +1827,48 @@ mod tests {
 
     #[test]
     fn video_uniforms_keep_float4_fields_aligned() {
-        assert_eq!(std::mem::size_of::<super::VideoUniforms>(), 112);
+        assert_eq!(std::mem::size_of::<super::VideoUniforms>(), 144);
         assert_eq!(std::mem::offset_of!(super::VideoUniforms, edr_output), 20);
-        assert_eq!(std::mem::offset_of!(super::VideoUniforms, nits), 32);
+        assert_eq!(std::mem::offset_of!(super::VideoUniforms, rect), 32);
+        assert_eq!(std::mem::offset_of!(super::VideoUniforms, viewport), 48);
+        assert_eq!(std::mem::offset_of!(super::VideoUniforms, nits), 64);
         assert_eq!(
             std::mem::offset_of!(super::VideoUniforms, luma_coefficients),
-            48
+            80
         );
         assert_eq!(
             std::mem::offset_of!(super::VideoUniforms, gamut_matrix_rows),
-            64
+            96
         );
+    }
+
+    #[test]
+    fn presentation_layout_preserves_source_aspect_ratio() {
+        fn assert_rect_close(actual: [f32; 4], expected: [f32; 4]) {
+            for (actual, expected) in actual.into_iter().zip(expected) {
+                assert!((actual - expected).abs() < 0.001, "{actual} != {expected}");
+            }
+        }
+
+        assert_rect_close(
+            super::VideoPresentationLayout::aspect_fit(1920, 1080, 1000, 1000).target_rect,
+            [0.0, 218.75, 1000.0, 562.5],
+        );
+        assert_rect_close(
+            super::VideoPresentationLayout::aspect_fit(1920, 1080, 2000, 1000).target_rect,
+            [111.111, 0.0, 1777.778, 1000.0],
+        );
+    }
+
+    #[test]
+    fn overlay_uniforms_map_source_rect_into_presentation_layout() {
+        let layout = super::VideoPresentationLayout::aspect_fit(1920, 1080, 1000, 1000);
+        let uniforms = super::OverlayUniforms::from_plane(960, 540, 192, 108, layout);
+
+        assert_eq!(uniforms.viewport, [1000.0, 1000.0]);
+        for (actual, expected) in uniforms.rect.into_iter().zip([500.0, 500.0, 100.0, 56.25]) {
+            assert!((actual - expected).abs() < 0.001, "{actual} != {expected}");
+        }
     }
 
     #[test]
