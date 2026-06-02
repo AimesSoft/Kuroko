@@ -3,10 +3,13 @@ use std::ffi::c_void;
 use wgpu::util::DeviceExt;
 
 use crate::core::{
-    PlatformSurface, PlayerError, RendererBackend, Result, TransferFunction, WgpuSurfaceHandle,
-    WgpuSurfaceKind,
+    ColorPrimaries, PlatformSurface, PlayerError, PlayerVideoFrame, RendererBackend, Result,
+    TransferFunction, WgpuSurfaceHandle, WgpuSurfaceKind,
 };
-use crate::renderer::pipeline::{ColorRange, ToneMapOperator, VideoRenderPipeline};
+use crate::overlay::OverlayFrame;
+use crate::renderer::pipeline::{
+    ColorRange, SourceColorState, TargetColorState, ToneMapOperator, VideoRenderPipeline,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WgpuRendererStats {
@@ -146,11 +149,23 @@ fn tone_map_code(operator: ToneMapOperator) -> u32 {
     }
 }
 
-/// Lazily-built GPU objects for the NV12/P010 video pipeline.
+/// Lazily-built GPU objects for the NV12/P010 video pipeline, tied to the color
+/// target format the pipeline was compiled for.
 struct VideoPipeline {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    format: wgpu::TextureFormat,
+}
+
+/// The currently uploaded video frame: GPU plane textures plus the color uniforms
+/// to render it. Retained so the presenter can re-present it across vsync ticks.
+struct UploadedVideoFrame {
+    luma: wgpu::Texture,
+    chroma: wgpu::Texture,
+    width: u32,
+    height: u32,
+    uniforms: VideoUniforms,
 }
 
 struct AttachedSurface {
@@ -166,6 +181,7 @@ pub struct WgpuRenderer {
     queue: wgpu::Queue,
     surface: Option<AttachedSurface>,
     video_pipeline: Option<VideoPipeline>,
+    current_video: Option<UploadedVideoFrame>,
     stats: WgpuRendererStats,
 }
 
@@ -200,6 +216,7 @@ impl WgpuRenderer {
             queue,
             surface: None,
             video_pipeline: None,
+            current_video: None,
             stats: WgpuRendererStats::default(),
         })
     }
@@ -363,6 +380,22 @@ impl WgpuRenderer {
         chroma: &[u8],
         uniforms: VideoUniforms,
     ) -> Result<WgpuOffscreenReadback> {
+        self.upload_nv12(width, height, luma, chroma, uniforms)?;
+        self.render_current_offscreen()?
+            .ok_or_else(|| PlayerError::Renderer("no current frame after upload".to_string()))
+    }
+
+    /// Upload tightly packed NV12 planes as the current video frame. `luma` is
+    /// `width * height` bytes; `chroma` is the interleaved Cb/Cr plane at half
+    /// resolution (`(width / 2) * (height / 2) * 2` bytes).
+    pub fn upload_nv12(
+        &mut self,
+        width: u32,
+        height: u32,
+        luma: &[u8],
+        chroma: &[u8],
+        uniforms: VideoUniforms,
+    ) -> Result<()> {
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return Err(PlayerError::Renderer(
                 "NV12 frame dimensions must be non-zero and even".to_string(),
@@ -385,12 +418,6 @@ impl WgpuRenderer {
             )));
         }
 
-        self.ensure_video_pipeline();
-        let video = self
-            .video_pipeline
-            .as_ref()
-            .expect("video pipeline initialized");
-
         let luma_texture = self.create_plane_texture(
             "kuroko-wgpu-luma",
             width,
@@ -407,40 +434,27 @@ impl WgpuRenderer {
             chroma,
             chroma_width * 2,
         );
-        let luma_view = luma_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let chroma_view = chroma_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let uniform_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("kuroko-wgpu-video-uniforms"),
-                contents: bytemuck::bytes_of(&uniforms),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("kuroko-wgpu-video-bind-group"),
-            layout: &video.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&luma_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&chroma_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&video.sampler),
-                },
-            ],
+        self.current_video = Some(UploadedVideoFrame {
+            luma: luma_texture,
+            chroma: chroma_texture,
+            width,
+            height,
+            uniforms,
         });
+        Ok(())
+    }
 
+    /// Render the current video frame into an offscreen RGBA8 target and read it
+    /// back to host memory. Returns `None` if no frame has been uploaded.
+    pub fn render_current_offscreen(&mut self) -> Result<Option<WgpuOffscreenReadback>> {
+        if self.current_video.is_none() {
+            return Ok(None);
+        }
+        self.ensure_video_pipeline(OFFSCREEN_FORMAT);
+        let (width, height) = {
+            let video = self.current_video.as_ref().expect("current video frame");
+            (video.width, video.height)
+        };
         let target = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("kuroko-wgpu-video-target"),
             size: wgpu::Extent3d {
@@ -456,6 +470,64 @@ impl WgpuRenderer {
             view_formats: &[],
         });
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        self.draw_current_video(&target_view)?;
+        let rgba = self.read_back_rgba8(&target, width, height)?;
+        self.stats.rendered_frames += 1;
+        Ok(Some(WgpuOffscreenReadback {
+            width,
+            height,
+            rgba,
+        }))
+    }
+
+    /// Encode and submit a render pass drawing the current video frame into
+    /// `target_view`. The caller must have uploaded a frame and the video pipeline
+    /// must be initialized.
+    fn draw_current_video(&self, target_view: &wgpu::TextureView) -> Result<()> {
+        let video = self
+            .current_video
+            .as_ref()
+            .ok_or_else(|| PlayerError::Renderer("no current video frame".to_string()))?;
+        let pipeline = self
+            .video_pipeline
+            .as_ref()
+            .ok_or_else(|| PlayerError::Renderer("video pipeline not initialized".to_string()))?;
+
+        let luma_view = video
+            .luma
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let chroma_view = video
+            .chroma
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let uniform_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("kuroko-wgpu-video-uniforms"),
+                contents: bytemuck::bytes_of(&video.uniforms),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("kuroko-wgpu-video-bind-group"),
+            layout: &pipeline.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&luma_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&chroma_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&pipeline.sampler),
+                },
+            ],
+        });
 
         let mut encoder = self
             .device
@@ -466,7 +538,7 @@ impl WgpuRenderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("kuroko-wgpu-video-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target_view,
+                    view: target_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -479,19 +551,12 @@ impl WgpuRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&video.pipeline);
+            pass.set_pipeline(&pipeline.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
         self.queue.submit(Some(encoder.finish()));
-
-        let rgba = self.read_back_rgba8(&target, width, height)?;
-        self.stats.rendered_frames += 1;
-        Ok(WgpuOffscreenReadback {
-            width,
-            height,
-            rgba,
-        })
+        Ok(())
     }
 
     fn create_plane_texture(
@@ -539,8 +604,15 @@ impl WgpuRenderer {
         texture
     }
 
-    fn ensure_video_pipeline(&mut self) {
-        if self.video_pipeline.is_some() {
+    fn ensure_video_pipeline(&mut self, format: wgpu::TextureFormat) {
+        // The render pipeline's color target format must match the render pass
+        // attachment, so rebuild if the target format changed (offscreen Rgba8Unorm
+        // vs the surface's format).
+        if self
+            .video_pipeline
+            .as_ref()
+            .is_some_and(|video| video.format == format)
+        {
             return;
         }
         let shader = self
@@ -609,7 +681,7 @@ impl WgpuRenderer {
                     module: &shader,
                     entry_point: Some("kuroko_video_fragment"),
                     targets: &[Some(wgpu::ColorTargetState {
-                        format: OFFSCREEN_FORMAT,
+                        format,
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
@@ -632,6 +704,7 @@ impl WgpuRenderer {
             pipeline,
             bind_group_layout,
             sampler,
+            format,
         });
     }
 
@@ -720,11 +793,13 @@ impl RendererBackend for WgpuRenderer {
         })?;
 
         let caps = surface.get_capabilities(&self.adapter);
+        // Prefer a non-sRGB format: the video shader already emits display-encoded
+        // values for the SDR target, so an sRGB surface would double-encode gamma.
         let format = caps
             .formats
             .iter()
             .copied()
-            .find(|format| format.is_srgb())
+            .find(|format| !format.is_srgb())
             .unwrap_or_else(|| caps.formats[0]);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -779,6 +854,57 @@ impl RendererBackend for WgpuRenderer {
             self.stats.rendered_frames += 1;
             Ok(())
         }
+    }
+
+    fn upload_player_frame(&mut self, frame: &PlayerVideoFrame) -> Result<()> {
+        // Software path: repack the decoded planes to NV12 and upload. A hardware
+        // frame (e.g. VideoToolbox) has no CPU planes here; that needs the
+        // per-platform zero-copy interop bridge (a later slice).
+        let nv12 = frame.frame.to_nv12().ok_or_else(|| {
+            PlayerError::Renderer(
+                "wgpu: frame is not software 8-bit 4:2:0 (hardware frame or unsupported format)"
+                    .to_string(),
+            )
+        })?;
+        let source =
+            SourceColorState::new(frame.frame.color_primaries(), frame.frame.transfer_function())
+                .range(frame.frame.color_range())
+                .matrix(frame.frame.matrix_coefficients())
+                .hdr_metadata(frame.frame.hdr_metadata());
+        let pipeline = VideoRenderPipeline::new(source, TargetColorState::sdr(ColorPrimaries::Bt709));
+        let uniforms = VideoUniforms::from_pipeline(&pipeline, false, false);
+        self.upload_nv12(nv12.width, nv12.height, &nv12.luma, &nv12.chroma, uniforms)
+    }
+
+    fn render_current_frame(&mut self, _overlay: Option<&OverlayFrame>) -> Result<bool> {
+        // Overlay compositing on the wgpu backend is a later slice; for now only
+        // the video plane is presented.
+        if self.current_video.is_none() {
+            return Ok(false);
+        }
+        let Some(format) = self.surface.as_ref().map(|attached| attached.config.format) else {
+            // No surface to present to (e.g. ticked before attach); the presenter
+            // falls back to a test frame.
+            return Ok(false);
+        };
+        self.ensure_video_pipeline(format);
+        let attached = self.surface.as_ref().expect("surface present");
+        let frame = match attached.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(texture)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+            other => {
+                return Err(PlayerError::Renderer(format!(
+                    "wgpu surface acquire failed: {other:?}"
+                )));
+            }
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        self.draw_current_video(&view)?;
+        frame.present();
+        self.stats.rendered_frames += 1;
+        Ok(true)
     }
 }
 
@@ -1051,9 +1177,20 @@ mod tests {
     }
 
     #[test]
+    fn wgpu_renderer_is_usable_as_dyn_backend_and_reports_no_current_frame() {
+        let mut renderer = WgpuRenderer::new().unwrap();
+        // The presenter holds the backend as `Box<dyn RendererBackend>`; confirm the
+        // wgpu renderer is object-safe through the trait and reports no current frame
+        // so the presenter falls back to a test frame.
+        let backend: &mut dyn RendererBackend = &mut renderer;
+        assert!(!backend.render_current_frame(None).unwrap());
+    }
+
+    #[test]
     fn wgpu_video_rejects_wrong_plane_sizes() {
         let mut renderer = WgpuRenderer::new().unwrap();
-        let uniforms = VideoUniforms::from_pipeline(&VideoRenderPipeline::sdr_default(), false, false);
+        let uniforms =
+            VideoUniforms::from_pipeline(&VideoRenderPipeline::sdr_default(), false, false);
 
         // Luma too short for a 4x4 frame.
         let result = renderer.render_nv12_offscreen(4, 4, &[0u8; 8], &[0u8; 8], uniforms);

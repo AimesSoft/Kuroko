@@ -866,6 +866,100 @@ impl Frame {
         )?;
         Ok(frame)
     }
+
+    /// Repack a software-decoded 8-bit 4:2:0 frame (yuv420p or nv12) into tightly
+    /// packed NV12 planes, resolving the source row stride. Returns `None` for
+    /// hardware frames or unsupported pixel formats (e.g. 10-bit P010).
+    pub fn to_nv12(&self) -> Option<Nv12Frame> {
+        let width = self.width() as usize;
+        let height = self.height() as usize;
+        if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+            return None;
+        }
+        let format = self.raw_pixel_format();
+        let chroma_width = width / 2;
+        let chroma_height = height / 2;
+
+        // SAFETY: `self.ptr` is a valid AVFrame for this Frame's lifetime. For a
+        // software 4:2:0 frame `data[0]` is the luma plane and `data[1..]` the
+        // chroma plane(s); each row spans `linesize[i]` bytes with at least the
+        // visible width of valid samples. We read only the visible region, row by
+        // row, after checking the pointers are non-null and the strides are wide
+        // enough.
+        unsafe {
+            let frame = &*self.ptr;
+            let luma_ptr = frame.data[0] as *const u8;
+            if luma_ptr.is_null() {
+                return None;
+            }
+            let luma_stride = frame.linesize[0].max(0) as usize;
+            if luma_stride < width {
+                return None;
+            }
+            let mut luma = vec![0u8; width * height];
+            for row in 0..height {
+                let src = std::slice::from_raw_parts(luma_ptr.add(row * luma_stride), width);
+                luma[row * width..row * width + width].copy_from_slice(src);
+            }
+
+            let mut chroma = vec![0u8; chroma_width * chroma_height * 2];
+            if format == sys::AVPixelFormat_AV_PIX_FMT_YUV420P {
+                let u_ptr = frame.data[1] as *const u8;
+                let v_ptr = frame.data[2] as *const u8;
+                if u_ptr.is_null() || v_ptr.is_null() {
+                    return None;
+                }
+                let u_stride = frame.linesize[1].max(0) as usize;
+                let v_stride = frame.linesize[2].max(0) as usize;
+                if u_stride < chroma_width || v_stride < chroma_width {
+                    return None;
+                }
+                for row in 0..chroma_height {
+                    let u = std::slice::from_raw_parts(u_ptr.add(row * u_stride), chroma_width);
+                    let v = std::slice::from_raw_parts(v_ptr.add(row * v_stride), chroma_width);
+                    for col in 0..chroma_width {
+                        let idx = (row * chroma_width + col) * 2;
+                        chroma[idx] = u[col];
+                        chroma[idx + 1] = v[col];
+                    }
+                }
+            } else if format == sys::AVPixelFormat_AV_PIX_FMT_NV12 {
+                let uv_ptr = frame.data[1] as *const u8;
+                if uv_ptr.is_null() {
+                    return None;
+                }
+                let uv_stride = frame.linesize[1].max(0) as usize;
+                let row_bytes = chroma_width * 2;
+                if uv_stride < row_bytes {
+                    return None;
+                }
+                for row in 0..chroma_height {
+                    let src = std::slice::from_raw_parts(uv_ptr.add(row * uv_stride), row_bytes);
+                    chroma[row * row_bytes..row * row_bytes + row_bytes].copy_from_slice(src);
+                }
+            } else {
+                return None;
+            }
+
+            Some(Nv12Frame {
+                width: width as u32,
+                height: height as u32,
+                luma,
+                chroma,
+            })
+        }
+    }
+}
+
+/// Tightly packed NV12 planes produced by [`Frame::to_nv12`]: an 8-bit luma plane
+/// (`width * height`) and an interleaved Cb/Cr plane at half resolution
+/// (`(width / 2) * (height / 2) * 2`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Nv12Frame {
+    pub width: u32,
+    pub height: u32,
+    pub luma: Vec<u8>,
+    pub chroma: Vec<u8>,
 }
 
 impl AudioResampler {

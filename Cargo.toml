@@ -19,6 +19,9 @@ members = [
   "examples/playback_audio_tick",
   "examples/render_pipeline_plan",
   "examples/macos_native_demo",
+  "examples/wgpu_video_png",
+  "examples/wgpu_decode_png",
+  "examples/wgpu_window_check",
   "xtask",
 ]
 resolver = "2"
