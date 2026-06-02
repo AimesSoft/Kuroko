@@ -44,6 +44,7 @@ fn main() {
         .allowlist_function("av_.*")
         .allowlist_function("avio_.*")
         .allowlist_function("avcodec_.*")
+        .allowlist_function("avsubtitle_.*")
         .allowlist_function("avformat_.*")
         .allowlist_function("swr_.*")
         .allowlist_type("AV.*")

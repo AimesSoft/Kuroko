@@ -13,6 +13,10 @@ use crate::renderer::pipeline::{
     MatrixCoefficients,
 };
 use crate::source::{ByteRange, MediaSource};
+use crate::subtitle::{
+    DecodedSubtitleFrame, SubtitleBitmapPlane, SubtitleTextFormat, SubtitleTextSegment,
+    SubtitleTrackConfig,
+};
 use kuroko_ffmpeg_sys as sys;
 use libc::{EAGAIN, EINVAL, EIO, ESPIPE, SEEK_CUR, SEEK_END, SEEK_SET};
 use thiserror::Error;
@@ -40,6 +44,17 @@ pub enum FfmpegError {
     },
     #[error("expected audio frame")]
     ExpectedAudioFrame,
+    #[error("expected subtitle stream")]
+    ExpectedSubtitleStream,
+    #[error(
+        "invalid subtitle bitmap: width={width} height={height} stride={stride} colors={colors}"
+    )]
+    InvalidSubtitleBitmap {
+        width: i32,
+        height: i32,
+        stride: i32,
+        colors: i32,
+    },
     #[error("source error: {0}")]
     Source(String),
 }
@@ -55,6 +70,13 @@ pub struct TimeBase {
 impl TimeBase {
     pub fn seconds_from_timestamp(self, timestamp: i64) -> f64 {
         timestamp as f64 * self.num as f64 / self.den as f64
+    }
+
+    fn to_av_rational(self) -> sys::AVRational {
+        sys::AVRational {
+            num: self.num,
+            den: self.den,
+        }
     }
 
     fn from_av(rational: sys::AVRational) -> Self {
@@ -118,6 +140,7 @@ pub struct MediaProbe {
     pub tracks: Vec<TrackInfo>,
     pub video: Vec<VideoProbe>,
     pub audio: Vec<AudioProbe>,
+    pub subtitles: Vec<SubtitleTrackConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,6 +323,10 @@ impl Demuxer {
         Decoder::open(self.codec_parameters(stream_index)?)
     }
 
+    pub fn open_subtitle_decoder(&self, stream_index: i32) -> Result<SubtitleDecoder> {
+        SubtitleDecoder::open(self.codec_parameters(stream_index)?)
+    }
+
     pub fn read_packet(&mut self) -> Result<Option<Packet>> {
         loop {
             let mut packet = Packet::alloc()?;
@@ -371,6 +398,109 @@ impl CodecParameters<'_> {
 
     pub fn kind(self) -> Option<TrackKind> {
         unsafe { track_kind((*self.ptr).codec_type) }
+    }
+}
+
+pub struct SubtitleDecoder {
+    context: *mut sys::AVCodecContext,
+    stream_index: i32,
+    time_base: TimeBase,
+    track: SubtitleTrackConfig,
+}
+
+unsafe impl Send for SubtitleDecoder {}
+
+impl SubtitleDecoder {
+    pub fn open(parameters: CodecParameters<'_>) -> Result<Self> {
+        if parameters.kind() != Some(TrackKind::Subtitle) {
+            return Err(FfmpegError::ExpectedSubtitleStream);
+        }
+
+        let codec_id = unsafe { (*parameters.ptr).codec_id };
+        let codec = unsafe { sys::avcodec_find_decoder(codec_id) };
+        if codec.is_null() {
+            return Err(FfmpegError::NullPointer("avcodec_find_decoder(subtitle)"));
+        }
+        let context = unsafe { sys::avcodec_alloc_context3(codec) };
+        if context.is_null() {
+            return Err(FfmpegError::NullPointer("avcodec_alloc_context3(subtitle)"));
+        }
+        let decoder = Self {
+            context,
+            stream_index: parameters.stream_index,
+            time_base: parameters.time_base,
+            track: SubtitleTrackConfig::embedded(
+                i64::from(parameters.stream_index),
+                i64::from(parameters.stream_index),
+            ),
+        };
+        check(
+            unsafe { sys::avcodec_parameters_to_context(decoder.context, parameters.ptr) },
+            "avcodec_parameters_to_context(subtitle)",
+        )?;
+        unsafe {
+            (*decoder.context).pkt_timebase = parameters.time_base.to_av_rational();
+        }
+        check(
+            unsafe { sys::avcodec_open2(decoder.context, codec, ptr::null_mut()) },
+            "avcodec_open2(subtitle)",
+        )?;
+        Ok(decoder)
+    }
+
+    pub fn stream_index(&self) -> i32 {
+        self.stream_index
+    }
+
+    pub fn time_base(&self) -> TimeBase {
+        self.time_base
+    }
+
+    pub fn track(&self) -> &SubtitleTrackConfig {
+        &self.track
+    }
+
+    pub fn decode_packet(&mut self, packet: &Packet) -> Result<Option<DecodedSubtitleFrame>> {
+        if packet.stream_index() != self.stream_index {
+            return Err(FfmpegError::StreamMismatch {
+                decoder_stream: self.stream_index,
+                packet_stream: packet.stream_index(),
+            });
+        }
+
+        let mut subtitle = sys::AVSubtitle::default();
+        let mut got_subtitle = 0;
+        let code = unsafe {
+            sys::avcodec_decode_subtitle2(
+                self.context,
+                &mut subtitle,
+                &mut got_subtitle,
+                packet.as_ptr(),
+            )
+        };
+        if code < 0 {
+            if got_subtitle != 0 {
+                unsafe { sys::avsubtitle_free(&mut subtitle) };
+            }
+            check(code, "avcodec_decode_subtitle2")?;
+        }
+        if got_subtitle == 0 {
+            return Ok(None);
+        }
+
+        let frame = unsafe { import_av_subtitle(i64::from(self.stream_index), packet, &subtitle) };
+        unsafe { sys::avsubtitle_free(&mut subtitle) };
+        frame.map(Some)
+    }
+
+    pub fn flush(&mut self) {
+        unsafe { sys::avcodec_flush_buffers(self.context) };
+    }
+}
+
+impl Drop for SubtitleDecoder {
+    fn drop(&mut self) {
+        unsafe { sys::avcodec_free_context(&mut self.context) };
     }
 }
 
@@ -1211,6 +1341,7 @@ fn inspect_format_context(
     let mut tracks = Vec::with_capacity(stream_count);
     let mut video = Vec::new();
     let mut audio = Vec::new();
+    let mut subtitles = Vec::new();
     let mut stream_time_bases = Vec::with_capacity(stream_count);
 
     for index in 0..stream_count {
@@ -1246,6 +1377,9 @@ fn inspect_format_context(
         if kind == TrackKind::Audio {
             audio.push(unsafe { audio_probe(&track, codecpar) });
         }
+        if kind == TrackKind::Subtitle {
+            subtitles.push(subtitle_probe(&track));
+        }
 
         tracks.push(track);
     }
@@ -1257,6 +1391,7 @@ fn inspect_format_context(
             tracks,
             video,
             audio,
+            subtitles,
         },
         stream_time_bases,
     )
@@ -1351,6 +1486,155 @@ unsafe fn audio_probe(track: &TrackInfo, codecpar: *const sys::AVCodecParameters
         channels: unsafe { (*codecpar).ch_layout.nb_channels.max(0) as u32 },
         sample_format: unsafe { sample_format_name((*codecpar).format) },
     }
+}
+
+fn subtitle_probe(track: &TrackInfo) -> SubtitleTrackConfig {
+    let mut config = SubtitleTrackConfig::embedded(track.id, track.id);
+    config.language = track.language.clone();
+    config.title = track.title.clone();
+    config
+}
+
+unsafe fn import_av_subtitle(
+    track_id: i64,
+    packet: &Packet,
+    subtitle: &sys::AVSubtitle,
+) -> Result<DecodedSubtitleFrame> {
+    let start = subtitle_start_time(packet, subtitle);
+    let start_offset = Duration::from_millis(u64::from(subtitle.start_display_time));
+    let start = start.map(|pts| pts.saturating_add(start_offset));
+    let end = subtitle_end_time(start, subtitle);
+    let mut frame = DecodedSubtitleFrame::new(track_id, start, end);
+
+    let rect_count = subtitle.num_rects as usize;
+    if rect_count == 0 || subtitle.rects.is_null() {
+        return Ok(frame);
+    }
+
+    for index in 0..rect_count {
+        let rect = unsafe { *subtitle.rects.add(index) };
+        if rect.is_null() {
+            continue;
+        }
+        let rect = unsafe { &*rect };
+        let forced = subtitle_rect_forced(rect);
+        match rect.type_ {
+            sys::AVSubtitleType_SUBTITLE_TEXT => {
+                if let Some(text) = unsafe { subtitle_c_string(rect.text) } {
+                    frame.push_text(
+                        SubtitleTextSegment::new(SubtitleTextFormat::PlainText, text)
+                            .with_forced(forced),
+                    );
+                }
+            }
+            sys::AVSubtitleType_SUBTITLE_ASS => {
+                if let Some(text) = unsafe { subtitle_c_string(rect.ass) } {
+                    frame.push_text(
+                        SubtitleTextSegment::new(SubtitleTextFormat::Ass, text).with_forced(forced),
+                    );
+                }
+            }
+            sys::AVSubtitleType_SUBTITLE_BITMAP => {
+                if let Some(plane) = unsafe { subtitle_bitmap_rect_to_rgba_plane(rect) }? {
+                    frame.push_bitmap_plane(plane, forced);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(frame)
+}
+
+fn subtitle_start_time(packet: &Packet, subtitle: &sys::AVSubtitle) -> Option<Duration> {
+    if subtitle.pts != i64::MIN {
+        let seconds = subtitle.pts as f64 / f64::from(sys::AV_TIME_BASE);
+        if seconds.is_finite() && seconds >= 0.0 {
+            return Some(Duration::from_secs_f64(seconds));
+        }
+    }
+    packet.pts().and_then(PacketTimestamp::as_duration)
+}
+
+fn subtitle_end_time(start: Option<Duration>, subtitle: &sys::AVSubtitle) -> Option<Duration> {
+    let start = start?;
+    if subtitle.end_display_time <= subtitle.start_display_time
+        || subtitle.end_display_time == u32::MAX
+    {
+        return None;
+    }
+    let duration_ms = subtitle
+        .end_display_time
+        .saturating_sub(subtitle.start_display_time);
+    Some(start.saturating_add(Duration::from_millis(u64::from(duration_ms))))
+}
+
+unsafe fn subtitle_c_string(ptr: *const libc::c_char) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let text = unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned();
+    (!text.is_empty()).then_some(text)
+}
+
+fn subtitle_rect_forced(rect: &sys::AVSubtitleRect) -> bool {
+    rect.flags & sys::AV_SUBTITLE_FLAG_FORCED as i32 != 0
+}
+
+unsafe fn subtitle_bitmap_rect_to_rgba_plane(
+    rect: &sys::AVSubtitleRect,
+) -> Result<Option<SubtitleBitmapPlane>> {
+    if rect.w <= 0 || rect.h <= 0 {
+        return Ok(None);
+    }
+    if rect.data[0].is_null()
+        || rect.data[1].is_null()
+        || rect.linesize[0] < rect.w
+        || rect.nb_colors <= 0
+        || rect.nb_colors > sys::AVPALETTE_COUNT as i32
+    {
+        return Err(FfmpegError::InvalidSubtitleBitmap {
+            width: rect.w,
+            height: rect.h,
+            stride: rect.linesize[0],
+            colors: rect.nb_colors,
+        });
+    }
+
+    let width = rect.w as usize;
+    let height = rect.h as usize;
+    let stride = rect.linesize[0] as usize;
+    let mut rgba = vec![0u8; width.saturating_mul(height).saturating_mul(4)];
+    let palette =
+        unsafe { std::slice::from_raw_parts(rect.data[1].cast::<u32>(), rect.nb_colors as usize) };
+
+    for y in 0..height {
+        let row = unsafe { std::slice::from_raw_parts(rect.data[0].add(y * stride), width) };
+        for (x, index) in row.iter().copied().enumerate() {
+            let color = palette.get(index as usize).copied().unwrap_or(0);
+            let dst = &mut rgba[(y * width + x) * 4..][..4];
+            dst.copy_from_slice(&palette_color_to_rgba(color));
+        }
+    }
+
+    Ok(Some(SubtitleBitmapPlane {
+        x: rect.x,
+        y: rect.y,
+        width: rect.w as u32,
+        height: rect.h as u32,
+        rgba,
+    }))
+}
+
+fn palette_color_to_rgba(color: u32) -> [u8; 4] {
+    [
+        ((color >> 16) & 0xff) as u8,
+        ((color >> 8) & 0xff) as u8,
+        (color & 0xff) as u8,
+        ((color >> 24) & 0xff) as u8,
+    ]
 }
 
 unsafe fn pixel_format_name(format: i32) -> Option<String> {
@@ -1687,6 +1971,133 @@ mod tests {
             unsafe { matrix_coefficients(sys::AVColorSpace_AVCOL_SPC_UNSPECIFIED) },
             MatrixCoefficients::Unspecified
         );
+    }
+
+    #[test]
+    fn subtitle_probe_marks_embedded_tracks_non_removable() {
+        let track = TrackInfo {
+            id: 3,
+            kind: TrackKind::Subtitle,
+            title: Some("Signs".to_string()),
+            language: Some("jpn".to_string()),
+            codec: Some("hdmv_pgs_subtitle".to_string()),
+        };
+
+        let config = subtitle_probe(&track);
+
+        assert_eq!(config.id, 3);
+        assert_eq!(config.language.as_deref(), Some("jpn"));
+        assert_eq!(config.title.as_deref(), Some("Signs"));
+        assert!(config.source.is_embedded());
+        assert!(!config.can_remove());
+    }
+
+    #[test]
+    fn imports_av_subtitle_text_and_ass_rects() {
+        let packet = Packet::alloc().unwrap();
+        let plain = CString::new("hello").unwrap();
+        let ass = CString::new("Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,hi").unwrap();
+        let mut text_rect = sys::AVSubtitleRect {
+            type_: sys::AVSubtitleType_SUBTITLE_TEXT,
+            text: plain.as_ptr().cast_mut(),
+            flags: sys::AV_SUBTITLE_FLAG_FORCED as i32,
+            ..sys::AVSubtitleRect::default()
+        };
+        let mut ass_rect = sys::AVSubtitleRect {
+            type_: sys::AVSubtitleType_SUBTITLE_ASS,
+            ass: ass.as_ptr().cast_mut(),
+            ..sys::AVSubtitleRect::default()
+        };
+        let mut rects = [&mut text_rect as *mut _, &mut ass_rect as *mut _];
+        let subtitle = sys::AVSubtitle {
+            start_display_time: 250,
+            end_display_time: 1250,
+            num_rects: rects.len() as u32,
+            rects: rects.as_mut_ptr(),
+            pts: 1_000_000,
+            ..sys::AVSubtitle::default()
+        };
+
+        let frame = unsafe { import_av_subtitle(7, &packet, &subtitle) }.unwrap();
+
+        assert_eq!(frame.track_id, 7);
+        assert_eq!(frame.start, Some(Duration::from_millis(1250)));
+        assert_eq!(frame.end, Some(Duration::from_millis(2250)));
+        assert_eq!(frame.text.len(), 2);
+        assert_eq!(frame.text[0].format, SubtitleTextFormat::PlainText);
+        assert_eq!(frame.text[0].text, "hello");
+        assert!(frame.text[0].forced);
+        assert_eq!(frame.text[1].format, SubtitleTextFormat::Ass);
+        assert!(frame.forced);
+    }
+
+    #[test]
+    fn imports_palette_bitmap_subtitle_as_rgba_plane() {
+        let packet = Packet::alloc().unwrap();
+        let pixels = [0u8, 1, 2, 1];
+        let palette = [0x00000000u32, 0x804020ff, 0xff00ff80];
+        let mut rect = sys::AVSubtitleRect {
+            x: 11,
+            y: 22,
+            w: 2,
+            h: 2,
+            nb_colors: palette.len() as i32,
+            data: [
+                pixels.as_ptr().cast_mut(),
+                palette.as_ptr().cast::<u8>().cast_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ],
+            linesize: [2, 0, 0, 0],
+            type_: sys::AVSubtitleType_SUBTITLE_BITMAP,
+            ..sys::AVSubtitleRect::default()
+        };
+        let mut rects = [&mut rect as *mut _];
+        let subtitle = sys::AVSubtitle {
+            num_rects: 1,
+            rects: rects.as_mut_ptr(),
+            pts: 2_000_000,
+            start_display_time: 0,
+            end_display_time: 500,
+            ..sys::AVSubtitle::default()
+        };
+
+        let frame = unsafe { import_av_subtitle(9, &packet, &subtitle) }.unwrap();
+
+        assert_eq!(frame.start, Some(Duration::from_secs(2)));
+        assert_eq!(frame.end, Some(Duration::from_millis(2500)));
+        assert_eq!(frame.bitmap.planes.len(), 1);
+        let plane = &frame.bitmap.planes[0];
+        assert_eq!(
+            (plane.x, plane.y, plane.width, plane.height),
+            (11, 22, 2, 2)
+        );
+        assert_eq!(
+            plane.rgba,
+            vec![
+                0, 0, 0, 0, 0x40, 0x20, 0xff, 0x80, 0x00, 0xff, 0x80, 0xff, 0x40, 0x20, 0xff, 0x80,
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_bitmap_subtitle_rect() {
+        let mut rect = sys::AVSubtitleRect {
+            w: 4,
+            h: 2,
+            linesize: [3, 0, 0, 0],
+            nb_colors: 1,
+            type_: sys::AVSubtitleType_SUBTITLE_BITMAP,
+            ..sys::AVSubtitleRect::default()
+        };
+        let pixels = [0u8; 8];
+        let palette = [0xffffffffu32];
+        rect.data[0] = pixels.as_ptr().cast_mut();
+        rect.data[1] = palette.as_ptr().cast::<u8>().cast_mut();
+
+        let error = unsafe { subtitle_bitmap_rect_to_rgba_plane(&rect) }.unwrap_err();
+
+        assert!(matches!(error, FfmpegError::InvalidSubtitleBitmap { .. }));
     }
 
     #[test]

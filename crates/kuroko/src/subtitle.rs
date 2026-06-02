@@ -28,10 +28,133 @@ pub enum SubtitleError {
 pub type Result<T> = std::result::Result<T, SubtitleError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubtitleTrackSource {
+    Embedded { stream_index: i64 },
+    External { uri: String },
+}
+
+impl SubtitleTrackSource {
+    pub const fn embedded(stream_index: i64) -> Self {
+        Self::Embedded { stream_index }
+    }
+
+    pub fn external(uri: impl Into<String>) -> Self {
+        Self::External { uri: uri.into() }
+    }
+
+    pub const fn is_embedded(&self) -> bool {
+        matches!(self, Self::Embedded { .. })
+    }
+
+    pub const fn is_external(&self) -> bool {
+        matches!(self, Self::External { .. })
+    }
+
+    pub const fn can_remove(&self) -> bool {
+        self.is_external()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubtitleTrackConfig {
     pub id: i64,
+    pub source: SubtitleTrackSource,
     pub language: Option<String>,
     pub title: Option<String>,
+}
+
+impl SubtitleTrackConfig {
+    pub fn embedded(id: i64, stream_index: i64) -> Self {
+        Self {
+            id,
+            source: SubtitleTrackSource::embedded(stream_index),
+            language: None,
+            title: None,
+        }
+    }
+
+    pub fn external(id: i64, uri: impl Into<String>) -> Self {
+        Self {
+            id,
+            source: SubtitleTrackSource::external(uri),
+            language: None,
+            title: None,
+        }
+    }
+
+    pub const fn can_remove(&self) -> bool {
+        self.source.can_remove()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtitleTextFormat {
+    PlainText,
+    Ass,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitleTextSegment {
+    pub format: SubtitleTextFormat,
+    pub text: String,
+    pub forced: bool,
+}
+
+impl SubtitleTextSegment {
+    pub fn new(format: SubtitleTextFormat, text: impl Into<String>) -> Self {
+        Self {
+            format,
+            text: text.into(),
+            forced: false,
+        }
+    }
+
+    pub fn with_forced(mut self, forced: bool) -> Self {
+        self.forced = forced;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedSubtitleFrame {
+    pub track_id: i64,
+    pub start: Option<Duration>,
+    pub end: Option<Duration>,
+    pub text: Vec<SubtitleTextSegment>,
+    pub bitmap: SubtitleFrame,
+    pub forced: bool,
+}
+
+impl DecodedSubtitleFrame {
+    pub fn new(track_id: i64, start: Option<Duration>, end: Option<Duration>) -> Self {
+        Self {
+            track_id,
+            start,
+            end,
+            text: Vec::new(),
+            bitmap: SubtitleFrame {
+                pts: start.unwrap_or(Duration::ZERO),
+                planes: Vec::new(),
+            },
+            forced: false,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty() && self.bitmap.planes.is_empty()
+    }
+
+    pub fn push_text(&mut self, segment: SubtitleTextSegment) {
+        self.forced |= segment.forced;
+        if !segment.text.is_empty() {
+            self.text.push(segment);
+        }
+    }
+
+    pub fn push_bitmap_plane(&mut self, plane: SubtitleBitmapPlane, forced: bool) {
+        self.forced |= forced;
+        self.bitmap.planes.push(plane);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1187,6 +1310,17 @@ Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,Hello libass
         assert_eq!(frame.pts, Duration::from_secs(7));
         assert_eq!(frame.planes.len(), 1);
         assert_eq!(frame.planes[0].rgba, vec![0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn subtitle_track_source_distinguishes_embedded_and_external_removal() {
+        let embedded = SubtitleTrackConfig::embedded(2, 2);
+        let external = SubtitleTrackConfig::external(100, "/tmp/subs.ass");
+
+        assert!(embedded.source.is_embedded());
+        assert!(!embedded.can_remove());
+        assert!(external.source.is_external());
+        assert!(external.can_remove());
     }
 
     #[test]

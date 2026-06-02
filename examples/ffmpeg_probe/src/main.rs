@@ -66,4 +66,15 @@ fn print_probe(probe: &MediaProbe) {
             audio.sample_format.as_deref().unwrap_or("unknown"),
         );
     }
+
+    for subtitle in &probe.subtitles {
+        println!(
+            "subtitle #{}: source={:?} removable={} language={} title={}",
+            subtitle.id,
+            subtitle.source,
+            subtitle.can_remove(),
+            subtitle.language.as_deref().unwrap_or("-"),
+            subtitle.title.as_deref().unwrap_or("-"),
+        );
+    }
 }
