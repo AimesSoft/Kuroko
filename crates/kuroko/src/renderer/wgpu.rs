@@ -11,6 +11,7 @@ use crate::overlay::OverlayFrame;
 use crate::renderer::pipeline::{
     ColorRange, SourceColorState, TargetColorState, ToneMapOperator, VideoRenderPipeline,
 };
+use crate::subtitle::AssColor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WgpuRendererStats {
@@ -151,7 +152,7 @@ fn tone_map_code(operator: ToneMapOperator) -> u32 {
 }
 
 fn overlay_has_planes(frame: &OverlayFrame) -> bool {
-    !frame.subtitle_planes.is_empty()
+    !frame.subtitle_planes.is_empty() || !frame.subtitle_alpha_planes.is_empty()
 }
 
 /// Overlay quad uniforms, byte-compatible with the Metal `OverlayUniforms`.
@@ -183,6 +184,39 @@ impl OverlayUniforms {
             overlay_mode: 0,
             reserved0: 0,
             color: [1.0, 1.0, 1.0, 1.0],
+        }
+    }
+
+    /// A libass alpha coverage bitmap sampled from a horizontal R8 atlas at `atlas_x`,
+    /// tinted by `color_rgba` (mode 1). Mirrors the Metal `from_alpha_atlas_bitmap`.
+    #[allow(clippy::too_many_arguments)]
+    fn alpha_atlas(
+        color_rgba: u32,
+        place_x: i32,
+        place_y: i32,
+        place_w: u32,
+        place_h: u32,
+        atlas_x: u32,
+        atlas_w: u32,
+        atlas_h: u32,
+        viewport_w: u32,
+        viewport_h: u32,
+    ) -> Self {
+        let color = AssColor::from_libass_rgba(color_rgba);
+        let aw = atlas_w.max(1) as f32;
+        let ah = atlas_h.max(1) as f32;
+        Self {
+            rect: [place_x as f32, place_y as f32, place_w as f32, place_h as f32],
+            tex_rect: [atlas_x as f32 / aw, 0.0, place_w as f32 / aw, place_h as f32 / ah],
+            viewport: [viewport_w.max(1) as f32, viewport_h.max(1) as f32],
+            overlay_mode: 1,
+            reserved0: 0,
+            color: [
+                f32::from(color.red) / 255.0,
+                f32::from(color.green) / 255.0,
+                f32::from(color.blue) / 255.0,
+                f32::from(color.alpha) / 255.0,
+            ],
         }
     }
 }
@@ -717,15 +751,18 @@ impl WgpuRenderer {
         Ok(())
     }
 
-    /// Build per-plane GPU resources for the overlay's straight-RGBA subtitle planes.
+    /// Build per-quad GPU resources for the overlay: straight-RGBA subtitle planes
+    /// (mode 0) plus libass alpha coverage bitmaps packed into one R8 atlas (mode 1).
     fn prepare_overlay_draws(&self, frame: &OverlayFrame) -> Result<Vec<OverlayDraw>> {
-        let pipeline = self
-            .overlay_pipeline
-            .as_ref()
-            .ok_or_else(|| PlayerError::Renderer("overlay pipeline not initialized".to_string()))?;
+        if self.overlay_pipeline.is_none() {
+            return Err(PlayerError::Renderer(
+                "overlay pipeline not initialized".to_string(),
+            ));
+        }
         let viewport_w = frame.viewport.width;
         let viewport_h = frame.viewport.height;
-        let mut draws = Vec::with_capacity(frame.subtitle_planes.len());
+        let mut draws = Vec::new();
+
         for plane in &frame.subtitle_planes {
             if plane.width == 0 || plane.height == 0 {
                 continue;
@@ -747,7 +784,6 @@ impl WgpuRenderer {
                 &plane.rgba,
                 plane.width * 4,
             );
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             let uniforms = OverlayUniforms::rgba_plane(
                 plane.x,
                 plane.y,
@@ -756,38 +792,131 @@ impl WgpuRenderer {
                 viewport_w,
                 viewport_h,
             );
-            let uniform = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("kuroko-wgpu-overlay-uniforms"),
-                    contents: bytemuck::bytes_of(&uniforms),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("kuroko-wgpu-overlay-bind-group"),
-                layout: &pipeline.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: uniform.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&pipeline.sampler),
-                    },
-                ],
-            });
-            draws.push(OverlayDraw {
-                bind_group,
-                _texture: texture,
-                _uniform: uniform,
-            });
+            draws.push(self.make_overlay_draw(&texture, uniforms));
         }
+
+        self.append_alpha_atlas_draws(frame, viewport_w, viewport_h, &mut draws)?;
         Ok(draws)
+    }
+
+    /// Pack libass alpha coverage bitmaps horizontally into one R8 atlas and add a
+    /// mode-1 (coverage tinted by the bitmap's color) draw per placement. Mirrors the
+    /// Metal `prepare_overlay_alpha_atlas` packing.
+    fn append_alpha_atlas_draws(
+        &self,
+        frame: &OverlayFrame,
+        viewport_w: u32,
+        viewport_h: u32,
+        draws: &mut Vec<OverlayDraw>,
+    ) -> Result<()> {
+        let bitmaps = &frame.subtitle_alpha_planes;
+        let mut atlas_width = 0usize;
+        let mut atlas_height = 0usize;
+        for bitmap in bitmaps {
+            if bitmap.placement.width == 0 || bitmap.placement.height == 0 {
+                continue;
+            }
+            atlas_width += bitmap.placement.width as usize;
+            atlas_height = atlas_height.max(bitmap.placement.height as usize);
+        }
+        if atlas_width == 0 || atlas_height == 0 {
+            return Ok(());
+        }
+
+        let mut pixels = vec![0u8; atlas_width * atlas_height];
+        let mut cursor_x = 0usize;
+        let mut placements: Vec<(usize, usize)> = Vec::new();
+        for (index, bitmap) in bitmaps.iter().enumerate() {
+            let bw = bitmap.placement.width as usize;
+            let bh = bitmap.placement.height as usize;
+            if bw == 0 || bh == 0 {
+                continue;
+            }
+            if !bitmap.is_valid() {
+                return Err(PlayerError::Renderer(format!(
+                    "overlay alpha bitmap has {} bytes, expected at least {} for {}x{} stride {}",
+                    bitmap.alpha.len(),
+                    bitmap.required_len(),
+                    bitmap.placement.width,
+                    bitmap.placement.height,
+                    bitmap.stride
+                )));
+            }
+            for row in 0..bh {
+                let src = row * bitmap.stride;
+                let dst = row * atlas_width + cursor_x;
+                pixels[dst..dst + bw].copy_from_slice(&bitmap.alpha[src..src + bw]);
+            }
+            placements.push((index, cursor_x));
+            cursor_x += bw;
+        }
+
+        let atlas = self.create_plane_texture(
+            "kuroko-wgpu-overlay-atlas",
+            atlas_width as u32,
+            atlas_height as u32,
+            wgpu::TextureFormat::R8Unorm,
+            &pixels,
+            atlas_width as u32,
+        );
+        for (index, atlas_x) in placements {
+            let bitmap = &bitmaps[index];
+            let uniforms = OverlayUniforms::alpha_atlas(
+                bitmap.color_rgba,
+                bitmap.placement.x,
+                bitmap.placement.y,
+                bitmap.placement.width,
+                bitmap.placement.height,
+                atlas_x as u32,
+                atlas_width as u32,
+                atlas_height as u32,
+                viewport_w,
+                viewport_h,
+            );
+            draws.push(self.make_overlay_draw(&atlas, uniforms));
+        }
+        Ok(())
+    }
+
+    /// Create the bind group (uniform + texture + sampler) for one overlay quad,
+    /// retaining the texture and uniform buffer alongside it. The overlay pipeline
+    /// must be initialized.
+    fn make_overlay_draw(&self, texture: &wgpu::Texture, uniforms: OverlayUniforms) -> OverlayDraw {
+        let pipeline = self
+            .overlay_pipeline
+            .as_ref()
+            .expect("overlay pipeline initialized");
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let uniform = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("kuroko-wgpu-overlay-uniforms"),
+                contents: bytemuck::bytes_of(&uniforms),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("kuroko-wgpu-overlay-bind-group"),
+            layout: &pipeline.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&pipeline.sampler),
+                },
+            ],
+        });
+        OverlayDraw {
+            bind_group,
+            _texture: texture.clone(),
+            _uniform: uniform,
+        }
     }
 
     fn create_plane_texture(

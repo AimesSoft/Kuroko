@@ -4,7 +4,7 @@
 
 use kuroko::overlay::{OverlayFrame, OverlayViewport};
 use kuroko::renderer::wgpu::{VideoUniforms, WgpuRenderer};
-use kuroko::subtitle::SubtitleBitmapPlane;
+use kuroko::subtitle::{SubtitleAlphaBitmap, SubtitleBitmapPlacement, SubtitleBitmapPlane};
 
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 180;
@@ -53,7 +53,11 @@ fn main() {
                 rgba: solid_rgba(40, 24, [255, 0, 255, 255]),
             },
         ],
-        subtitle_alpha_planes: Vec::new(),
+        subtitle_alpha_planes: vec![
+            // A libass-style coverage bitmap: cyan, horizontal alpha gradient.
+            // Exercises the mode-1 alpha-atlas path (coverage tinted by color).
+            alpha_gradient_bitmap(60, 96, 200, 20, 0x00FF_FF00),
+        ],
         subtitle_changed: true,
         danmaku_boxes: Vec::new(),
     };
@@ -73,6 +77,21 @@ fn main() {
         .write_image_data(&readback.rgba)
         .expect("write png data");
     println!("wrote {out} ({WIDTH}x{HEIGHT})");
+}
+
+fn alpha_gradient_bitmap(x: i32, y: i32, width: u32, height: u32, color_rgba: u32) -> SubtitleAlphaBitmap {
+    let mut alpha = vec![0u8; width as usize * height as usize];
+    for row in 0..height as usize {
+        for col in 0..width as usize {
+            alpha[row * width as usize + col] = (col * 255 / width.max(1) as usize) as u8;
+        }
+    }
+    SubtitleAlphaBitmap::new(
+        SubtitleBitmapPlacement::new(x, y, width, height),
+        width as usize,
+        color_rgba,
+        alpha,
+    )
 }
 
 fn solid_rgba(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
