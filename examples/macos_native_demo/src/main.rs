@@ -9,6 +9,8 @@ use kuroko::danmaku::{DanmakuItem, DanmakuMode, DanmakuTimeline};
 use kuroko::overlay::OverlayTimeline;
 use kuroko::presenter::{PresenterConfig, PresenterRuntime};
 use kuroko::renderer::metal::{MetalOutputMode, MetalRendererConfig};
+#[cfg(feature = "libass")]
+use kuroko::subtitle::LibassRenderConfig;
 use kuroko::subtitle::{SubtitleCue, SubtitleTimeline};
 use kuroko::{MediaRequest, MetalSurfaceHandle, PlatformSurface};
 
@@ -100,9 +102,22 @@ fn demo_overlay_timeline() -> OverlayTimeline {
         end: Duration::from_secs(4),
         text: "Kuroko native overlay".to_string(),
     }]);
-    OverlayTimeline::default()
-        .with_subtitles(subtitles)
-        .with_danmaku(demo_danmaku_timeline())
+    let timeline = OverlayTimeline::default().with_subtitles(subtitles);
+    #[cfg(feature = "libass")]
+    {
+        let danmaku = demo_danmaku_timeline();
+        let fallback = timeline.clone().with_danmaku(danmaku.clone());
+        timeline
+            .with_ass_danmaku(danmaku, LibassRenderConfig::default())
+            .unwrap_or_else(|error| {
+                eprintln!("Kuroko demo libass danmaku setup failed: {error}");
+                fallback
+            })
+    }
+    #[cfg(not(feature = "libass"))]
+    {
+        timeline.with_danmaku(demo_danmaku_timeline())
+    }
 }
 
 fn demo_danmaku_timeline() -> DanmakuTimeline {

@@ -611,10 +611,13 @@ mod tests {
             subtitle_changed: true,
             danmaku_boxes: vec![DanmakuLayoutBox {
                 item_id: 1,
+                text: "danmaku".to_string(),
                 x: 12.0,
                 y: 24.0,
                 width: 80.0,
                 height: 24.0,
+                font_size: 24.0,
+                color_rgba: [1.0, 1.0, 1.0, 1.0],
             }],
         };
 

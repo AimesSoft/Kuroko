@@ -44,10 +44,13 @@ pub struct DanmakuItem {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DanmakuLayoutBox {
     pub item_id: u64,
+    pub text: String,
     pub x: f32,
     pub y: f32,
     pub width: f32,
     pub height: f32,
+    pub font_size: f32,
+    pub color_rgba: [f32; 4],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -150,14 +153,97 @@ impl DanmakuTimeline {
             };
             boxes.push(DanmakuLayoutBox {
                 item_id: item.id,
+                text: item.text.clone(),
                 x,
                 y,
                 width: metrics.width,
                 height: metrics.height,
+                font_size: item.font_size,
+                color_rgba: item.color_rgba,
             });
         }
 
         boxes
+    }
+
+    pub fn to_ass_script(&self, config: DanmakuLayoutConfig, shaper: &TextShaper) -> String {
+        let width = config.viewport_width.max(1.0).round() as u32;
+        let height = config.viewport_height.max(1.0).round() as u32;
+        let mut script = format!(
+            r#"[Script Info]
+ScriptType: v4.00+
+ScaledBorderAndShadow: yes
+PlayResX: {width}
+PlayResY: {height}
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Danmaku,Arial,25,&H00FFFFFF,&H000000FF,&H80000000,&H80000000,0,0,0,0,100,100,0,0,1,1,0,7,0,0,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"#
+        );
+
+        let mut scroll_lanes: Vec<Duration> = Vec::new();
+        let mut top_lanes: Vec<Duration> = Vec::new();
+        let mut bottom_lanes: Vec<Duration> = Vec::new();
+        for item in &self.items {
+            let metrics = shaper.measure(&item.text, item.font_size);
+            let lane_height = metrics.height + config.lane_gap;
+            let lane_count = (config.viewport_height / lane_height).floor().max(1.0) as usize;
+            let (lane, hold) = match item.mode {
+                DanmakuMode::Scroll => (
+                    choose_lane(&mut scroll_lanes, lane_count, item.pts, config.duration),
+                    config.duration,
+                ),
+                DanmakuMode::Top => (
+                    choose_lane(&mut top_lanes, lane_count, item.pts, Duration::from_secs(3)),
+                    config.duration,
+                ),
+                DanmakuMode::Bottom => (
+                    choose_lane(
+                        &mut bottom_lanes,
+                        lane_count,
+                        item.pts,
+                        Duration::from_secs(3),
+                    ),
+                    config.duration,
+                ),
+            };
+            let y = match item.mode {
+                DanmakuMode::Scroll | DanmakuMode::Top => lane as f32 * lane_height,
+                DanmakuMode::Bottom => config.viewport_height - (lane as f32 + 1.0) * lane_height,
+            };
+            let start = format_ass_timestamp(item.pts);
+            let end = format_ass_timestamp(item.pts + hold);
+            let color = format_ass_primary_color(item.color_rgba);
+            let alpha = format_ass_alpha(item.color_rgba[3]);
+            let font_size = item.font_size.max(1.0).round() as u32;
+            let text = escape_ass_text(&item.text);
+            let override_tags = match item.mode {
+                DanmakuMode::Scroll => format!(
+                    r"{{\an7\fs{font_size}\c{color}\alpha{alpha}\move({},{},{},{})}}",
+                    ass_coord(config.viewport_width),
+                    ass_coord(y),
+                    ass_coord(-metrics.width),
+                    ass_coord(y)
+                ),
+                DanmakuMode::Top | DanmakuMode::Bottom => {
+                    let x = (config.viewport_width - metrics.width) * 0.5;
+                    format!(
+                        r"{{\an7\fs{font_size}\c{color}\alpha{alpha}\pos({},{})}}",
+                        ass_coord(x),
+                        ass_coord(y)
+                    )
+                }
+            };
+            script.push_str(&format!(
+                "Dialogue: 5,{start},{end},Danmaku,,0,0,0,,{override_tags}{text}\n"
+            ));
+        }
+
+        script
     }
 }
 
@@ -274,6 +360,43 @@ fn color_from_bilibili_decimal(value: u32) -> [f32; 4] {
     [red, green, blue, 1.0]
 }
 
+fn format_ass_timestamp(duration: Duration) -> String {
+    let centis = duration.as_millis() / 10;
+    let hours = centis / 360_000;
+    let minutes = (centis / 6_000) % 60;
+    let seconds = (centis / 100) % 60;
+    let centis = centis % 100;
+    format!("{hours}:{minutes:02}:{seconds:02}.{centis:02}")
+}
+
+fn format_ass_primary_color(rgba: [f32; 4]) -> String {
+    let red = color_component_to_u8(rgba[0]);
+    let green = color_component_to_u8(rgba[1]);
+    let blue = color_component_to_u8(rgba[2]);
+    format!("&H{blue:02X}{green:02X}{red:02X}&")
+}
+
+fn format_ass_alpha(alpha: f32) -> String {
+    let ass_alpha = 255u8.saturating_sub(color_component_to_u8(alpha));
+    format!("&H{ass_alpha:02X}&")
+}
+
+fn color_component_to_u8(component: f32) -> u8 {
+    (component.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+fn ass_coord(value: f32) -> i32 {
+    value.round() as i32
+}
+
+fn escape_ass_text(text: &str) -> String {
+    text.replace('\\', "＼")
+        .replace('{', "｛")
+        .replace('}', "｝")
+        .replace('\r', "")
+        .replace('\n', " ")
+}
+
 fn decode_xml_entities(text: &str) -> String {
     text.replace("&lt;", "<")
         .replace("&gt;", ">")
@@ -382,5 +505,49 @@ mod tests {
 
         assert_eq!(boxes.len(), 2);
         assert_ne!(boxes[0].y, boxes[1].y);
+        assert_eq!(boxes[0].text, "first");
+        assert_eq!(boxes[0].font_size, 24.0);
+        assert_eq!(boxes[0].color_rgba, [1.0; 4]);
+    }
+
+    #[test]
+    fn ass_script_preserves_danmaku_motion_and_style() {
+        let mut timeline = DanmakuTimeline::default();
+        timeline.extend([
+            DanmakuItem {
+                id: 1,
+                pts: Duration::from_millis(1500),
+                text: "hello".to_string(),
+                mode: DanmakuMode::Scroll,
+                font_size: 24.0,
+                color_rgba: [1.0, 0.0, 0.0, 0.5],
+            },
+            DanmakuItem {
+                id: 2,
+                pts: Duration::from_secs(2),
+                text: "top".to_string(),
+                mode: DanmakuMode::Top,
+                font_size: 30.0,
+                color_rgba: [0.0, 0.0, 1.0, 1.0],
+            },
+        ]);
+
+        let script = timeline.to_ass_script(
+            DanmakuLayoutConfig {
+                viewport_width: 320.0,
+                viewport_height: 180.0,
+                duration: Duration::from_secs(8),
+                lane_gap: 2.0,
+            },
+            &TextShaper::default(),
+        );
+
+        assert!(script.contains("PlayResX: 320"));
+        assert!(script.contains("Dialogue: 5,0:00:01.50,0:00:09.50"));
+        assert!(script.contains("\\move(320,0,"));
+        assert!(script.contains("\\pos("));
+        assert!(script.contains("\\fs24"));
+        assert!(script.contains("\\c&H0000FF&\\alpha&H7F&"));
+        assert!(script.contains("\\c&HFF0000&\\alpha&H00&"));
     }
 }
