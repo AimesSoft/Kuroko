@@ -16,7 +16,11 @@ Rust で実装された独立型メディアプレーヤーエンジンです。
 - CoreAudio による音声出力
 - 不透明な C ABI — Swift、Dart FFI、C/C++、または任意の Rust クレートから呼び出し可能
 
-wgpu を通じたクロスプラットフォーム対応は計画中です。現在のターゲットは macOS 14+ です。
+クロスプラットフォーム対応のための wgpu レンダリングバックエンドを開発中です。現在は macOS 14+ を中心としています。
+
+## ビルド
+
+ネイティブ依存関係、Nix 環境、サンプルの実行コマンドは [`docs/development.md`](../docs/development.md) にまとめています。
 
 ## 組み込み
 
@@ -26,6 +30,17 @@ Kuroko は二種類の C ABI を提供します：
 - **`KurokoPresenterHandle`** — プレゼンタースタック全体（プレーヤー、レンダラー、音声、オーバーレイ）を Kuroko が管理します。ホストはネイティブサーフェスを提供し、ディスプレイタイマーから `render_tick` を呼び出すだけで済みます。
 
 Flutter との統合方法および macOS HDR 組み込み戦略については [`docs/flutter_embedding.md`](../docs/flutter_embedding.md) を参照してください。
+
+## リポジトリ構成
+
+```text
+crates/kuroko              プレーヤーエンジン
+crates/kuroko_capi         不透明ハンドルの C ABI
+crates/kuroko_ffmpeg_sys   FFmpeg 低レベルバインディング
+docs/                      アーキテクチャ・組み込み・開発ノート
+examples/                  サブシステムごとの実行可能なサンプル
+xtask/                     ネイティブ依存関係のオーケストレーション
+```
 
 ## 現在の状態
 
