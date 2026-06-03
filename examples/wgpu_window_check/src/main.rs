@@ -66,7 +66,9 @@ fn run(layer: *mut c_void, scale: f64, seconds: f64) -> Result<(), String> {
         HEIGHT,
         scale,
     ));
-    renderer.attach_surface(surface).map_err(|e| e.to_string())?;
+    renderer
+        .attach_surface(surface)
+        .map_err(|e| e.to_string())?;
 
     let (luma, chroma) = color_bars_nv12();
     renderer
@@ -75,7 +77,10 @@ fn run(layer: *mut c_void, scale: f64, seconds: f64) -> Result<(), String> {
 
     let frames = (seconds * 60.0) as u32;
     for _ in 0..frames {
-        if !renderer.render_current_frame(None).map_err(|e| e.to_string())? {
+        if !renderer
+            .render_current_frame(None)
+            .map_err(|e| e.to_string())?
+        {
             return Err("render_current_frame returned false (no surface/frame)".to_string());
         }
         unsafe { kuroko_wgpu_window_pump() };
@@ -97,7 +102,11 @@ fn rgb_to_ycbcr_limited(rgb: [u8; 3]) -> (u8, u8, u8) {
     let cb = (b - y) / (2.0 * (1.0 - kb));
     let cr = (r - y) / (2.0 * (1.0 - kr));
     let to8 = |v: f32| v.round().clamp(0.0, 255.0) as u8;
-    (to8(16.0 + 219.0 * y), to8(128.0 + 224.0 * cb), to8(128.0 + 224.0 * cr))
+    (
+        to8(16.0 + 219.0 * y),
+        to8(128.0 + 224.0 * cb),
+        to8(128.0 + 224.0 * cr),
+    )
 }
 
 fn bar_index(x: u32) -> usize {

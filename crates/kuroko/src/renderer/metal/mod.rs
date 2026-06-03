@@ -258,9 +258,14 @@ impl<'a> OverlayRenderFrame<'a> {
 pub struct PreparedOverlayFrameInfo {
     pub viewport_width: u32,
     pub viewport_height: u32,
+    pub surface_viewport_width: u32,
+    pub surface_viewport_height: u32,
     pub subtitle_planes: usize,
     pub subtitle_pixels: usize,
     pub subtitle_bytes: usize,
+    pub danmaku_planes: usize,
+    pub danmaku_pixels: usize,
+    pub danmaku_bytes: usize,
     pub danmaku_boxes: usize,
 }
 
@@ -464,12 +469,34 @@ fn inspect_overlay_frame(frame: &OverlayFrame) -> Result<PreparedOverlayFrameInf
         subtitle_bytes += bitmap.required_len();
     }
 
+    let mut danmaku_pixels = 0usize;
+    let mut danmaku_bytes = 0usize;
+    for plane in &frame.danmaku_planes {
+        let pixels = plane.width as usize * plane.height as usize;
+        let bytes = pixels * 4;
+        if plane.rgba.len() != bytes {
+            return Err(crate::core::PlayerError::Renderer(format!(
+                "danmaku plane has {} bytes, expected {bytes} for {}x{} RGBA",
+                plane.rgba.len(),
+                plane.width,
+                plane.height
+            )));
+        }
+        danmaku_pixels += pixels;
+        danmaku_bytes += bytes;
+    }
+
     Ok(PreparedOverlayFrameInfo {
         viewport_width: frame.viewport.width,
         viewport_height: frame.viewport.height,
+        surface_viewport_width: frame.surface_viewport.width,
+        surface_viewport_height: frame.surface_viewport.height,
         subtitle_planes: frame.subtitle_planes.len() + frame.subtitle_alpha_planes.len(),
         subtitle_pixels,
         subtitle_bytes,
+        danmaku_planes: frame.danmaku_planes.len(),
+        danmaku_pixels,
+        danmaku_bytes,
         danmaku_boxes: frame.danmaku_boxes.len(),
     })
 }
@@ -600,6 +627,7 @@ mod tests {
         let frame = OverlayFrame {
             pts: Duration::from_secs(1),
             viewport: OverlayViewport::new(640, 360),
+            surface_viewport: OverlayViewport::new(640, 360),
             subtitle_planes: vec![SubtitleBitmapPlane {
                 x: 0,
                 y: 0,
@@ -608,6 +636,7 @@ mod tests {
                 rgba: vec![255; 10 * 4 * 4],
             }],
             subtitle_alpha_planes: Vec::new(),
+            danmaku_planes: Vec::new(),
             subtitle_changed: true,
             danmaku_boxes: vec![DanmakuLayoutBox {
                 item_id: 1,
@@ -625,10 +654,44 @@ mod tests {
 
         assert_eq!(info.viewport_width, 640);
         assert_eq!(info.viewport_height, 360);
+        assert_eq!(info.surface_viewport_width, 640);
+        assert_eq!(info.surface_viewport_height, 360);
         assert_eq!(info.subtitle_planes, 1);
         assert_eq!(info.subtitle_pixels, 40);
         assert_eq!(info.subtitle_bytes, 160);
+        assert_eq!(info.danmaku_planes, 0);
+        assert_eq!(info.danmaku_pixels, 0);
+        assert_eq!(info.danmaku_bytes, 0);
         assert_eq!(info.danmaku_boxes, 1);
+    }
+
+    #[test]
+    fn inspect_overlay_counts_danmaku_plane_bytes() {
+        let frame = OverlayFrame {
+            pts: Duration::ZERO,
+            viewport: OverlayViewport::new(640, 360),
+            surface_viewport: OverlayViewport::new(1000, 1000),
+            subtitle_planes: Vec::new(),
+            subtitle_alpha_planes: Vec::new(),
+            danmaku_planes: vec![SubtitleBitmapPlane {
+                x: 0,
+                y: 0,
+                width: 5,
+                height: 3,
+                rgba: vec![255; 5 * 3 * 4],
+            }],
+            subtitle_changed: true,
+            danmaku_boxes: Vec::new(),
+        };
+
+        let info = inspect_overlay_frame(&frame).unwrap();
+
+        assert_eq!(info.surface_viewport_width, 1000);
+        assert_eq!(info.surface_viewport_height, 1000);
+        assert_eq!(info.subtitle_planes, 0);
+        assert_eq!(info.danmaku_planes, 1);
+        assert_eq!(info.danmaku_pixels, 15);
+        assert_eq!(info.danmaku_bytes, 60);
     }
 
     #[test]
@@ -636,6 +699,7 @@ mod tests {
         let frame = OverlayFrame {
             pts: Duration::ZERO,
             viewport: OverlayViewport::new(640, 360),
+            surface_viewport: OverlayViewport::new(640, 360),
             subtitle_planes: Vec::new(),
             subtitle_alpha_planes: vec![crate::subtitle::SubtitleAlphaBitmap::new(
                 crate::subtitle::SubtitleBitmapPlacement::new(4, 8, 3, 2),
@@ -643,6 +707,7 @@ mod tests {
                 0xff00ffff,
                 vec![255; 8],
             )],
+            danmaku_planes: Vec::new(),
             subtitle_changed: true,
             danmaku_boxes: Vec::new(),
         };
@@ -659,6 +724,7 @@ mod tests {
         let frame = OverlayFrame {
             pts: Duration::ZERO,
             viewport: OverlayViewport::new(640, 360),
+            surface_viewport: OverlayViewport::new(640, 360),
             subtitle_planes: Vec::new(),
             subtitle_alpha_planes: vec![crate::subtitle::SubtitleAlphaBitmap::new(
                 crate::subtitle::SubtitleBitmapPlacement::new(4, 8, 3, 2),
@@ -666,6 +732,7 @@ mod tests {
                 0xff00ffff,
                 vec![255; 7],
             )],
+            danmaku_planes: Vec::new(),
             subtitle_changed: true,
             danmaku_boxes: Vec::new(),
         };
@@ -678,6 +745,7 @@ mod tests {
         let frame = OverlayFrame {
             pts: Duration::ZERO,
             viewport: OverlayViewport::new(1, 1),
+            surface_viewport: OverlayViewport::new(1, 1),
             subtitle_planes: vec![SubtitleBitmapPlane {
                 x: 0,
                 y: 0,
@@ -686,6 +754,7 @@ mod tests {
                 rgba: vec![0; 15],
             }],
             subtitle_alpha_planes: Vec::new(),
+            danmaku_planes: Vec::new(),
             subtitle_changed: true,
             danmaku_boxes: Vec::new(),
         };

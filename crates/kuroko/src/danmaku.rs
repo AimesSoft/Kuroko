@@ -316,7 +316,9 @@ pub fn parse_json_lines(input: &str) -> Result<Vec<DanmakuItem>> {
                 _ => DanmakuMode::Scroll,
             },
             font_size: json_number_value(line, "font_size").unwrap_or(25.0) as f32,
-            color_rgba: [1.0, 1.0, 1.0, 1.0],
+            color_rgba: json_number_value(line, "color")
+                .map(|value| color_from_bilibili_decimal(value as u32))
+                .unwrap_or([1.0, 1.0, 1.0, 1.0]),
         });
     }
     Ok(items)
@@ -549,5 +551,18 @@ mod tests {
         assert!(script.contains("\\fs24"));
         assert!(script.contains("\\c&H0000FF&\\alpha&H7F&"));
         assert!(script.contains("\\c&HFF0000&\\alpha&H00&"));
+    }
+
+    #[test]
+    fn json_lines_parse_bilibili_decimal_color() {
+        let input =
+            r#"{"id":9,"time":1.25,"mode":"bottom","font_size":28,"color":65280,"text":"green"}"#;
+
+        let items = parse_json_lines(input).unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].mode, DanmakuMode::Bottom);
+        assert_eq!(items[0].font_size, 28.0);
+        assert_eq!(items[0].color_rgba, [0.0, 1.0, 0.0, 1.0]);
     }
 }

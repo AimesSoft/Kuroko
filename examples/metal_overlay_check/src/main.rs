@@ -41,6 +41,7 @@ fn run_check(layer: *mut c_void) -> Result<(), String> {
     let overlay = OverlayFrame {
         pts: Duration::from_secs(1),
         viewport: OverlayViewport::new(640, 360),
+        surface_viewport: OverlayViewport::new(1280, 720),
         subtitle_planes: vec![SubtitleBitmapPlane {
             x: 80,
             y: 260,
@@ -49,6 +50,7 @@ fn run_check(layer: *mut c_void) -> Result<(), String> {
             rgba: solid_rgba(240, 32, [255, 255, 255, 220]),
         }],
         subtitle_alpha_planes: Vec::new(),
+        danmaku_planes: Vec::new(),
         subtitle_changed: true,
         danmaku_boxes: Vec::new(),
     };
