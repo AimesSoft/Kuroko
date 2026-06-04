@@ -39,7 +39,6 @@ use objc2_metal::{
 use objc2_metal::{MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerState};
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
-use crate::overlay::OverlayViewport;
 use crate::renderer::metal::{
     ClearColor, ImportedVideoFormat, ImportedVideoFrameInfo, ImportedVideoPlaneInfo,
     MetalDrawablePixelFormat, MetalOutputMode, MetalRendererConfig, MetalRendererStats,
@@ -454,7 +453,6 @@ impl MetalRendererImpl {
         let _ = crate::renderer::metal::inspect_overlay_frame(overlay.frame)?;
         if overlay.frame.subtitle_planes.is_empty()
             && overlay.frame.subtitle_alpha_planes.is_empty()
-            && overlay.frame.danmaku_planes.is_empty()
         {
             return Ok(());
         }
@@ -469,41 +467,6 @@ impl MetalRendererImpl {
             )?;
             let uniforms =
                 OverlayUniforms::from_plane(plane.x, plane.y, plane.width, plane.height, layout);
-            unsafe {
-                encoder.setRenderPipelineState(&pipeline);
-                encoder.setFragmentTexture_atIndex(Some(&*texture), 0);
-                encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
-                encoder.setVertexBytes_length_atIndex(
-                    overlay_uniform_pointer(&uniforms),
-                    mem::size_of::<OverlayUniforms>(),
-                    0,
-                );
-                encoder.setFragmentBytes_length_atIndex(
-                    overlay_uniform_pointer(&uniforms),
-                    mem::size_of::<OverlayUniforms>(),
-                    0,
-                );
-                encoder.drawPrimitives_vertexStart_vertexCount(
-                    MTLPrimitiveType::TriangleStrip,
-                    0,
-                    4,
-                );
-            }
-        }
-        for plane in &overlay.frame.danmaku_planes {
-            let texture = self.create_overlay_texture(
-                plane.width as usize,
-                plane.height as usize,
-                &plane.rgba,
-            )?;
-            let uniforms = OverlayUniforms::from_surface_plane(
-                plane.x,
-                plane.y,
-                plane.width,
-                plane.height,
-                overlay.frame.surface_viewport,
-                layout,
-            );
             unsafe {
                 encoder.setRenderPipelineState(&pipeline);
                 encoder.setFragmentTexture_atIndex(Some(&*texture), 0);
@@ -985,19 +948,6 @@ impl VideoPresentationLayout {
         [self.drawable_width, self.drawable_height]
     }
 
-    fn map_surface_rect(
-        self,
-        viewport: OverlayViewport,
-        x: f32,
-        y: f32,
-        width: f32,
-        height: f32,
-    ) -> [f32; 4] {
-        let scale_x = self.drawable_width / viewport.width.max(1) as f32;
-        let scale_y = self.drawable_height / viewport.height.max(1) as f32;
-        [x * scale_x, y * scale_y, width * scale_x, height * scale_y]
-    }
-
     fn map_source_rect(self, x: f32, y: f32, width: f32, height: f32) -> [f32; 4] {
         let scale_x = self.target_rect[2] / self.source_width;
         let scale_y = self.target_rect[3] / self.source_height;
@@ -1060,30 +1010,6 @@ impl OverlayUniforms {
     ) -> Self {
         Self {
             rect: layout.map_source_rect(x as f32, y as f32, width as f32, height as f32),
-            tex_rect: [0.0, 0.0, 1.0, 1.0],
-            viewport: layout.overlay_viewport(),
-            overlay_mode: 0,
-            _reserved0: 0,
-            color: [1.0, 1.0, 1.0, 1.0],
-        }
-    }
-
-    fn from_surface_plane(
-        x: i32,
-        y: i32,
-        width: u32,
-        height: u32,
-        surface_viewport: OverlayViewport,
-        layout: VideoPresentationLayout,
-    ) -> Self {
-        Self {
-            rect: layout.map_surface_rect(
-                surface_viewport,
-                x as f32,
-                y as f32,
-                width as f32,
-                height as f32,
-            ),
             tex_rect: [0.0, 0.0, 1.0, 1.0],
             viewport: layout.overlay_viewport(),
             overlay_mode: 0,
@@ -1943,37 +1869,6 @@ mod tests {
         for (actual, expected) in uniforms.rect.into_iter().zip([500.0, 500.0, 100.0, 56.25]) {
             assert!((actual - expected).abs() < 0.001, "{actual} != {expected}");
         }
-    }
-
-    #[test]
-    fn overlay_uniforms_map_danmaku_rect_in_surface_space() {
-        let layout = super::VideoPresentationLayout::aspect_fit(1920, 1080, 1000, 1000);
-        let uniforms = super::OverlayUniforms::from_surface_plane(
-            0,
-            0,
-            1000,
-            1000,
-            crate::overlay::OverlayViewport::new(1000, 1000),
-            layout,
-        );
-
-        assert_eq!(uniforms.viewport, [1000.0, 1000.0]);
-        assert_eq!(uniforms.rect, [0.0, 0.0, 1000.0, 1000.0]);
-    }
-
-    #[test]
-    fn overlay_uniforms_scale_surface_space_to_drawable() {
-        let layout = super::VideoPresentationLayout::aspect_fit(1920, 1080, 1000, 1000);
-        let uniforms = super::OverlayUniforms::from_surface_plane(
-            100,
-            50,
-            200,
-            100,
-            crate::overlay::OverlayViewport::new(500, 500),
-            layout,
-        );
-
-        assert_eq!(uniforms.rect, [200.0, 100.0, 400.0, 200.0]);
     }
 
     #[test]

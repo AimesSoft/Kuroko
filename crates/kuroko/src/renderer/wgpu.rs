@@ -152,9 +152,7 @@ fn tone_map_code(operator: ToneMapOperator) -> u32 {
 }
 
 fn overlay_has_planes(frame: &OverlayFrame) -> bool {
-    !frame.subtitle_planes.is_empty()
-        || !frame.subtitle_alpha_planes.is_empty()
-        || !frame.danmaku_planes.is_empty()
+    !frame.subtitle_planes.is_empty() || !frame.subtitle_alpha_planes.is_empty()
 }
 
 /// Overlay quad uniforms, byte-compatible with the Metal `OverlayUniforms`.
@@ -208,18 +206,8 @@ impl OverlayUniforms {
         let aw = atlas_w.max(1) as f32;
         let ah = atlas_h.max(1) as f32;
         Self {
-            rect: [
-                place_x as f32,
-                place_y as f32,
-                place_w as f32,
-                place_h as f32,
-            ],
-            tex_rect: [
-                atlas_x as f32 / aw,
-                0.0,
-                place_w as f32 / aw,
-                place_h as f32 / ah,
-            ],
+            rect: [place_x as f32, place_y as f32, place_w as f32, place_h as f32],
+            tex_rect: [atlas_x as f32 / aw, 0.0, place_w as f32 / aw, place_h as f32 / ah],
             viewport: [viewport_w.max(1) as f32, viewport_h.max(1) as f32],
             overlay_mode: 1,
             reserved0: 0,
@@ -541,11 +529,9 @@ impl WgpuRenderer {
             ));
         }
         let (luma_format, chroma_format, bytes_per_sample) = match frame.format {
-            PlanarPixelFormat::Nv12 => (
-                wgpu::TextureFormat::R8Unorm,
-                wgpu::TextureFormat::Rg8Unorm,
-                1u32,
-            ),
+            PlanarPixelFormat::Nv12 => {
+                (wgpu::TextureFormat::R8Unorm, wgpu::TextureFormat::Rg8Unorm, 1u32)
+            }
             PlanarPixelFormat::P010 => {
                 if !self.supports_16bit_norm {
                     return Err(PlayerError::Renderer(
@@ -805,37 +791,6 @@ impl WgpuRenderer {
                 plane.height,
                 viewport_w,
                 viewport_h,
-            );
-            draws.push(self.make_overlay_draw(&texture, uniforms));
-        }
-        for plane in &frame.danmaku_planes {
-            if plane.width == 0 || plane.height == 0 {
-                continue;
-            }
-            let expected = plane.width as usize * plane.height as usize * 4;
-            if plane.rgba.len() != expected {
-                return Err(PlayerError::Renderer(format!(
-                    "overlay danmaku plane has {} bytes, expected {expected} for {}x{} RGBA",
-                    plane.rgba.len(),
-                    plane.width,
-                    plane.height
-                )));
-            }
-            let texture = self.create_plane_texture(
-                "kuroko-wgpu-overlay-danmaku-plane",
-                plane.width,
-                plane.height,
-                wgpu::TextureFormat::Rgba8Unorm,
-                &plane.rgba,
-                plane.width * 4,
-            );
-            let uniforms = OverlayUniforms::rgba_plane(
-                plane.x,
-                plane.y,
-                plane.width,
-                plane.height,
-                frame.surface_viewport.width,
-                frame.surface_viewport.height,
             );
             draws.push(self.make_overlay_draw(&texture, uniforms));
         }

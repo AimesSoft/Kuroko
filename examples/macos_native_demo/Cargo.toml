@@ -13,8 +13,7 @@ crossbeam-channel.workspace = true
 kuroko = { path = "../../crates/kuroko" }
 
 [features]
-default = ["danmaku-next2"]
-danmaku-next2 = ["kuroko/danmaku-next2"]
+default = []
 libass = ["kuroko/libass"]
 
 [build-dependencies]

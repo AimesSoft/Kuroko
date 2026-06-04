@@ -35,7 +35,6 @@ fn main() {
     let overlay = OverlayFrame {
         pts: std::time::Duration::ZERO,
         viewport: OverlayViewport::new(WIDTH, HEIGHT),
-        surface_viewport: OverlayViewport::new(WIDTH, HEIGHT),
         subtitle_planes: vec![
             // A translucent white caption bar near the bottom.
             SubtitleBitmapPlane {
@@ -59,7 +58,6 @@ fn main() {
             // Exercises the mode-1 alpha-atlas path (coverage tinted by color).
             alpha_gradient_bitmap(60, 96, 200, 20, 0x00FF_FF00),
         ],
-        danmaku_planes: Vec::new(),
         subtitle_changed: true,
         danmaku_boxes: Vec::new(),
     };
@@ -81,13 +79,7 @@ fn main() {
     println!("wrote {out} ({WIDTH}x{HEIGHT})");
 }
 
-fn alpha_gradient_bitmap(
-    x: i32,
-    y: i32,
-    width: u32,
-    height: u32,
-    color_rgba: u32,
-) -> SubtitleAlphaBitmap {
+fn alpha_gradient_bitmap(x: i32, y: i32, width: u32, height: u32, color_rgba: u32) -> SubtitleAlphaBitmap {
     let mut alpha = vec![0u8; width as usize * height as usize];
     for row in 0..height as usize {
         for col in 0..width as usize {
@@ -119,11 +111,7 @@ fn rgb_to_ycbcr_limited(rgb: [u8; 3]) -> (u8, u8, u8) {
     let cb = (b - y) / (2.0 * (1.0 - kb));
     let cr = (r - y) / (2.0 * (1.0 - kr));
     let to8 = |v: f32| v.round().clamp(0.0, 255.0) as u8;
-    (
-        to8(16.0 + 219.0 * y),
-        to8(128.0 + 224.0 * cb),
-        to8(128.0 + 224.0 * cr),
-    )
+    (to8(16.0 + 219.0 * y), to8(128.0 + 224.0 * cb), to8(128.0 + 224.0 * cr))
 }
 
 fn bar_index(x: u32) -> usize {

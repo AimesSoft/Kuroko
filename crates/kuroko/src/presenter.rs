@@ -1,12 +1,11 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crossbeam_channel::Receiver;
 
 use crate::apple::coreaudio::{CoreAudioOutput, CoreAudioOutputConfig};
 use crate::core::{
-    FlutterTextureHandle, MediaRequest, MetalSurfaceHandle, PlatformSurface, Player,
-    PlayerAudioFrame, PlayerConfig, PlayerSubtitleFrame, PlayerVideoFrame, RendererBackend,
-    RendererBackendPreference, TrackInfo, TrackSelection, WgpuSurfaceHandle,
+    MediaRequest, PlatformSurface, Player, PlayerAudioFrame, PlayerConfig, PlayerSubtitleFrame,
+    PlayerVideoFrame, RendererBackend, RendererBackendPreference, TrackInfo, TrackSelection,
 };
 use crate::overlay::{OverlayFrame, OverlayTimeline, OverlayViewport};
 use crate::renderer::metal::{MetalRenderer, MetalRendererConfig};
@@ -52,19 +51,6 @@ pub struct PresenterStats {
     pub import_failures: u64,
     pub render_failures: u64,
     pub audio_failures: u64,
-    pub render_ticks: u64,
-    pub render_tick_ns_total: u64,
-    pub render_tick_ns_max: u64,
-    pub last_render_tick_ns: u64,
-    pub overlay_builds: u64,
-    pub overlay_build_ns_total: u64,
-    pub overlay_build_ns_max: u64,
-    pub last_overlay_build_ns: u64,
-    pub last_overlay_danmaku_boxes: u32,
-    pub max_overlay_danmaku_boxes: u32,
-    pub total_overlay_danmaku_boxes: u64,
-    pub last_overlay_subtitle_planes: u32,
-    pub last_overlay_alpha_planes: u32,
 }
 
 pub struct PresenterRuntime {
@@ -76,7 +62,6 @@ pub struct PresenterRuntime {
     audio_output: CoreAudioOutput,
     audio_started: bool,
     current_overlay: Option<OverlayFrame>,
-    overlay_surface_viewport: Option<OverlayViewport>,
     subtitles: SubtitleFrameState,
     overlay: OverlayTimeline,
     stats: PresenterStats,
@@ -98,7 +83,6 @@ impl PresenterRuntime {
             audio_output: CoreAudioOutput::new(config.audio),
             audio_started: false,
             current_overlay: None,
-            overlay_surface_viewport: None,
             subtitles: SubtitleFrameState::default(),
             overlay: config.overlay,
             stats: PresenterStats::default(),
@@ -111,18 +95,15 @@ impl PresenterRuntime {
 
     pub fn attach_surface(&mut self, surface: PlatformSurface) -> Result<()> {
         self.player.attach_surface(surface)?;
-        self.overlay_surface_viewport = platform_surface_viewport(surface);
         self.renderer.attach_surface(surface)
     }
 
     pub fn detach_surface(&mut self) -> Result<()> {
         self.player.detach_surface()?;
-        self.overlay_surface_viewport = None;
         self.renderer.detach_surface()
     }
 
     pub fn resize_surface(&mut self, width: u32, height: u32, scale: f64) -> Result<()> {
-        self.overlay_surface_viewport = Some(surface_viewport_from_size(width, height, scale));
         self.renderer.resize_surface(width, height, scale)
     }
 
@@ -175,36 +156,26 @@ impl PresenterRuntime {
     }
 
     pub fn render_tick(&mut self, time_seconds: f64) -> Result<PresenterStats> {
-        let started = Instant::now();
-        let result = (|| {
-            self.pump_audio();
-            self.pump_subtitles();
-            self.pump_video();
+        self.pump_audio();
+        self.pump_subtitles();
+        self.pump_video();
 
-            match self
-                .renderer
-                .render_current_frame(self.current_overlay.as_ref())
-            {
-                Ok(true) => self.stats.rendered_video_frames += 1,
-                Ok(false) => {
-                    self.renderer.render_test_frame(time_seconds)?;
-                    self.stats.rendered_test_frames += 1;
-                }
-                Err(error) => {
-                    self.stats.render_failures += 1;
-                    return Err(error);
-                }
+        match self
+            .renderer
+            .render_current_frame(self.current_overlay.as_ref())
+        {
+            Ok(true) => self.stats.rendered_video_frames += 1,
+            Ok(false) => {
+                self.renderer.render_test_frame(time_seconds)?;
+                self.stats.rendered_test_frames += 1;
             }
-            Ok(())
-        })();
+            Err(error) => {
+                self.stats.render_failures += 1;
+                return Err(error);
+            }
+        }
 
-        let elapsed = duration_ns(started.elapsed());
-        self.stats.render_ticks += 1;
-        self.stats.last_render_tick_ns = elapsed;
-        self.stats.render_tick_ns_total = self.stats.render_tick_ns_total.saturating_add(elapsed);
-        self.stats.render_tick_ns_max = self.stats.render_tick_ns_max.max(elapsed);
-
-        result.map(|()| self.stats)
+        Ok(self.stats)
     }
 
     pub fn stats(&self) -> PresenterStats {
@@ -219,7 +190,11 @@ impl PresenterRuntime {
                     match self.renderer.upload_player_frame(&frame) {
                         Ok(()) => {
                             let pts = frame.pts.unwrap_or(frame.media_time);
-                            self.update_overlay(pts, frame.frame.width(), frame.frame.height());
+                            self.update_overlay(
+                                pts,
+                                frame.frame.width() as usize,
+                                frame.frame.height() as usize,
+                            );
                         }
                         Err(error) => {
                             self.stats.import_failures += 1;
@@ -233,34 +208,15 @@ impl PresenterRuntime {
         }
     }
 
-    fn update_overlay(&mut self, pts: Duration, width: u32, height: u32) {
-        let started = Instant::now();
-        let video_viewport = OverlayViewport::new(width, height);
-        let surface_viewport = self.overlay_surface_viewport.unwrap_or(video_viewport);
-        let mut overlay = self
-            .overlay
-            .render_for_surface(pts, video_viewport, surface_viewport);
+    fn update_overlay(&mut self, pts: Duration, width: usize, height: usize) {
+        let mut overlay = self.overlay.render(
+            pts,
+            OverlayViewport::new(
+                width.min(u32::MAX as usize) as u32,
+                height.min(u32::MAX as usize) as u32,
+            ),
+        );
         self.subtitles.append_to_overlay(pts, &mut overlay);
-        let elapsed = duration_ns(started.elapsed());
-        self.stats.overlay_builds += 1;
-        self.stats.last_overlay_build_ns = elapsed;
-        self.stats.overlay_build_ns_total =
-            self.stats.overlay_build_ns_total.saturating_add(elapsed);
-        self.stats.overlay_build_ns_max = self.stats.overlay_build_ns_max.max(elapsed);
-        self.stats.last_overlay_danmaku_boxes =
-            overlay.danmaku_boxes.len().min(u32::MAX as usize) as u32;
-        self.stats.max_overlay_danmaku_boxes = self
-            .stats
-            .max_overlay_danmaku_boxes
-            .max(self.stats.last_overlay_danmaku_boxes);
-        self.stats.total_overlay_danmaku_boxes = self
-            .stats
-            .total_overlay_danmaku_boxes
-            .saturating_add(overlay.danmaku_boxes.len() as u64);
-        self.stats.last_overlay_subtitle_planes =
-            overlay.subtitle_planes.len().min(u32::MAX as usize) as u32;
-        self.stats.last_overlay_alpha_planes =
-            overlay.subtitle_alpha_planes.len().min(u32::MAX as usize) as u32;
         if !overlay.is_empty() {
             self.stats.overlay_frames += 1;
         }
@@ -326,48 +282,11 @@ impl PresenterRuntime {
     }
 }
 
-fn duration_ns(duration: Duration) -> u64 {
-    duration.as_nanos().min(u64::MAX as u128) as u64
-}
-
 impl Drop for PresenterRuntime {
     fn drop(&mut self) {
         let _ = self.audio_output.stop();
         let _ = self.player.close();
     }
-}
-
-fn platform_surface_viewport(surface: PlatformSurface) -> Option<OverlayViewport> {
-    match surface {
-        PlatformSurface::Metal(handle) => Some(metal_surface_viewport(handle)),
-        PlatformSurface::Wgpu(handle) => Some(wgpu_surface_viewport(handle)),
-        PlatformSurface::FlutterTexture(handle) => Some(flutter_texture_viewport(handle)),
-    }
-}
-
-fn metal_surface_viewport(handle: MetalSurfaceHandle) -> OverlayViewport {
-    surface_viewport_from_size(handle.width, handle.height, handle.scale)
-}
-
-fn wgpu_surface_viewport(handle: WgpuSurfaceHandle) -> OverlayViewport {
-    surface_viewport_from_size(handle.width, handle.height, handle.scale)
-}
-
-fn flutter_texture_viewport(handle: FlutterTextureHandle) -> OverlayViewport {
-    surface_viewport_from_size(handle.width, handle.height, handle.scale)
-}
-
-fn surface_viewport_from_size(width: u32, height: u32, scale: f64) -> OverlayViewport {
-    let scale = if scale.is_finite() && scale > 0.0 {
-        scale
-    } else {
-        1.0
-    };
-    let width = ((width as f64) * scale).round().clamp(1.0, u32::MAX as f64) as u32;
-    let height = ((height as f64) * scale)
-        .round()
-        .clamp(1.0, u32::MAX as f64) as u32;
-    OverlayViewport::new(width, height)
 }
 
 fn build_renderer(
@@ -614,27 +533,11 @@ mod tests {
         OverlayFrame {
             pts: Duration::ZERO,
             viewport: OverlayViewport::new(640, 360),
-            surface_viewport: OverlayViewport::new(640, 360),
             subtitle_planes: Vec::new(),
             subtitle_alpha_planes: Vec::new(),
-            danmaku_planes: Vec::new(),
             subtitle_changed: false,
             danmaku_boxes: Vec::new(),
         }
-    }
-
-    #[test]
-    fn presenter_surface_viewport_uses_physical_drawable_size() {
-        assert_eq!(
-            surface_viewport_from_size(960, 540, 2.0),
-            OverlayViewport::new(1920, 1080)
-        );
-        assert_eq!(
-            platform_surface_viewport(PlatformSurface::Metal(MetalSurfaceHandle::new(
-                1, 800, 450, 1.5
-            ))),
-            Some(OverlayViewport::new(1200, 675))
-        );
     }
 
     #[test]
