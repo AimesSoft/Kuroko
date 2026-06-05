@@ -1227,6 +1227,7 @@ pub struct VideoPlaybackEngine {
     last_presented_pts: Option<Duration>,
     eof: bool,
     waiting_for_first_frame: bool,
+    seek_floor: Option<Duration>,
 }
 
 unsafe impl Send for VideoPlaybackEngine {}
@@ -1259,6 +1260,7 @@ impl VideoPlaybackEngine {
             last_presented_pts: None,
             eof: false,
             waiting_for_first_frame: false,
+            seek_floor: None,
         }
     }
 
@@ -1337,6 +1339,7 @@ impl VideoPlaybackEngine {
         self.last_presented_pts = None;
         self.eof = false;
         self.waiting_for_first_frame = self.state == PlaybackRunState::Playing;
+        self.seek_floor = Some(media_time);
         Ok(())
     }
 
@@ -1373,6 +1376,7 @@ impl VideoPlaybackEngine {
         self.state = PlaybackRunState::Stopped;
         self.eof = false;
         self.waiting_for_first_frame = false;
+        self.seek_floor = None;
     }
 
     pub fn seek(&mut self, position: Duration) -> Result<()> {
@@ -1388,6 +1392,7 @@ impl VideoPlaybackEngine {
         self.last_presented_pts = None;
         self.eof = false;
         self.waiting_for_first_frame = self.state == PlaybackRunState::Playing;
+        self.seek_floor = Some(position);
         Ok(())
     }
 
@@ -1497,6 +1502,10 @@ impl VideoPlaybackEngine {
             };
 
             let pts = frame.pts().and_then(|pts| pts.as_duration());
+            if self.should_drop_seek_preroll(pts) {
+                let _ = self.pending_frame.take();
+                continue;
+            }
             let should_present_first = self.last_presented_pts.is_none();
             if should_present_first && self.waiting_for_first_frame {
                 let now = Instant::now();
@@ -1533,6 +1542,22 @@ impl VideoPlaybackEngine {
                     }));
                 }
             }
+        }
+    }
+
+    fn should_drop_seek_preroll(&mut self, pts: Option<Duration>) -> bool {
+        let Some(target) = self.seek_floor else {
+            return false;
+        };
+        let Some(pts) = pts else {
+            self.seek_floor = None;
+            return false;
+        };
+        if pts < target {
+            true
+        } else {
+            self.seek_floor = None;
+            false
         }
     }
 

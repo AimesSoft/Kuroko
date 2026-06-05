@@ -3,6 +3,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Duration;
 
 use crossbeam_channel::Receiver;
+use kuroko::danmaku::{
+    DanmakuLayoutConfig, DanmakuShadowStyle, DanmakuTimeline, DanmakuTrackInfo, DanmakuTrackSource,
+};
 #[cfg(target_os = "macos")]
 use kuroko::presenter::{PresenterConfig, PresenterRuntime, PresenterStats};
 #[cfg(target_os = "macos")]
@@ -161,6 +164,81 @@ impl Default for KurokoPresenterConfig {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KurokoDanmakuConfig {
+    pub enabled: bool,
+    pub font_size: f32,
+    pub opacity: f32,
+    pub display_area: f32,
+    pub scroll_duration_seconds: f32,
+    pub scroll_speed_factor: f32,
+    pub track_gap_ratio: f32,
+    pub outline_width: f32,
+    pub shadow_offset_x: f32,
+    pub shadow_offset_y: f32,
+    pub merge_duplicates: bool,
+    pub allow_stacking: bool,
+    pub allow_scroll_overwrite: bool,
+    pub max_quantity: u32,
+    pub max_lines_per_mode: u32,
+    pub block_top: bool,
+    pub block_bottom: bool,
+    pub block_scroll: bool,
+    pub shadow_style: i32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KurokoDanmakuTrackInfo {
+    pub id: u64,
+    pub enabled: bool,
+    pub offset_micros: i64,
+    pub item_count: usize,
+    pub name: *mut c_char,
+    pub source: *mut c_char,
+}
+
+impl Default for KurokoDanmakuTrackInfo {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            enabled: false,
+            offset_micros: 0,
+            item_count: 0,
+            name: std::ptr::null_mut(),
+            source: std::ptr::null_mut(),
+        }
+    }
+}
+
+impl Default for KurokoDanmakuConfig {
+    fn default() -> Self {
+        let config = DanmakuLayoutConfig::default();
+        Self {
+            enabled: config.enabled,
+            font_size: config.font_size,
+            opacity: config.opacity,
+            display_area: config.display_area,
+            scroll_duration_seconds: config.scroll_duration_seconds,
+            scroll_speed_factor: config.scroll_speed_factor,
+            track_gap_ratio: config.track_gap_ratio,
+            outline_width: config.outline_width,
+            shadow_offset_x: config.shadow_offset[0],
+            shadow_offset_y: config.shadow_offset[1],
+            merge_duplicates: config.merge_duplicates,
+            allow_stacking: config.allow_stacking,
+            allow_scroll_overwrite: config.allow_scroll_overwrite,
+            max_quantity: 0,
+            max_lines_per_mode: 0,
+            block_top: config.block_top,
+            block_bottom: config.block_bottom,
+            block_scroll: config.block_scroll,
+            shadow_style: config.shadow_style.code(),
+        }
+    }
+}
+
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct KurokoVideoParams {
     pub width: u32,
@@ -224,6 +302,8 @@ pub struct KurokoPresenterStats {
     pub rendered_test_frames: u64,
     pub pushed_audio_frames: u64,
     pub overlay_frames: u64,
+    pub danmaku_frames: u64,
+    pub danmaku_items: u64,
     pub import_failures: u64,
     pub render_failures: u64,
     pub audio_failures: u64,
@@ -391,6 +471,16 @@ pub unsafe extern "C" fn kuroko_track_info_free(track: *mut KurokoTrackInfo) {
     free_c_string(&mut track.title);
     free_c_string(&mut track.language);
     free_c_string(&mut track.codec);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_danmaku_track_info_free(track: *mut KurokoDanmakuTrackInfo) {
+    if track.is_null() {
+        return;
+    }
+    let track = unsafe { &mut *track };
+    free_c_string(&mut track.name);
+    free_c_string(&mut track.source);
 }
 
 #[unsafe(no_mangle)]
@@ -584,6 +674,51 @@ fn presenter_config_from_c(config: KurokoPresenterConfig) -> PresenterConfig {
     }
 }
 
+fn danmaku_config_from_c(
+    config: KurokoDanmakuConfig,
+    base: &DanmakuLayoutConfig,
+) -> DanmakuLayoutConfig {
+    DanmakuLayoutConfig {
+        enabled: config.enabled,
+        font_size: config.font_size,
+        opacity: config.opacity,
+        display_area: config.display_area,
+        scroll_duration_seconds: config.scroll_duration_seconds,
+        scroll_speed_factor: config.scroll_speed_factor,
+        track_gap_ratio: config.track_gap_ratio,
+        outline_width: config.outline_width,
+        shadow_offset: [config.shadow_offset_x, config.shadow_offset_y],
+        merge_duplicates: config.merge_duplicates,
+        allow_stacking: config.allow_stacking,
+        allow_scroll_overwrite: config.allow_scroll_overwrite,
+        max_quantity: (config.max_quantity > 0).then_some(config.max_quantity),
+        max_lines_per_mode: (config.max_lines_per_mode > 0).then_some(config.max_lines_per_mode),
+        block_top: config.block_top,
+        block_bottom: config.block_bottom,
+        block_scroll: config.block_scroll,
+        block_words: base.block_words.clone(),
+        shadow_style: DanmakuShadowStyle::from_code(config.shadow_style),
+        custom_font_family: base.custom_font_family.clone(),
+        custom_font_file_path: base.custom_font_file_path.clone(),
+    }
+}
+
+fn danmaku_block_words_from_json(json: &str) -> Result<Vec<String>, KurokoStatus> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|_| KurokoStatus::PlayerError)?;
+    match value {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .map(|item| match item {
+                serde_json::Value::String(value) => Ok(value),
+                _ => Err(KurokoStatus::PlayerError),
+            })
+            .collect(),
+        serde_json::Value::String(value) => Ok(vec![value]),
+        _ => Err(KurokoStatus::PlayerError),
+    }
+}
+
 #[cfg(all(target_os = "macos", test))]
 fn metal_output_mode_from_c(config: KurokoPresenterConfig) -> MetalOutputMode {
     presenter_config_from_c(config).renderer.output_mode
@@ -669,6 +804,17 @@ pub unsafe extern "C" fn kuroko_presenter_seek(
 
 #[cfg(target_os = "macos")]
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_set_playback_rate(
+    handle: *mut KurokoPresenterHandle,
+    rate: f64,
+) -> KurokoStatus {
+    with_presenter_mut(handle, |handle| {
+        status_from_player_result(handle.presenter.set_playback_rate(rate))
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_add_external_subtitle(
     handle: *mut KurokoPresenterHandle,
     uri: *const c_char,
@@ -740,6 +886,297 @@ pub unsafe extern "C" fn kuroko_presenter_select_subtitle_track(
                 .presenter
                 .select_subtitle_track(track_id_option(track_id)),
         )
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_load_danmaku_file(
+    handle: *mut KurokoPresenterHandle,
+    uri: *const c_char,
+) -> KurokoStatus {
+    with_presenter_mut(handle, |handle| {
+        let uri = match c_string(uri) {
+            Ok(uri) => uri,
+            Err(status) => return status,
+        };
+        match DanmakuTimeline::from_file(uri) {
+            Ok(timeline) => {
+                handle.presenter.set_danmaku_timeline(timeline);
+                KurokoStatus::Ok
+            }
+            Err(_) => KurokoStatus::PlayerError,
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_load_danmaku_json(
+    handle: *mut KurokoPresenterHandle,
+    json: *const c_char,
+) -> KurokoStatus {
+    with_presenter_mut(handle, |handle| {
+        let json = match c_string(json) {
+            Ok(json) => json,
+            Err(status) => return status,
+        };
+        match DanmakuTimeline::parse_auto(&json) {
+            Ok(timeline) => {
+                handle.presenter.set_danmaku_timeline(timeline);
+                KurokoStatus::Ok
+            }
+            Err(_) => KurokoStatus::PlayerError,
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_add_danmaku_track_file(
+    handle: *mut KurokoPresenterHandle,
+    uri: *const c_char,
+    name: *const c_char,
+    offset_micros: i64,
+    out_track_id: *mut u64,
+) -> KurokoStatus {
+    if out_track_id.is_null() {
+        return KurokoStatus::NullPointer;
+    }
+    with_presenter_mut(handle, |handle| {
+        let uri = match c_string(uri) {
+            Ok(uri) => uri,
+            Err(status) => return status,
+        };
+        let name = optional_c_string(name).unwrap_or_else(|| danmaku_track_name_from_uri(&uri));
+        match DanmakuTimeline::from_file(&uri) {
+            Ok(timeline) => {
+                let track_id = handle.presenter.add_danmaku_track(
+                    timeline,
+                    name,
+                    DanmakuTrackSource::File(std::path::PathBuf::from(uri)),
+                    offset_micros,
+                );
+                unsafe { *out_track_id = track_id };
+                KurokoStatus::Ok
+            }
+            Err(_) => KurokoStatus::PlayerError,
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_add_danmaku_track_json(
+    handle: *mut KurokoPresenterHandle,
+    json: *const c_char,
+    name: *const c_char,
+    offset_micros: i64,
+    out_track_id: *mut u64,
+) -> KurokoStatus {
+    if out_track_id.is_null() {
+        return KurokoStatus::NullPointer;
+    }
+    with_presenter_mut(handle, |handle| {
+        let json = match c_string(json) {
+            Ok(json) => json,
+            Err(status) => return status,
+        };
+        let name = optional_c_string(name).unwrap_or_else(|| "danmaku".to_string());
+        match DanmakuTimeline::parse_auto(&json) {
+            Ok(timeline) => {
+                let track_id = handle.presenter.add_danmaku_track(
+                    timeline,
+                    name,
+                    DanmakuTrackSource::Json,
+                    offset_micros,
+                );
+                unsafe { *out_track_id = track_id };
+                KurokoStatus::Ok
+            }
+            Err(_) => KurokoStatus::PlayerError,
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_remove_danmaku_track(
+    handle: *mut KurokoPresenterHandle,
+    track_id: u64,
+) -> KurokoStatus {
+    with_presenter_mut(handle, |handle| {
+        if handle.presenter.remove_danmaku_track(track_id) {
+            KurokoStatus::Ok
+        } else {
+            KurokoStatus::PlayerError
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_set_danmaku_track_enabled(
+    handle: *mut KurokoPresenterHandle,
+    track_id: u64,
+    enabled: bool,
+) -> KurokoStatus {
+    with_presenter_mut(handle, |handle| {
+        if handle
+            .presenter
+            .set_danmaku_track_enabled(track_id, enabled)
+        {
+            KurokoStatus::Ok
+        } else {
+            KurokoStatus::PlayerError
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_set_danmaku_track_offset(
+    handle: *mut KurokoPresenterHandle,
+    track_id: u64,
+    offset_micros: i64,
+) -> KurokoStatus {
+    with_presenter_mut(handle, |handle| {
+        if handle
+            .presenter
+            .set_danmaku_track_offset(track_id, offset_micros)
+        {
+            KurokoStatus::Ok
+        } else {
+            KurokoStatus::PlayerError
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_set_danmaku_global_offset(
+    handle: *mut KurokoPresenterHandle,
+    offset_micros: i64,
+) -> KurokoStatus {
+    with_presenter_mut(handle, |handle| {
+        handle.presenter.set_danmaku_global_offset(offset_micros);
+        KurokoStatus::Ok
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_danmaku_tracks(
+    handle: *mut KurokoPresenterHandle,
+    out_tracks: *mut KurokoDanmakuTrackInfo,
+    capacity: usize,
+    out_len: *mut usize,
+) -> KurokoStatus {
+    if out_len.is_null() || (capacity > 0 && out_tracks.is_null()) {
+        return KurokoStatus::NullPointer;
+    }
+    with_presenter_mut(handle, |handle| {
+        write_danmaku_tracks_to_c(
+            &handle.presenter.danmaku_tracks(),
+            out_tracks,
+            capacity,
+            out_len,
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_clear_danmaku(
+    handle: *mut KurokoPresenterHandle,
+) -> KurokoStatus {
+    with_presenter_mut(handle, |handle| {
+        handle.presenter.clear_danmaku();
+        KurokoStatus::Ok
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_set_danmaku_enabled(
+    handle: *mut KurokoPresenterHandle,
+    enabled: bool,
+) -> KurokoStatus {
+    with_presenter_mut(handle, |handle| {
+        handle.presenter.set_danmaku_enabled(enabled);
+        KurokoStatus::Ok
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_set_danmaku_config(
+    handle: *mut KurokoPresenterHandle,
+    config: KurokoDanmakuConfig,
+) -> KurokoStatus {
+    with_presenter_mut(handle, |handle| {
+        let base = handle
+            .presenter
+            .danmaku_config()
+            .cloned()
+            .unwrap_or_default();
+        handle
+            .presenter
+            .set_danmaku_config(danmaku_config_from_c(config, &base));
+        KurokoStatus::Ok
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_set_danmaku_config_ptr(
+    handle: *mut KurokoPresenterHandle,
+    config: *const KurokoDanmakuConfig,
+) -> KurokoStatus {
+    if config.is_null() {
+        return KurokoStatus::NullPointer;
+    }
+    unsafe { kuroko_presenter_set_danmaku_config(handle, *config) }
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_set_danmaku_font(
+    handle: *mut KurokoPresenterHandle,
+    family: *const c_char,
+    file_path: *const c_char,
+) -> KurokoStatus {
+    with_presenter_mut(handle, |handle| {
+        let family = optional_c_string(family).unwrap_or_default();
+        let file_path = optional_c_string(file_path).unwrap_or_default();
+        handle.presenter.set_danmaku_font(family, file_path);
+        KurokoStatus::Ok
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_set_danmaku_block_words_json(
+    handle: *mut KurokoPresenterHandle,
+    json: *const c_char,
+) -> KurokoStatus {
+    with_presenter_mut(handle, |handle| {
+        let json = match c_string(json) {
+            Ok(json) => json,
+            Err(status) => return status,
+        };
+        let block_words = match danmaku_block_words_from_json(&json) {
+            Ok(words) => words,
+            Err(status) => return status,
+        };
+        let mut config = handle
+            .presenter
+            .danmaku_config()
+            .cloned()
+            .unwrap_or_default();
+        config.block_words = block_words;
+        handle.presenter.set_danmaku_config(config);
+        KurokoStatus::Ok
     })
 }
 
@@ -818,6 +1255,175 @@ pub unsafe extern "C" fn kuroko_presenter_tracks(
     _capacity: usize,
     _out_len: *mut usize,
 ) -> KurokoStatus {
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_set_playback_rate(
+    _handle: *mut std::ffi::c_void,
+    _rate: f64,
+) -> KurokoStatus {
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_load_danmaku_file(
+    _handle: *mut std::ffi::c_void,
+    _uri: *const c_char,
+) -> KurokoStatus {
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_load_danmaku_json(
+    _handle: *mut std::ffi::c_void,
+    _json: *const c_char,
+) -> KurokoStatus {
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_add_danmaku_track_file(
+    _handle: *mut std::ffi::c_void,
+    uri: *const c_char,
+    _name: *const c_char,
+    _offset_micros: i64,
+    out_track_id: *mut u64,
+) -> KurokoStatus {
+    if uri.is_null() || out_track_id.is_null() {
+        return KurokoStatus::NullPointer;
+    }
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_add_danmaku_track_json(
+    _handle: *mut std::ffi::c_void,
+    json: *const c_char,
+    _name: *const c_char,
+    _offset_micros: i64,
+    out_track_id: *mut u64,
+) -> KurokoStatus {
+    if json.is_null() || out_track_id.is_null() {
+        return KurokoStatus::NullPointer;
+    }
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_remove_danmaku_track(
+    _handle: *mut std::ffi::c_void,
+    _track_id: u64,
+) -> KurokoStatus {
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_set_danmaku_track_enabled(
+    _handle: *mut std::ffi::c_void,
+    _track_id: u64,
+    _enabled: bool,
+) -> KurokoStatus {
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_set_danmaku_track_offset(
+    _handle: *mut std::ffi::c_void,
+    _track_id: u64,
+    _offset_micros: i64,
+) -> KurokoStatus {
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_set_danmaku_global_offset(
+    _handle: *mut std::ffi::c_void,
+    _offset_micros: i64,
+) -> KurokoStatus {
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_danmaku_tracks(
+    _handle: *mut std::ffi::c_void,
+    out_tracks: *mut KurokoDanmakuTrackInfo,
+    capacity: usize,
+    out_len: *mut usize,
+) -> KurokoStatus {
+    if out_len.is_null() || (capacity > 0 && out_tracks.is_null()) {
+        return KurokoStatus::NullPointer;
+    }
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_clear_danmaku(
+    _handle: *mut std::ffi::c_void,
+) -> KurokoStatus {
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_set_danmaku_enabled(
+    _handle: *mut std::ffi::c_void,
+    _enabled: bool,
+) -> KurokoStatus {
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_set_danmaku_config(
+    _handle: *mut std::ffi::c_void,
+    _config: KurokoDanmakuConfig,
+) -> KurokoStatus {
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_set_danmaku_config_ptr(
+    _handle: *mut std::ffi::c_void,
+    config: *const KurokoDanmakuConfig,
+) -> KurokoStatus {
+    if config.is_null() {
+        return KurokoStatus::NullPointer;
+    }
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_set_danmaku_font(
+    _handle: *mut std::ffi::c_void,
+    _family: *const c_char,
+    _file_path: *const c_char,
+) -> KurokoStatus {
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_set_danmaku_block_words_json(
+    _handle: *mut std::ffi::c_void,
+    json: *const c_char,
+) -> KurokoStatus {
+    if json.is_null() {
+        return KurokoStatus::NullPointer;
+    }
     KurokoStatus::PlayerError
 }
 
@@ -939,6 +1545,18 @@ fn c_string(ptr: *const c_char) -> Result<String, KurokoStatus> {
         .map_err(|_| KurokoStatus::InvalidUtf8)
 }
 
+fn optional_c_string(ptr: *const c_char) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let value = unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .ok()?
+        .trim()
+        .to_string();
+    (!value.is_empty()).then_some(value)
+}
+
 fn status_from_player_result(result: kuroko::Result<()>) -> KurokoStatus {
     match result {
         Ok(()) => KurokoStatus::Ok,
@@ -965,6 +1583,43 @@ fn write_tracks_to_c(
         unsafe { *out_tracks.add(index) = track_info_to_c(track) };
     }
     KurokoStatus::Ok
+}
+
+fn write_danmaku_tracks_to_c(
+    tracks: &[DanmakuTrackInfo],
+    out_tracks: *mut KurokoDanmakuTrackInfo,
+    capacity: usize,
+    out_len: *mut usize,
+) -> KurokoStatus {
+    unsafe { *out_len = tracks.len() };
+    if capacity == 0 {
+        return KurokoStatus::Ok;
+    }
+    let count = tracks.len().min(capacity);
+    for (index, track) in tracks.iter().take(count).enumerate() {
+        unsafe { *out_tracks.add(index) = danmaku_track_info_to_c(track) };
+    }
+    KurokoStatus::Ok
+}
+
+fn danmaku_track_info_to_c(track: &DanmakuTrackInfo) -> KurokoDanmakuTrackInfo {
+    KurokoDanmakuTrackInfo {
+        id: track.id,
+        enabled: track.enabled,
+        offset_micros: track.offset_micros,
+        item_count: track.item_count,
+        name: option_string_to_c(Some(&track.name)),
+        source: option_string_to_c(Some(&track.source)),
+    }
+}
+
+fn danmaku_track_name_from_uri(uri: &str) -> String {
+    std::path::Path::new(uri)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("danmaku")
+        .to_string()
 }
 
 fn track_info_to_c(track: &TrackInfo) -> KurokoTrackInfo {
@@ -1160,6 +1815,8 @@ fn presenter_stats_to_c(stats: PresenterStats) -> KurokoPresenterStats {
         rendered_test_frames: stats.rendered_test_frames,
         pushed_audio_frames: stats.pushed_audio_frames,
         overlay_frames: stats.overlay_frames,
+        danmaku_frames: stats.danmaku_frames,
+        danmaku_items: stats.danmaku_items,
         import_failures: stats.import_failures,
         render_failures: stats.render_failures,
         audio_failures: stats.audio_failures,
@@ -1365,6 +2022,36 @@ mod tests {
             edr_headroom: 4.0,
         });
         assert!(!handle.is_null());
+        unsafe { kuroko_presenter_destroy(handle) };
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn c_presenter_danmaku_api_loads_configures_and_clears() {
+        let handle = kuroko_presenter_create();
+        assert!(!handle.is_null());
+
+        let json = CString::new(
+            r##"{"comments":[{"time":1.0,"content":"c api danmaku","type":"scroll","color":"#ffffff"}]}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            unsafe { kuroko_presenter_load_danmaku_json(handle, json.as_ptr()) },
+            KurokoStatus::Ok
+        );
+        assert_eq!(
+            unsafe { kuroko_presenter_set_danmaku_enabled(handle, true) },
+            KurokoStatus::Ok
+        );
+        assert_eq!(
+            unsafe { kuroko_presenter_set_danmaku_config(handle, KurokoDanmakuConfig::default()) },
+            KurokoStatus::Ok
+        );
+        assert_eq!(
+            unsafe { kuroko_presenter_clear_danmaku(handle) },
+            KurokoStatus::Ok
+        );
+
         unsafe { kuroko_presenter_destroy(handle) };
     }
 

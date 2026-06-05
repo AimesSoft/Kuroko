@@ -1,9 +1,11 @@
 use std::ffi::c_void;
+use std::time::Duration;
 
 use crate::core::{
-    ColorPrimaries, PlatformSurface, PlayerError, PlayerVideoFrame, RendererBackend, Result,
-    TransferFunction,
+    ColorPrimaries, PlatformSurface, PlayerError, PlayerVideoFrame, RenderFrameContext,
+    RendererBackend, Result, TransferFunction,
 };
+use crate::danmaku::DanmakuRenderPlan;
 use crate::ffmpeg::Frame;
 use crate::overlay::OverlayFrame;
 use crate::renderer::pipeline::{
@@ -38,6 +40,8 @@ pub struct MetalRenderer {
     #[cfg(not(target_os = "macos"))]
     _unsupported: (),
     current_frame: Option<ImportedVideoFrame>,
+    current_media_time: Duration,
+    current_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -107,7 +111,8 @@ pub struct MetalRendererStats {
     pub rendered_frames: u64,
     pub prepared_overlay_frames: u64,
     pub prepared_overlay_subtitle_planes: u64,
-    pub prepared_overlay_danmaku_boxes: u64,
+    pub danmaku_passes: u64,
+    pub danmaku_items: u64,
     pub overlay_alpha_atlas_uploads: u64,
     pub overlay_alpha_atlas_reuses: u64,
 }
@@ -254,6 +259,16 @@ impl<'a> OverlayRenderFrame<'a> {
     }
 }
 
+pub struct DanmakuRenderFrame<'a> {
+    pub plan: &'a DanmakuRenderPlan,
+}
+
+impl<'a> DanmakuRenderFrame<'a> {
+    pub fn new(plan: &'a DanmakuRenderPlan) -> Self {
+        Self { plan }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreparedOverlayFrameInfo {
     pub viewport_width: u32,
@@ -261,7 +276,6 @@ pub struct PreparedOverlayFrameInfo {
     pub subtitle_planes: usize,
     pub subtitle_pixels: usize,
     pub subtitle_bytes: usize,
-    pub danmaku_boxes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,6 +297,8 @@ impl MetalRenderer {
             Ok(Self {
                 inner: macos::MetalRendererImpl::new(config)?,
                 current_frame: None,
+                current_media_time: Duration::ZERO,
+                current_generation: 1,
             })
         }
         #[cfg(not(target_os = "macos"))]
@@ -364,6 +380,26 @@ impl MetalRenderer {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (frame, overlay);
+            Err(PlayerError::Renderer(
+                "Metal renderer is only available on macOS for v0".to_string(),
+            ))
+        }
+    }
+
+    pub fn render_video_frame_with_context(
+        &mut self,
+        frame: VideoRenderFrame<'_>,
+        overlay: Option<OverlayRenderFrame<'_>>,
+        danmaku: Option<DanmakuRenderFrame<'_>>,
+    ) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            self.inner
+                .render_video_frame_with_context(frame, overlay, danmaku)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (frame, overlay, danmaku);
             Err(PlayerError::Renderer(
                 "Metal renderer is only available on macOS for v0".to_string(),
             ))
@@ -470,7 +506,6 @@ fn inspect_overlay_frame(frame: &OverlayFrame) -> Result<PreparedOverlayFrameInf
         subtitle_planes: frame.subtitle_planes.len() + frame.subtitle_alpha_planes.len(),
         subtitle_pixels,
         subtitle_bytes,
-        danmaku_boxes: frame.danmaku_boxes.len(),
     })
 }
 
@@ -543,20 +578,26 @@ impl RendererBackend for MetalRenderer {
     fn upload_player_frame(&mut self, frame: &PlayerVideoFrame) -> Result<()> {
         let imported = self.import_player_frame(&frame.frame)?;
         self.current_frame = Some(imported);
+        self.current_media_time = frame.pts.unwrap_or(frame.media_time);
+        self.current_generation = frame.generation.max(1);
         Ok(())
     }
 
-    fn render_current_frame(&mut self, overlay: Option<&OverlayFrame>) -> Result<bool> {
+    fn render_current_frame(&mut self, context: RenderFrameContext<'_>) -> Result<bool> {
         let Some(frame) = self.current_frame.take() else {
             return Ok(false);
         };
-        let result = match overlay {
-            Some(overlay) => self.render_video_frame_with_overlay(
-                VideoRenderFrame::new(&frame),
-                OverlayRenderFrame::new(overlay),
-            ),
-            None => self.render_video_frame(VideoRenderFrame::new(&frame)),
-        };
+        let danmaku = context.danmaku.filter(|plan| {
+            plan.generation == context.generation
+                && plan.media_time == context.media_time
+                && (context.output_width == 0 || plan.viewport.width == context.output_width)
+                && (context.output_height == 0 || plan.viewport.height == context.output_height)
+        });
+        let result = self.render_video_frame_with_context(
+            VideoRenderFrame::new(&frame),
+            context.overlay.map(OverlayRenderFrame::new),
+            danmaku.map(DanmakuRenderFrame::new),
+        );
         self.current_frame = Some(frame);
         result.map(|()| true)
     }
@@ -567,7 +608,6 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::danmaku::DanmakuLayoutBox;
     use crate::overlay::OverlayViewport;
     use crate::renderer::pipeline::{MatrixCoefficients, SourceColorState};
     use crate::subtitle::SubtitleBitmapPlane;
@@ -596,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn inspect_overlay_counts_subtitle_bytes_and_danmaku_boxes() {
+    fn inspect_overlay_counts_subtitle_bytes() {
         let frame = OverlayFrame {
             pts: Duration::from_secs(1),
             viewport: OverlayViewport::new(640, 360),
@@ -609,16 +649,6 @@ mod tests {
             }],
             subtitle_alpha_planes: Vec::new(),
             subtitle_changed: true,
-            danmaku_boxes: vec![DanmakuLayoutBox {
-                item_id: 1,
-                text: "danmaku".to_string(),
-                x: 12.0,
-                y: 24.0,
-                width: 80.0,
-                height: 24.0,
-                font_size: 24.0,
-                color_rgba: [1.0, 1.0, 1.0, 1.0],
-            }],
         };
 
         let info = inspect_overlay_frame(&frame).unwrap();
@@ -628,7 +658,6 @@ mod tests {
         assert_eq!(info.subtitle_planes, 1);
         assert_eq!(info.subtitle_pixels, 40);
         assert_eq!(info.subtitle_bytes, 160);
-        assert_eq!(info.danmaku_boxes, 1);
     }
 
     #[test]
@@ -644,7 +673,6 @@ mod tests {
                 vec![255; 8],
             )],
             subtitle_changed: true,
-            danmaku_boxes: Vec::new(),
         };
 
         let info = inspect_overlay_frame(&frame).unwrap();
@@ -667,7 +695,6 @@ mod tests {
                 vec![255; 7],
             )],
             subtitle_changed: true,
-            danmaku_boxes: Vec::new(),
         };
 
         assert!(inspect_overlay_frame(&frame).is_err());
@@ -687,7 +714,6 @@ mod tests {
             }],
             subtitle_alpha_planes: Vec::new(),
             subtitle_changed: true,
-            danmaku_boxes: Vec::new(),
         };
 
         assert!(inspect_overlay_frame(&frame).is_err());

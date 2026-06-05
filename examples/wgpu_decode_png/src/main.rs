@@ -89,7 +89,9 @@ fn render_frame(renderer: &mut WgpuRenderer, frame: Frame, out: &str) {
         "frame {}x{} pix_fmt={} primaries={:?} transfer={:?}",
         frame.width(),
         frame.height(),
-        frame.pixel_format().unwrap_or_else(|| "unknown".to_string()),
+        frame
+            .pixel_format()
+            .unwrap_or_else(|| "unknown".to_string()),
         frame.color_primaries(),
         frame.transfer_function(),
     );
@@ -98,6 +100,7 @@ fn render_frame(renderer: &mut WgpuRenderer, frame: Frame, out: &str) {
         pts,
         media_time: pts.unwrap_or_default(),
         late_by: None,
+        generation: 1,
     };
     renderer
         .upload_player_frame(&player_frame)

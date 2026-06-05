@@ -1,0 +1,32 @@
+{
+  "comments": [
+    {
+      "id": 1,
+      "time": 0.2,
+      "content": "scroll sync",
+      "type": "scroll",
+      "color": "#ffffff"
+    },
+    {
+      "id": 2,
+      "time": 1.6,
+      "content": "seek target",
+      "type": "scroll",
+      "color": "rgb(255,220,0)"
+    },
+    {
+      "id": 3,
+      "time": 2.0,
+      "content": "top fixed",
+      "type": "top",
+      "color": 16733525
+    },
+    {
+      "id": 4,
+      "time": 2.4,
+      "content": "bottom fixed",
+      "type": "bottom",
+      "color": "#50b4ff"
+    }
+  ]
+}

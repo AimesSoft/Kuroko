@@ -86,6 +86,37 @@ typedef struct KurokoPresenterConfig {
   float edr_headroom;
 } KurokoPresenterConfig;
 
+typedef struct KurokoDanmakuConfig {
+  bool enabled;
+  float font_size;
+  float opacity;
+  float display_area;
+  float scroll_duration_seconds;
+  float scroll_speed_factor;
+  float track_gap_ratio;
+  float outline_width;
+  float shadow_offset_x;
+  float shadow_offset_y;
+  bool merge_duplicates;
+  bool allow_stacking;
+  bool allow_scroll_overwrite;
+  uint32_t max_quantity;
+  uint32_t max_lines_per_mode;
+  bool block_top;
+  bool block_bottom;
+  bool block_scroll;
+  int32_t shadow_style;
+} KurokoDanmakuConfig;
+
+typedef struct KurokoDanmakuTrackInfo {
+  uint64_t id;
+  bool enabled;
+  int64_t offset_micros;
+  uintptr_t item_count;
+  char *name;
+  char *source;
+} KurokoDanmakuTrackInfo;
+
 typedef struct KurokoVideoParams {
   uint32_t width;
   uint32_t height;
@@ -133,6 +164,8 @@ typedef struct KurokoPresenterStats {
   uint64_t rendered_test_frames;
   uint64_t pushed_audio_frames;
   uint64_t overlay_frames;
+  uint64_t danmaku_frames;
+  uint64_t danmaku_items;
   uint64_t import_failures;
   uint64_t render_failures;
   uint64_t audio_failures;
@@ -163,6 +196,7 @@ KurokoStatus kuroko_tracks(
     uintptr_t capacity,
     uintptr_t *out_len);
 void kuroko_track_info_free(KurokoTrackInfo *track);
+void kuroko_danmaku_track_info_free(KurokoDanmakuTrackInfo *track);
 KurokoStatus kuroko_state(KurokoHandle *handle, KurokoState *out_state);
 KurokoStatus kuroko_poll_event(KurokoHandle *handle, KurokoEvent *out_event);
 
@@ -205,6 +239,7 @@ KurokoStatus kuroko_presenter_pause(KurokoPresenterHandle *handle);
 KurokoStatus kuroko_presenter_stop(KurokoPresenterHandle *handle);
 KurokoStatus kuroko_presenter_close(KurokoPresenterHandle *handle);
 KurokoStatus kuroko_presenter_seek(KurokoPresenterHandle *handle, uint64_t position_micros);
+KurokoStatus kuroko_presenter_set_playback_rate(KurokoPresenterHandle *handle, double rate);
 KurokoStatus kuroko_presenter_add_external_subtitle(
     KurokoPresenterHandle *handle,
     const char *uri,
@@ -218,6 +253,60 @@ KurokoStatus kuroko_presenter_select_audio_track(
 KurokoStatus kuroko_presenter_select_subtitle_track(
     KurokoPresenterHandle *handle,
     int64_t track_id);
+KurokoStatus kuroko_presenter_load_danmaku_file(
+    KurokoPresenterHandle *handle,
+    const char *uri);
+KurokoStatus kuroko_presenter_load_danmaku_json(
+    KurokoPresenterHandle *handle,
+    const char *json);
+KurokoStatus kuroko_presenter_add_danmaku_track_file(
+    KurokoPresenterHandle *handle,
+    const char *uri,
+    const char *name,
+    int64_t offset_micros,
+    uint64_t *out_track_id);
+KurokoStatus kuroko_presenter_add_danmaku_track_json(
+    KurokoPresenterHandle *handle,
+    const char *json,
+    const char *name,
+    int64_t offset_micros,
+    uint64_t *out_track_id);
+KurokoStatus kuroko_presenter_remove_danmaku_track(
+    KurokoPresenterHandle *handle,
+    uint64_t track_id);
+KurokoStatus kuroko_presenter_set_danmaku_track_enabled(
+    KurokoPresenterHandle *handle,
+    uint64_t track_id,
+    bool enabled);
+KurokoStatus kuroko_presenter_set_danmaku_track_offset(
+    KurokoPresenterHandle *handle,
+    uint64_t track_id,
+    int64_t offset_micros);
+KurokoStatus kuroko_presenter_set_danmaku_global_offset(
+    KurokoPresenterHandle *handle,
+    int64_t offset_micros);
+KurokoStatus kuroko_presenter_danmaku_tracks(
+    KurokoPresenterHandle *handle,
+    KurokoDanmakuTrackInfo *out_tracks,
+    uintptr_t capacity,
+    uintptr_t *out_len);
+KurokoStatus kuroko_presenter_clear_danmaku(KurokoPresenterHandle *handle);
+KurokoStatus kuroko_presenter_set_danmaku_enabled(
+    KurokoPresenterHandle *handle,
+    bool enabled);
+KurokoStatus kuroko_presenter_set_danmaku_config(
+    KurokoPresenterHandle *handle,
+    KurokoDanmakuConfig config);
+KurokoStatus kuroko_presenter_set_danmaku_config_ptr(
+    KurokoPresenterHandle *handle,
+    const KurokoDanmakuConfig *config);
+KurokoStatus kuroko_presenter_set_danmaku_font(
+    KurokoPresenterHandle *handle,
+    const char *family,
+    const char *file_path);
+KurokoStatus kuroko_presenter_set_danmaku_block_words_json(
+    KurokoPresenterHandle *handle,
+    const char *json);
 KurokoStatus kuroko_presenter_track_selection(
     KurokoPresenterHandle *handle,
     KurokoTrackSelection *out_selection);

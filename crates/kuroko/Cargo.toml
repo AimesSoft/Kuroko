@@ -13,15 +13,24 @@ libass = []
 wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [dependencies]
+ab_glyph.workspace = true
+aho-corasick.workspace = true
 crossbeam-channel.workspace = true
+fontdb.workspace = true
 libc.workspace = true
 kuroko_ffmpeg_sys = { path = "../kuroko_ffmpeg_sys" }
 objc2.workspace = true
 objc2-core-foundation.workspace = true
+objc2-core-graphics = { workspace = true, features = ["CGColorSpace"] }
 objc2-core-video.workspace = true
 objc2-foundation.workspace = true
 objc2-metal.workspace = true
 objc2-quartz-core.workspace = true
+regex.workspace = true
+rustc-hash.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smallvec.workspace = true
 thiserror.workspace = true
 ureq.workspace = true
 wgpu = { version = "29.0.3", optional = true }

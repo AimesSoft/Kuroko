@@ -12,3 +12,4 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 [dependencies]
 crossbeam-channel.workspace = true
 kuroko = { path = "../kuroko" }
+serde_json.workspace = true

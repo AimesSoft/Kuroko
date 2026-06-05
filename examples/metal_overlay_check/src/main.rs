@@ -50,7 +50,6 @@ fn run_check(layer: *mut c_void) -> Result<(), String> {
         }],
         subtitle_alpha_planes: Vec::new(),
         subtitle_changed: true,
-        danmaku_boxes: Vec::new(),
     };
     let info = renderer
         .prepare_overlay_frame(OverlayRenderFrame::new(&overlay))

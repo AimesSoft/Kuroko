@@ -9,13 +9,12 @@ use kuroko::danmaku::{DanmakuItem, DanmakuMode, DanmakuTimeline};
 use kuroko::overlay::OverlayTimeline;
 use kuroko::presenter::{PresenterConfig, PresenterRuntime};
 use kuroko::renderer::metal::{MetalOutputMode, MetalRendererConfig};
-#[cfg(feature = "libass")]
-use kuroko::subtitle::LibassRenderConfig;
 use kuroko::subtitle::{SubtitleCue, SubtitleTimeline};
 use kuroko::{MediaRequest, MetalSurfaceHandle, PlatformSurface};
 
 static MEDIA_URI: OnceLock<String> = OnceLock::new();
 static SUBTITLE_PATH: OnceLock<String> = OnceLock::new();
+static DANMAKU_PATH: OnceLock<String> = OnceLock::new();
 static SMOKE_SECONDS: OnceLock<f64> = OnceLock::new();
 static EDR_HEADROOM: OnceLock<f32> = OnceLock::new();
 
@@ -39,6 +38,7 @@ impl DemoState {
             presenter: PresenterRuntime::new(PresenterConfig {
                 renderer: demo_renderer_config(),
                 overlay: demo_overlay_timeline(),
+                danmaku: Some(demo_danmaku_timeline()),
                 ..PresenterConfig::default()
             })?,
             load_attempted: false,
@@ -85,6 +85,26 @@ impl DemoState {
             Err(error) => eprintln!("Kuroko demo render failed: {error}"),
         }
     }
+
+    fn toggle_play_pause(&mut self) {
+        let result = if self.presenter.is_playing() {
+            self.presenter.pause()
+        } else {
+            self.presenter.play()
+        };
+        if let Err(error) = result {
+            eprintln!("Kuroko demo play/pause failed: {error}");
+        }
+    }
+
+    fn seek_seconds(&mut self, seconds: f64) {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return;
+        }
+        if let Err(error) = self.presenter.seek(Duration::from_secs_f64(seconds)) {
+            eprintln!("Kuroko demo seek failed: {error}");
+        }
+    }
 }
 
 fn demo_renderer_config() -> MetalRendererConfig {
@@ -102,34 +122,32 @@ fn demo_overlay_timeline() -> OverlayTimeline {
         end: Duration::from_secs(4),
         text: "Kuroko native overlay".to_string(),
     }]);
-    let timeline = OverlayTimeline::default().with_subtitles(subtitles);
-    #[cfg(feature = "libass")]
-    {
-        let danmaku = demo_danmaku_timeline();
-        let fallback = timeline.clone().with_danmaku(danmaku.clone());
-        timeline
-            .with_ass_danmaku(danmaku, LibassRenderConfig::default())
-            .unwrap_or_else(|error| {
-                eprintln!("Kuroko demo libass danmaku setup failed: {error}");
-                fallback
-            })
-    }
-    #[cfg(not(feature = "libass"))]
-    {
-        timeline.with_danmaku(demo_danmaku_timeline())
-    }
+    OverlayTimeline::default().with_subtitles(subtitles)
 }
 
 fn demo_danmaku_timeline() -> DanmakuTimeline {
+    if let Some(path) = DANMAKU_PATH.get() {
+        match DanmakuTimeline::from_file(path) {
+            Ok(timeline) => {
+                eprintln!("Kuroko demo loaded danmaku file: {path}");
+                return timeline;
+            }
+            Err(error) => eprintln!("Kuroko demo danmaku load failed: {error}"),
+        }
+    }
     let mut danmaku = DanmakuTimeline::default();
-    danmaku.push(DanmakuItem {
-        id: 1,
-        pts: Duration::from_secs(1),
-        text: "Rust danmaku timeline".to_string(),
-        mode: DanmakuMode::Scroll,
-        font_size: 32.0,
-        color_rgba: [1.0, 1.0, 1.0, 1.0],
-    });
+    danmaku
+        .push(DanmakuItem {
+            id: 1,
+            pts: Duration::from_secs(1),
+            text: "Rust danmaku timeline".to_string(),
+            mode: DanmakuMode::Scroll,
+            font_size: 32.0,
+            color: kuroko::danmaku::DanmakuColor::WHITE,
+            opacity: 1.0,
+            is_self: false,
+        })
+        .expect("demo danmaku item is valid");
     danmaku
 }
 
@@ -168,6 +186,37 @@ pub extern "C" fn kuroko_demo_render_frame(time_seconds: f64) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn kuroko_demo_toggle_play_pause() {
+    DEMO.with(|demo| demo.borrow_mut().toggle_play_pause());
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn kuroko_demo_seek_seconds(seconds: f64) {
+    DEMO.with(|demo| demo.borrow_mut().seek_seconds(seconds));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn kuroko_demo_position_seconds() -> f64 {
+    DEMO.with(|demo| demo.borrow().presenter.media_time().as_secs_f64())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn kuroko_demo_duration_seconds() -> f64 {
+    DEMO.with(|demo| {
+        demo.borrow()
+            .presenter
+            .duration()
+            .map(|duration| duration.as_secs_f64())
+            .unwrap_or(0.0)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn kuroko_demo_is_playing() -> bool {
+    DEMO.with(|demo| demo.borrow().presenter.is_playing())
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn kuroko_demo_smoke_seconds() -> f64 {
     SMOKE_SECONDS.get().copied().unwrap_or(0.0)
 }
@@ -177,12 +226,15 @@ fn main() {
     let options = parse_args(&args).unwrap_or_else(|error| {
         eprintln!("{error}");
         eprintln!(
-            "usage: cargo run -p macos_native_demo -- [--edr [HEADROOM]] [--smoke-seconds N] [--subtitle PATH] [--ass-subtitle PATH] [media-path-or-uri]"
+            "usage: cargo run -p macos_native_demo -- [--edr [HEADROOM]] [--smoke-seconds N] [--subtitle PATH] [--ass-subtitle PATH] [--danmaku PATH] [media-path-or-uri]"
         );
         process::exit(2);
     });
     if let Some(path) = options.subtitle_path {
         SUBTITLE_PATH.set(path).expect("subtitle path is set once");
+    }
+    if let Some(path) = options.danmaku_path {
+        DANMAKU_PATH.set(path).expect("danmaku path is set once");
     }
 
     if let Some(headroom) = options.edr_headroom {
@@ -209,6 +261,7 @@ struct DemoOptions {
     smoke_seconds: Option<f64>,
     edr_headroom: Option<f32>,
     subtitle_path: Option<String>,
+    danmaku_path: Option<String>,
 }
 
 fn parse_args(args: &[String]) -> Result<DemoOptions, String> {
@@ -216,6 +269,7 @@ fn parse_args(args: &[String]) -> Result<DemoOptions, String> {
     let mut smoke_seconds = None;
     let mut edr_headroom = None;
     let mut subtitle_path = None;
+    let mut danmaku_path = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -256,6 +310,15 @@ fn parse_args(args: &[String]) -> Result<DemoOptions, String> {
                     return Err("subtitle path was provided more than once".to_string());
                 }
             }
+            "--danmaku" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("--danmaku requires a path".to_string());
+                };
+                if danmaku_path.replace(value.to_string()).is_some() {
+                    return Err("danmaku path was provided more than once".to_string());
+                }
+            }
             "--" => {
                 index += 1;
                 if index >= args.len() {
@@ -282,6 +345,7 @@ fn parse_args(args: &[String]) -> Result<DemoOptions, String> {
         smoke_seconds,
         edr_headroom,
         subtitle_path,
+        danmaku_path,
     })
 }
 
@@ -303,6 +367,7 @@ mod tests {
         assert_eq!(options.smoke_seconds, Some(1.5));
         assert_eq!(options.edr_headroom, None);
         assert_eq!(options.subtitle_path, None);
+        assert_eq!(options.danmaku_path, None);
     }
 
     #[test]
@@ -367,6 +432,20 @@ mod tests {
         let options = parse_args(&args).unwrap();
 
         assert_eq!(options.subtitle_path.as_deref(), Some("/tmp/subs.ass"));
+        assert_eq!(options.media_uri.as_deref(), Some("/tmp/movie.mp4"));
+    }
+
+    #[test]
+    fn parse_args_accepts_danmaku_path() {
+        let args = vec![
+            "--danmaku".to_string(),
+            "/tmp/danmaku.json".to_string(),
+            "/tmp/movie.mp4".to_string(),
+        ];
+
+        let options = parse_args(&args).unwrap();
+
+        assert_eq!(options.danmaku_path.as_deref(), Some("/tmp/danmaku.json"));
         assert_eq!(options.media_uri.as_deref(), Some("/tmp/movie.mp4"));
     }
 }

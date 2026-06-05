@@ -8,6 +8,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounde
 use thiserror::Error;
 
 use crate::audio::AudioClockSnapshot;
+use crate::danmaku::DanmakuRenderPlan;
 use crate::ffmpeg::{Frame, PcmAudioFrame};
 use crate::overlay::OverlayFrame;
 use crate::playback::{PlaybackRunState, PlaybackSessionConfig, VideoPlaybackEngine};
@@ -232,6 +233,7 @@ pub struct PlayerVideoFrame {
     pub pts: Option<Duration>,
     pub media_time: Duration,
     pub late_by: Option<Duration>,
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -245,6 +247,46 @@ pub struct PlayerSubtitleFrame {
     pub pts: Option<Duration>,
     pub media_time: Duration,
     pub late_by: Option<Duration>,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RenderFrameContext<'a> {
+    pub media_time: Duration,
+    pub generation: u64,
+    pub overlay: Option<&'a OverlayFrame>,
+    pub danmaku: Option<&'a DanmakuRenderPlan>,
+    pub output_width: u32,
+    pub output_height: u32,
+}
+
+impl<'a> RenderFrameContext<'a> {
+    pub fn new(media_time: Duration, generation: u64) -> Self {
+        Self {
+            media_time,
+            generation,
+            overlay: None,
+            danmaku: None,
+            output_width: 0,
+            output_height: 0,
+        }
+    }
+
+    pub fn overlay(mut self, overlay: Option<&'a OverlayFrame>) -> Self {
+        self.overlay = overlay;
+        self
+    }
+
+    pub fn danmaku(mut self, danmaku: Option<&'a DanmakuRenderPlan>) -> Self {
+        self.danmaku = danmaku;
+        self
+    }
+
+    pub fn output_size(mut self, width: u32, height: u32) -> Self {
+        self.output_width = width;
+        self.output_height = height;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -368,13 +410,16 @@ pub trait RendererBackend {
     /// Render the current frame (optionally compositing `overlay`) to the attached
     /// surface. Returns `false` if there is no current frame to draw, letting the
     /// caller fall back to a test frame.
-    fn render_current_frame(&mut self, overlay: Option<&OverlayFrame>) -> Result<bool>;
+    fn render_current_frame(&mut self, context: RenderFrameContext<'_>) -> Result<bool>;
 }
 
 struct PlayerInner {
     state: PlayerState,
     media: Option<MediaRequest>,
     playback: Option<PlaybackRuntime>,
+    duration: Option<Duration>,
+    current_media_time: Duration,
+    playback_generation: u64,
     surface: Option<PlatformSurface>,
     tracks: Vec<TrackInfo>,
     track_selection: TrackSelection,
@@ -388,6 +433,7 @@ enum PlaybackCommand {
     Play,
     Pause,
     Seek(Duration),
+    SetPlaybackRate(f64),
     Stop,
     AudioClock(AudioClockSnapshot),
     AddExternalSubtitle(SubtitleTrackConfig),
@@ -449,6 +495,9 @@ impl Player {
                 state: PlayerState::Idle,
                 media: None,
                 playback: None,
+                duration: None,
+                current_media_time: Duration::ZERO,
+                playback_generation: 1,
                 surface: None,
                 tracks: Vec::new(),
                 track_selection: TrackSelection::default(),
@@ -470,6 +519,25 @@ impl Player {
 
     pub fn state(&self) -> PlayerState {
         self.inner.lock().expect("player mutex poisoned").state
+    }
+
+    pub fn current_media_time(&self) -> Duration {
+        self.inner
+            .lock()
+            .expect("player mutex poisoned")
+            .current_media_time
+    }
+
+    pub fn duration(&self) -> Option<Duration> {
+        self.inner.lock().expect("player mutex poisoned").duration
+    }
+
+    pub fn playback_generation(&self) -> u64 {
+        self.inner
+            .lock()
+            .expect("player mutex poisoned")
+            .playback_generation
+            .max(1)
     }
 
     pub fn subscribe(&self) -> Receiver<PlayerEvent> {
@@ -535,6 +603,9 @@ impl Player {
             let mut inner = self.inner.lock().expect("player mutex poisoned");
             inner.media = Some(media);
             inner.playback = Some(runtime);
+            inner.duration = info.duration;
+            inner.current_media_time = Duration::ZERO;
+            inner.playback_generation = 1;
             inner.tracks = info.tracks.clone();
             inner.track_selection = info.track_selection();
         }
@@ -577,9 +648,37 @@ impl Player {
 
     pub fn seek(&self, position: Duration) -> Result<()> {
         self.ensure_not_closed()?;
-        self.send_playback_command(PlaybackCommand::Seek(position))?;
+        let (previous_media_time, previous_generation, next_generation) = {
+            let mut inner = self.inner.lock().expect("player mutex poisoned");
+            let previous_media_time = inner.current_media_time;
+            let previous_generation = inner.playback_generation;
+            inner.current_media_time = position;
+            inner.playback_generation = inner.playback_generation.saturating_add(1).max(1);
+            (
+                previous_media_time,
+                previous_generation,
+                inner.playback_generation,
+            )
+        };
+        let result = self.send_playback_command(PlaybackCommand::Seek(position));
+        if result.is_err() {
+            let mut inner = self.inner.lock().expect("player mutex poisoned");
+            inner.current_media_time = previous_media_time;
+            inner.playback_generation = previous_generation;
+        }
+        result?;
+        {
+            let mut inner = self.inner.lock().expect("player mutex poisoned");
+            inner.current_media_time = position;
+            inner.playback_generation = inner.playback_generation.max(next_generation);
+        }
         self.emit(PlayerEvent::PositionChanged(position));
         Ok(())
+    }
+
+    pub fn set_playback_rate(&self, rate: f64) -> Result<()> {
+        self.ensure_not_closed()?;
+        self.send_playback_command(PlaybackCommand::SetPlaybackRate(rate))
     }
 
     pub fn add_external_subtitle(&self, uri: impl Into<String>) -> Result<SubtitleTrackConfig> {
@@ -624,6 +723,11 @@ impl Player {
     pub fn stop(&self) -> Result<()> {
         self.ensure_not_closed()?;
         self.send_playback_command(PlaybackCommand::Stop)?;
+        {
+            let mut inner = self.inner.lock().expect("player mutex poisoned");
+            inner.current_media_time = Duration::ZERO;
+            inner.playback_generation = inner.playback_generation.saturating_add(1).max(1);
+        }
         self.emit(PlayerEvent::PositionChanged(Duration::ZERO));
         self.transition(PlayerState::Stopped)
     }
@@ -646,6 +750,9 @@ impl Player {
             inner.media = None;
             inner.tracks.clear();
             inner.track_selection = TrackSelection::default();
+            inner.duration = None;
+            inner.current_media_time = Duration::ZERO;
+            inner.playback_generation = inner.playback_generation.saturating_add(1).max(1);
         }
         self.transition(PlayerState::Closed)
     }
@@ -730,10 +837,11 @@ fn run_playback_worker(
     commands: Receiver<PlaybackCommand>,
 ) {
     let mut last_position_event = None;
+    let mut playback_generation = 1u64;
     loop {
         match commands.recv_timeout(playback_poll_interval(engine.state())) {
             Ok(command) => {
-                if !handle_playback_command(engine, &inner, command) {
+                if !handle_playback_command(engine, &inner, command, &mut playback_generation) {
                     return;
                 }
             }
@@ -742,10 +850,12 @@ fn run_playback_worker(
         }
 
         while let Ok(command) = commands.try_recv() {
-            if !handle_playback_command(engine, &inner, command) {
+            if !handle_playback_command(engine, &inner, command, &mut playback_generation) {
                 return;
             }
         }
+
+        sync_playback_clock_from_worker(engine, &inner, playback_generation);
 
         match engine.tick() {
             Ok(Some(frame)) => {
@@ -758,6 +868,7 @@ fn run_playback_worker(
                         pts: frame.pts,
                         media_time: frame.media_time,
                         late_by: frame.late_by,
+                        generation: playback_generation,
                     },
                 );
             }
@@ -770,6 +881,8 @@ fn run_playback_worker(
                 set_state_from_worker(&inner, PlayerState::Error);
             }
         }
+
+        sync_playback_clock_from_worker(engine, &inner, playback_generation);
 
         if engine.state() == PlaybackRunState::Playing {
             match engine.tick_audio() {
@@ -794,6 +907,7 @@ fn run_playback_worker(
                         pts: frame.pts,
                         media_time: frame.media_time,
                         late_by: frame.late_by,
+                        generation: playback_generation,
                     },
                 ),
                 Ok(None) => {}
@@ -806,6 +920,8 @@ fn run_playback_worker(
                 }
             }
         }
+
+        sync_playback_clock_from_worker(engine, &inner, playback_generation);
 
         if engine.state() == PlaybackRunState::Ended {
             set_state_from_worker(&inner, PlayerState::Stopped);
@@ -821,6 +937,7 @@ fn handle_playback_command(
     engine: &mut VideoPlaybackEngine,
     inner: &Arc<Mutex<PlayerInner>>,
     command: PlaybackCommand,
+    playback_generation: &mut u64,
 ) -> bool {
     match command {
         PlaybackCommand::Play => engine.play(),
@@ -832,10 +949,16 @@ fn handle_playback_command(
                     PlayerEvent::Error(PlayerError::Playback(error.to_string())),
                 );
                 set_state_from_worker(inner, PlayerState::Error);
+            } else {
+                *playback_generation = playback_generation.saturating_add(1).max(1);
             }
+        }
+        PlaybackCommand::SetPlaybackRate(rate) => {
+            engine.set_playback_rate(rate);
         }
         PlaybackCommand::Stop => {
             engine.stop();
+            *playback_generation = playback_generation.saturating_add(1).max(1);
         }
         PlaybackCommand::AudioClock(snapshot) => {
             let _ = engine.sync_to_audio_clock(snapshot);
@@ -843,6 +966,7 @@ fn handle_playback_command(
         PlaybackCommand::AddExternalSubtitle(config) => {
             match engine.add_external_subtitle(config) {
                 Ok((_, clear_frame)) => {
+                    *playback_generation = playback_generation.saturating_add(1).max(1);
                     if let Some(frame) = clear_frame {
                         emit_subtitle_frame_from_worker(
                             inner,
@@ -851,6 +975,7 @@ fn handle_playback_command(
                                 pts: frame.pts,
                                 media_time: frame.media_time,
                                 late_by: frame.late_by,
+                                generation: *playback_generation,
                             },
                         );
                     }
@@ -865,6 +990,7 @@ fn handle_playback_command(
         PlaybackCommand::RemoveSubtitleTrack(track_id) => {
             match engine.remove_subtitle_track(track_id) {
                 Ok(Some(frame)) => {
+                    *playback_generation = playback_generation.saturating_add(1).max(1);
                     emit_subtitle_frame_from_worker(
                         inner,
                         PlayerSubtitleFrame {
@@ -872,6 +998,7 @@ fn handle_playback_command(
                             pts: frame.pts,
                             media_time: frame.media_time,
                             late_by: frame.late_by,
+                            generation: *playback_generation,
                         },
                     );
                     sync_track_state_from_worker(inner, engine);
@@ -884,7 +1011,10 @@ fn handle_playback_command(
             }
         }
         PlaybackCommand::SelectAudioTrack(track_id) => match engine.select_audio_track(track_id) {
-            Ok(()) => sync_track_state_from_worker(inner, engine),
+            Ok(()) => {
+                *playback_generation = playback_generation.saturating_add(1).max(1);
+                sync_track_state_from_worker(inner, engine)
+            }
             Err(error) => emit_from_worker(
                 inner,
                 PlayerEvent::Error(PlayerError::Playback(error.to_string())),
@@ -893,6 +1023,7 @@ fn handle_playback_command(
         PlaybackCommand::SelectSubtitleTrack(track_id) => {
             match engine.select_subtitle_track(track_id) {
                 Ok(Some(frame)) => {
+                    *playback_generation = playback_generation.saturating_add(1).max(1);
                     emit_subtitle_frame_from_worker(
                         inner,
                         PlayerSubtitleFrame {
@@ -900,11 +1031,15 @@ fn handle_playback_command(
                             pts: frame.pts,
                             media_time: frame.media_time,
                             late_by: frame.late_by,
+                            generation: *playback_generation,
                         },
                     );
                     sync_track_state_from_worker(inner, engine);
                 }
-                Ok(None) => sync_track_state_from_worker(inner, engine),
+                Ok(None) => {
+                    *playback_generation = playback_generation.saturating_add(1).max(1);
+                    sync_track_state_from_worker(inner, engine)
+                }
                 Err(error) => emit_from_worker(
                     inner,
                     PlayerEvent::Error(PlayerError::Playback(error.to_string())),
@@ -934,6 +1069,17 @@ fn sync_track_state_from_worker(inner: &Arc<Mutex<PlayerInner>>, engine: &VideoP
     for event in events {
         emit_from_worker(inner, event);
     }
+}
+
+fn sync_playback_clock_from_worker(
+    engine: &VideoPlaybackEngine,
+    inner: &Arc<Mutex<PlayerInner>>,
+    playback_generation: u64,
+) {
+    let media_time = engine.media_time();
+    let mut inner = inner.lock().expect("player mutex poisoned");
+    inner.current_media_time = media_time;
+    inner.playback_generation = playback_generation.max(1);
 }
 
 fn playback_poll_interval(state: PlaybackRunState) -> Duration {
@@ -1090,6 +1236,7 @@ mod tests {
             pts: Some(Duration::ZERO),
             media_time: Duration::ZERO,
             late_by: None,
+            generation: 1,
         };
 
         emit_subtitle_frame_from_worker(&player.inner, frame);
@@ -1104,6 +1251,51 @@ mod tests {
 
         assert!(player.tracks().is_empty());
         assert_eq!(player.track_selection(), TrackSelection::default());
+    }
+
+    #[test]
+    fn player_seek_updates_shared_media_time_and_generation_immediately() {
+        let player = Player::new(PlayerConfig::default());
+        let receiver = {
+            let (commands, receiver) = bounded(1);
+            let mut inner = player.inner.lock().expect("player mutex poisoned");
+            inner.state = PlayerState::Ready;
+            inner.playback = Some(PlaybackRuntime {
+                commands,
+                worker: None,
+            });
+            receiver
+        };
+        let before_generation = player.playback_generation();
+
+        player.seek(Duration::from_secs(12)).unwrap();
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(PlaybackCommand::Seek(position)) if position == Duration::from_secs(12)
+        ));
+        assert_eq!(player.current_media_time(), Duration::from_secs(12));
+        assert!(player.playback_generation() > before_generation);
+    }
+
+    #[test]
+    fn failed_seek_does_not_leave_clock_generation_half_updated() {
+        let player = Player::new(PlayerConfig::default());
+        {
+            let mut inner = player.inner.lock().expect("player mutex poisoned");
+            inner.state = PlayerState::Ready;
+            let (commands, _receiver) = bounded(1);
+            inner.playback = Some(PlaybackRuntime {
+                commands,
+                worker: None,
+            });
+        }
+        let before_generation = player.playback_generation();
+
+        assert!(player.seek(Duration::from_secs(12)).is_err());
+
+        assert_eq!(player.current_media_time(), Duration::ZERO);
+        assert_eq!(player.playback_generation(), before_generation);
     }
 
     #[test]
