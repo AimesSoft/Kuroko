@@ -385,16 +385,21 @@ impl PresenterRuntime {
                     self.stats.decoded_video_frames += 1;
                     match self.renderer.upload_player_frame(&frame) {
                         Ok(()) => {
-                            let pts = frame.pts.unwrap_or(frame.media_time);
-                            self.current_media_time = pts;
+                            // A video frame only drives the on-screen picture,
+                            // the generation, and the danmaku viewport size.
+                            // The danmaku/subtitle query time is owned by the
+                            // audio master clock (see sync_media_time_from_player);
+                            // writing the discrete, lagging frame.pts back into it
+                            // makes scrolling danmaku jitter between the master
+                            // clock and the frame timestamp.
                             self.current_generation =
                                 frame.generation.max(self.danmaku_generation).max(1);
-                            self.update_overlay(
-                                pts,
-                                frame.generation,
-                                frame.frame.width() as usize,
-                                frame.frame.height() as usize,
+                            let frame_viewport = DanmakuViewport::new(
+                                (frame.frame.width() as usize).min(u32::MAX as usize) as u32,
+                                (frame.frame.height() as usize).min(u32::MAX as usize) as u32,
                             );
+                            self.current_danmaku_viewport =
+                                Some(self.current_output_viewport.unwrap_or(frame_viewport));
                         }
                         Err(error) => {
                             self.stats.import_failures += 1;
@@ -406,26 +411,6 @@ impl PresenterRuntime {
                 Err(crossbeam_channel::TryRecvError::Disconnected) => break,
             }
         }
-    }
-
-    fn update_overlay(&mut self, pts: Duration, generation: u64, width: usize, height: usize) {
-        let viewport = DanmakuViewport::new(
-            width.min(u32::MAX as usize) as u32,
-            height.min(u32::MAX as usize) as u32,
-        );
-        let mut overlay = self
-            .overlay
-            .render(pts, OverlayViewport::new(viewport.width, viewport.height));
-        self.subtitles.append_to_overlay(pts, &mut overlay);
-        if !overlay.is_empty() {
-            self.stats.overlay_frames += 1;
-        }
-        self.current_overlay = Some(overlay);
-        let generation = generation.max(self.danmaku_generation).max(1);
-        let danmaku_viewport = self.current_output_viewport.unwrap_or(viewport);
-        self.current_danmaku_viewport = Some(danmaku_viewport);
-        self.current_danmaku = Some(self.danmaku.render_plan(pts, danmaku_viewport, generation));
-        self.record_current_danmaku_stats();
     }
 
     fn record_current_danmaku_stats(&mut self) {
@@ -460,12 +445,21 @@ impl PresenterRuntime {
     fn sync_media_time_from_player(&mut self) {
         let player_time = self.player.current_media_time();
         let player_generation = self.player.playback_generation();
-        self.current_generation = self
+        let new_generation = self
             .current_generation
             .max(player_generation)
             .max(self.danmaku_generation)
             .max(1);
-        if player_time != self.current_media_time {
+        // A generation change marks a discontinuity (seek / track switch / stop):
+        // there the clock is allowed to jump to the new position. Within the same
+        // generation the danmaku/subtitle clock is kept monotonic, so a small
+        // backward correction of the audio master clock (A/V re-anchor) cannot make
+        // the whole screen of scrolling danmaku jump backwards.
+        let discontinuity = new_generation != self.current_generation;
+        self.current_generation = new_generation;
+        let should_update = player_time != self.current_media_time
+            && (discontinuity || player_time > self.current_media_time);
+        if should_update {
             self.current_media_time = player_time;
             if let Some(viewport) = self.current_danmaku_viewport {
                 let mut overlay = self.overlay.render(
@@ -473,6 +467,9 @@ impl PresenterRuntime {
                     OverlayViewport::new(viewport.width, viewport.height),
                 );
                 self.subtitles.append_to_overlay(player_time, &mut overlay);
+                if !overlay.is_empty() {
+                    self.stats.overlay_frames += 1;
+                }
                 self.current_overlay = Some(overlay);
             }
         }
