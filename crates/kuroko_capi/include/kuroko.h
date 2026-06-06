@@ -242,6 +242,7 @@ KurokoStatus kuroko_presenter_stop(KurokoPresenterHandle *handle);
 KurokoStatus kuroko_presenter_close(KurokoPresenterHandle *handle);
 KurokoStatus kuroko_presenter_seek(KurokoPresenterHandle *handle, uint64_t position_micros);
 KurokoStatus kuroko_presenter_set_playback_rate(KurokoPresenterHandle *handle, double rate);
+KurokoStatus kuroko_presenter_set_volume(KurokoPresenterHandle *handle, double volume);
 KurokoStatus kuroko_presenter_add_external_subtitle(
     KurokoPresenterHandle *handle,
     const char *uri,
@@ -302,6 +303,9 @@ KurokoStatus kuroko_presenter_set_danmaku_config(
 KurokoStatus kuroko_presenter_set_danmaku_config_ptr(
     KurokoPresenterHandle *handle,
     const KurokoDanmakuConfig *config);
+KurokoStatus kuroko_presenter_get_danmaku_config(
+    KurokoPresenterHandle *handle,
+    KurokoDanmakuConfig *out_config);
 KurokoStatus kuroko_presenter_set_danmaku_font(
     KurokoPresenterHandle *handle,
     const char *family,

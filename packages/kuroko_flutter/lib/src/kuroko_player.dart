@@ -127,6 +127,14 @@ class KurokoPlayer {
     });
   }
 
+  Future<void> setVolume(double volume) async {
+    final playerId = await ensureCreated();
+    await _invoke('setVolume', <String, Object?>{
+      'playerId': playerId,
+      'volume': volume.clamp(0.0, 1.0),
+    });
+  }
+
   Future<int> addExternalSubtitle(String uri) async {
     final playerId = await ensureCreated();
     final trackId = await _channel.invokeMethod<int>(

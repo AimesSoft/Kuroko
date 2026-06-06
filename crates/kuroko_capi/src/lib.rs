@@ -705,6 +705,30 @@ fn danmaku_config_from_c(
     }
 }
 
+fn danmaku_config_to_c(config: &DanmakuLayoutConfig) -> KurokoDanmakuConfig {
+    KurokoDanmakuConfig {
+        enabled: config.enabled,
+        font_size: config.font_size,
+        opacity: config.opacity,
+        display_area: config.display_area,
+        scroll_duration_seconds: config.scroll_duration_seconds,
+        scroll_speed_factor: config.scroll_speed_factor,
+        track_gap_ratio: config.track_gap_ratio,
+        outline_width: config.outline_width,
+        shadow_offset_x: config.shadow_offset[0],
+        shadow_offset_y: config.shadow_offset[1],
+        merge_duplicates: config.merge_duplicates,
+        allow_stacking: config.allow_stacking,
+        allow_scroll_overwrite: config.allow_scroll_overwrite,
+        max_quantity: config.max_quantity.unwrap_or(0),
+        max_lines_per_mode: config.max_lines_per_mode.unwrap_or(0),
+        block_top: config.block_top,
+        block_bottom: config.block_bottom,
+        block_scroll: config.block_scroll,
+        shadow_style: config.shadow_style.code(),
+    }
+}
+
 fn danmaku_block_words_from_json(json: &str) -> Result<Vec<String>, KurokoStatus> {
     let value: serde_json::Value =
         serde_json::from_str(json).map_err(|_| KurokoStatus::PlayerError)?;
@@ -812,6 +836,18 @@ pub unsafe extern "C" fn kuroko_presenter_set_playback_rate(
 ) -> KurokoStatus {
     with_presenter_mut(handle, |handle| {
         status_from_player_result(handle.presenter.set_playback_rate(rate))
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_set_volume(
+    handle: *mut KurokoPresenterHandle,
+    volume: f64,
+) -> KurokoStatus {
+    with_presenter_mut(handle, |handle| {
+        handle.presenter.set_volume(volume);
+        KurokoStatus::Ok
     })
 }
 
@@ -1143,6 +1179,28 @@ pub unsafe extern "C" fn kuroko_presenter_set_danmaku_config_ptr(
 
 #[cfg(target_os = "macos")]
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_get_danmaku_config(
+    handle: *mut KurokoPresenterHandle,
+    out_config: *mut KurokoDanmakuConfig,
+) -> KurokoStatus {
+    if out_config.is_null() {
+        return KurokoStatus::NullPointer;
+    }
+    with_presenter_mut(handle, |handle| {
+        let config = handle
+            .presenter
+            .danmaku_config()
+            .map(danmaku_config_to_c)
+            .unwrap_or_default();
+        unsafe {
+            *out_config = config;
+        }
+        KurokoStatus::Ok
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_set_danmaku_font(
     handle: *mut KurokoPresenterHandle,
     family: *const c_char,
@@ -1265,6 +1323,15 @@ pub unsafe extern "C" fn kuroko_presenter_tracks(
 pub unsafe extern "C" fn kuroko_presenter_set_playback_rate(
     _handle: *mut std::ffi::c_void,
     _rate: f64,
+) -> KurokoStatus {
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_set_volume(
+    _handle: *mut std::ffi::c_void,
+    _volume: f64,
 ) -> KurokoStatus {
     KurokoStatus::PlayerError
 }
@@ -1402,6 +1469,18 @@ pub unsafe extern "C" fn kuroko_presenter_set_danmaku_config_ptr(
     config: *const KurokoDanmakuConfig,
 ) -> KurokoStatus {
     if config.is_null() {
+        return KurokoStatus::NullPointer;
+    }
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(target_os = "macos"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_get_danmaku_config(
+    _handle: *mut std::ffi::c_void,
+    out_config: *mut KurokoDanmakuConfig,
+) -> KurokoStatus {
+    if out_config.is_null() {
         return KurokoStatus::NullPointer;
     }
     KurokoStatus::PlayerError
@@ -2013,6 +2092,27 @@ mod tests {
         );
         let handle = kuroko_presenter_create();
         assert!(!handle.is_null());
+        unsafe { kuroko_presenter_destroy(handle) };
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn c_presenter_set_volume_accepts_valid_handle() {
+        assert_eq!(
+            unsafe { kuroko_presenter_set_volume(std::ptr::null_mut(), 0.5) },
+            KurokoStatus::NullPointer
+        );
+
+        let handle = kuroko_presenter_create();
+        assert!(!handle.is_null());
+        assert_eq!(
+            unsafe { kuroko_presenter_set_volume(handle, 0.5) },
+            KurokoStatus::Ok
+        );
+        assert_eq!(
+            unsafe { kuroko_presenter_set_volume(handle, f64::NAN) },
+            KurokoStatus::Ok
+        );
         unsafe { kuroko_presenter_destroy(handle) };
     }
 
