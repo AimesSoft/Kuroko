@@ -12,8 +12,8 @@ use crate::renderer::pipeline::{
     ColorRange, HdrMetadata, MatrixCoefficients, SourceColorState, VideoRenderPipeline,
 };
 
-#[cfg(target_os = "macos")]
-mod macos;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+mod apple;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClearColor {
@@ -35,9 +35,9 @@ impl ClearColor {
 }
 
 pub struct MetalRenderer {
-    #[cfg(target_os = "macos")]
-    inner: macos::MetalRendererImpl,
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    inner: apple::MetalRendererImpl,
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     _unsupported: (),
     current_frame: Option<ImportedVideoFrame>,
     current_media_time: Duration,
@@ -155,9 +155,9 @@ pub struct ImportedVideoFrameInfo {
 pub struct ImportedVideoFrame {
     info: ImportedVideoFrameInfo,
     source_color: SourceColorState,
-    #[cfg(target_os = "macos")]
-    inner: Option<macos::ImportedVideoFrameTextures>,
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    inner: Option<apple::ImportedVideoFrameTextures>,
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     _unsupported: (),
 }
 
@@ -167,11 +167,11 @@ impl ImportedVideoFrame {
     }
 
     pub fn plane_count(&self) -> usize {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             self.inner.as_ref().map_or(0, |inner| inner.plane_count())
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
             0
         }
@@ -292,19 +292,19 @@ impl MetalRenderer {
     }
 
     pub fn with_config(config: MetalRendererConfig) -> Result<Self> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             Ok(Self {
-                inner: macos::MetalRendererImpl::new(config)?,
+                inner: apple::MetalRendererImpl::new(config)?,
                 current_frame: None,
                 current_media_time: Duration::ZERO,
                 current_generation: 1,
             })
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
             Err(PlayerError::Renderer(
-                "Metal renderer is only available on macOS for v0".to_string(),
+                "Metal renderer is only available on Apple platforms for v0".to_string(),
             ))
         }
     }
@@ -316,15 +316,15 @@ impl MetalRenderer {
         height: u32,
         scale: f64,
     ) -> Result<()> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             unsafe { self.inner.attach_raw_layer(layer, width, height, scale) }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
             let _ = (layer, width, height, scale);
             Err(PlayerError::Renderer(
-                "Metal renderer is only available on macOS for v0".to_string(),
+                "Metal renderer is only available on Apple platforms for v0".to_string(),
             ))
         }
     }
@@ -333,7 +333,7 @@ impl MetalRenderer {
         &mut self,
         source: VideoFrameTextureSource,
     ) -> Result<ImportedVideoFrame> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             let imported = unsafe { self.inner.import_video_frame_textures(source) }?;
             let source_color =
@@ -345,25 +345,25 @@ impl MetalRenderer {
                 inner: Some(imported.textures),
             })
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
             let _ = source;
             Err(PlayerError::Renderer(
-                "Metal renderer is only available on macOS for v0".to_string(),
+                "Metal renderer is only available on Apple platforms for v0".to_string(),
             ))
         }
     }
 
     pub fn render_video_frame(&mut self, frame: VideoRenderFrame<'_>) -> Result<()> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             self.inner.render_video_frame(frame)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
             let _ = frame;
             Err(PlayerError::Renderer(
-                "Metal renderer is only available on macOS for v0".to_string(),
+                "Metal renderer is only available on Apple platforms for v0".to_string(),
             ))
         }
     }
@@ -373,15 +373,15 @@ impl MetalRenderer {
         frame: VideoRenderFrame<'_>,
         overlay: OverlayRenderFrame<'_>,
     ) -> Result<()> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             self.inner.render_video_frame_with_overlay(frame, overlay)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
             let _ = (frame, overlay);
             Err(PlayerError::Renderer(
-                "Metal renderer is only available on macOS for v0".to_string(),
+                "Metal renderer is only available on Apple platforms for v0".to_string(),
             ))
         }
     }
@@ -392,30 +392,30 @@ impl MetalRenderer {
         overlay: Option<OverlayRenderFrame<'_>>,
         danmaku: Option<DanmakuRenderFrame<'_>>,
     ) -> Result<()> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             self.inner
                 .render_video_frame_with_context(frame, overlay, danmaku)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
             let _ = (frame, overlay, danmaku);
             Err(PlayerError::Renderer(
-                "Metal renderer is only available on macOS for v0".to_string(),
+                "Metal renderer is only available on Apple platforms for v0".to_string(),
             ))
         }
     }
 
     pub fn render_overlay_frame(&mut self, overlay: OverlayRenderFrame<'_>) -> Result<()> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             self.inner.render_overlay_frame(overlay)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
             let _ = overlay;
             Err(PlayerError::Renderer(
-                "Metal renderer is only available on macOS for v0".to_string(),
+                "Metal renderer is only available on Apple platforms for v0".to_string(),
             ))
         }
     }
@@ -425,7 +425,7 @@ impl MetalRenderer {
         frame: OverlayRenderFrame<'_>,
     ) -> Result<PreparedOverlayFrameInfo> {
         let info = inspect_overlay_frame(frame.frame)?;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             self.inner.record_prepared_overlay_frame(info);
         }
@@ -456,11 +456,11 @@ impl MetalRenderer {
     }
 
     pub fn stats(&self) -> MetalRendererStats {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             self.inner.stats()
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
             MetalRendererStats::default()
         }
@@ -542,7 +542,7 @@ impl RendererBackend for MetalRenderer {
     }
 
     fn detach_surface(&mut self) -> Result<()> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             self.inner.detach_surface();
         }
@@ -550,11 +550,11 @@ impl RendererBackend for MetalRenderer {
     }
 
     fn resize_surface(&mut self, width: u32, height: u32, scale: f64) -> Result<()> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             self.inner.resize_surface(width, height, scale);
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
             let _ = (width, height, scale);
         }
@@ -562,15 +562,15 @@ impl RendererBackend for MetalRenderer {
     }
 
     fn render_test_frame(&mut self, time_seconds: f64) -> Result<()> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             self.inner.render_clear(ClearColor::animated(time_seconds))
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
             let _ = time_seconds;
             Err(PlayerError::Renderer(
-                "Metal renderer is only available on macOS for v0".to_string(),
+                "Metal renderer is only available on Apple platforms for v0".to_string(),
             ))
         }
     }
@@ -628,9 +628,9 @@ mod tests {
                 planes: Vec::new(),
             },
             source_color,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             inner: None,
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             _unsupported: (),
         }
     }

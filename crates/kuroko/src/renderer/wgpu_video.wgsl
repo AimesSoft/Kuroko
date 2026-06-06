@@ -1,4 +1,4 @@
-// WGSL port of the Metal `VIDEO_SHADER_SOURCE` in `renderer/metal/macos.rs`.
+// WGSL port of the Metal `VIDEO_SHADER_SOURCE` in `renderer/metal/apple.rs`.
 // Kept line-for-line equivalent so the wgpu backend produces the same pixels as
 // the native Metal renderer for a given frame and color pipeline.
 
