@@ -9,6 +9,10 @@ fn main() {
     println!("cargo:rerun-if-env-changed=KUROKO_HARFBUZZ_DIR");
     println!("cargo:rerun-if-env-changed=KUROKO_FRIBIDI_DIR");
 
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("ios") {
+        println!("cargo:rustc-link-lib=framework=AudioToolbox");
+    }
+
     if env::var("CARGO_FEATURE_LIBASS").is_err() {
         return;
     }

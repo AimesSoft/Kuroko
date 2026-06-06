@@ -1199,7 +1199,7 @@ pub unsafe extern "C" fn kuroko_presenter_get_danmaku_config(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_set_danmaku_font(
     handle: *mut KurokoPresenterHandle,
@@ -1486,7 +1486,7 @@ pub unsafe extern "C" fn kuroko_presenter_get_danmaku_config(
     KurokoStatus::PlayerError
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_set_danmaku_font(
     _handle: *mut std::ffi::c_void,
