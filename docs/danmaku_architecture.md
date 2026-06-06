@@ -131,6 +131,8 @@ renderer 会 gate 掉不匹配的弹幕 plan。Metal 和 WGPU 都要求 plan 的
 
 DFM+ 的碰撞结果依赖文本宽高。如果测量和实际绘制使用不同字体指标，轨道分配就会和最终画面不一致。因此 Kuroko 当前把 `DanmakuTextRasterizer` 放在 layout engine 内部：prepare 阶段会用同一套字体测量文本，render plan 阶段也用同一套 glyph rasterization / atlas 数据。
 
+字号语义现在分成两层。弹幕源文件里的 `size` / XML 第三段仍按 B 站默认 `25` 作为相对基准；播放器和 Flutter wrapper 传入的 `KurokoDanmakuConfig.font_size` 则按 NipaPlay/Flutter 逻辑字号解释，桌面默认是 `30`。Kuroko 默认嵌入并优先使用 NipaPlay 的 `Droid Sans Fallback` 弹幕字体，然后只按 surface backing scale 把逻辑字号转换到 glyph atlas 的物理像素。调用方不需要、也不应该再额外乘任何 renderer 补偿比例。
+
 Kuroko 的 render plan 不把整张弹幕文本当一张位图。它把每个字形缓存、打包进持久 glyph atlas，然后输出一批 `DanmakuGlyphInstance`。每个 instance 包含屏幕 rect、atlas tex_rect、正文颜色、描边颜色、阴影颜色和偏移。Metal/WGPU 只需要绑定 atlas 纹理并画 alpha mask quad。
 
 当前 atlas 有 fill alpha 和 outline alpha 两份 mask，用于先画阴影/描边，再画正文。atlas 带 version，renderer 以 version/尺寸/stride 判断是否复用 GPU 纹理，避免每帧无意义重传整张 atlas。

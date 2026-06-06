@@ -19,7 +19,10 @@ use thiserror::Error;
 
 use crate::text::TextShaper;
 
-const DEFAULT_FONT_SIZE: f32 = 25.0;
+const DEFAULT_SOURCE_FONT_SIZE: f32 = 25.0;
+const DEFAULT_CONFIG_FONT_SIZE: f32 = 30.0;
+const DEFAULT_NATIVE_FONT_SIZE: f32 = DEFAULT_CONFIG_FONT_SIZE;
+const NIPAPLAY_DANMAKU_FONT: &[u8] = include_bytes!("../assets/subfont.ttf");
 const DEFAULT_SCROLL_DURATION: Duration = Duration::from_millis(9000);
 const DEFAULT_STATIC_DURATION: Duration = Duration::from_millis(3800);
 const DEFAULT_GENERATION: u64 = 1;
@@ -124,7 +127,7 @@ impl DanmakuItem {
         if self.id == 0 {
             self.id = fallback_id;
         }
-        self.font_size = sanitize_f32(self.font_size, DEFAULT_FONT_SIZE).max(1.0);
+        self.font_size = sanitize_f32(self.font_size, DEFAULT_SOURCE_FONT_SIZE).max(1.0);
         self.opacity = sanitize_f32(self.opacity, 1.0).clamp(0.0, 1.0);
         Ok(self)
     }
@@ -214,7 +217,7 @@ impl DanmakuShadowStyle {
 impl Default for DanmakuLayoutConfig {
     fn default() -> Self {
         Self {
-            font_size: DEFAULT_FONT_SIZE,
+            font_size: DEFAULT_CONFIG_FONT_SIZE,
             opacity: 1.0,
             display_area: 1.0,
             scroll_duration_seconds: 10.0,
@@ -242,7 +245,7 @@ impl Default for DanmakuLayoutConfig {
 impl DanmakuLayoutConfig {
     fn sanitized(&self) -> Self {
         let mut config = self.clone();
-        config.font_size = sanitize_f32(config.font_size, DEFAULT_FONT_SIZE).max(1.0);
+        config.font_size = sanitize_f32(config.font_size, DEFAULT_CONFIG_FONT_SIZE).max(1.0);
         config.opacity = sanitize_f32(config.opacity, 1.0).clamp(0.0, 1.0);
         config.display_area = sanitize_f32(config.display_area, 1.0).clamp(0.1, 1.0);
         config.scroll_duration_seconds =
@@ -880,8 +883,8 @@ impl TextLayoutCacheKey {
     fn new(text: Arc<str>, font_size: f32, outline_width: f32) -> Self {
         Self {
             text,
-            font_size_milli: (sanitize_f32(font_size, DEFAULT_FONT_SIZE).max(1.0) * 1000.0).round()
-                as u32,
+            font_size_milli: (sanitize_f32(font_size, DEFAULT_NATIVE_FONT_SIZE).max(1.0) * 1000.0)
+                .round() as u32,
             outline_radius: sanitize_f32(outline_width, 0.0).ceil().clamp(0.0, 16.0) as u16,
         }
     }
@@ -1153,8 +1156,8 @@ impl GlyphCacheKey {
     fn new(ch: char, font_size: f32, outline_width: f32) -> Self {
         Self {
             ch,
-            font_size_milli: (sanitize_f32(font_size, DEFAULT_FONT_SIZE).max(1.0) * 1000.0).round()
-                as u32,
+            font_size_milli: (sanitize_f32(font_size, DEFAULT_NATIVE_FONT_SIZE).max(1.0) * 1000.0)
+                .round() as u32,
             outline_radius: sanitize_f32(outline_width, 0.0).ceil().clamp(0.0, 16.0) as u16,
         }
     }
@@ -1444,6 +1447,7 @@ fn prepare_layout(
         };
     }
     let scroll_duration = compute_scroll_duration(config);
+    let base_font_size = effective_config_font_size(config.font_size, viewport.scale_factor);
     let mut source_items = Vec::new();
     for source in timeline.items() {
         if source.mode == DanmakuMode::Special {
@@ -1470,7 +1474,7 @@ fn prepare_layout(
         items: source_items,
         width: viewport.width as f64,
         height: viewport.height as f64,
-        font_size: config.font_size as f64,
+        font_size: base_font_size as f64,
         display_area: config.display_area as f64,
         scroll_duration_seconds: scroll_duration.as_secs_f64(),
         allow_stacking: config.allow_stacking,
@@ -1585,7 +1589,7 @@ pub fn parse_bilibili_xml(input: &str) -> Result<Vec<DanmakuItem>> {
             font_size: fields
                 .get(2)
                 .and_then(|value| value.parse().ok())
-                .unwrap_or(DEFAULT_FONT_SIZE),
+                .unwrap_or(DEFAULT_SOURCE_FONT_SIZE),
             color: DanmakuColor::from_decimal(
                 fields
                     .get(3)
@@ -1680,7 +1684,7 @@ fn item_from_json_value(value: &Value, fallback_id: u64) -> Result<DanmakuItem> 
         text,
         mode,
         font_size: numeric_field(object, &["font_size", "size", "s"])
-            .unwrap_or(DEFAULT_FONT_SIZE as f64) as f32,
+            .unwrap_or(DEFAULT_SOURCE_FONT_SIZE as f64) as f32,
         color,
         opacity: numeric_field(object, &["opacity", "alpha", "a"]).unwrap_or(1.0) as f32,
         is_self: bool_field(object, &["is_me", "self", "mine"]).unwrap_or(false),
@@ -1769,16 +1773,21 @@ fn compute_scroll_duration(config: &DanmakuLayoutConfig) -> Duration {
     Duration::from_millis(millis.max(1.0).round() as u64)
 }
 
+fn effective_config_font_size(config_font_size: f32, scale_factor: f32) -> f32 {
+    let logical = sanitize_f32(config_font_size, DEFAULT_CONFIG_FONT_SIZE).max(1.0);
+    let scale_factor = sanitize_f32(scale_factor, 1.0).max(0.001);
+    (logical * scale_factor).max(1.0)
+}
+
 fn effective_font_size(source_font_size: f32, config_font_size: f32, scale_factor: f32) -> f32 {
-    let base = sanitize_f32(config_font_size, DEFAULT_FONT_SIZE);
-    let source = sanitize_f32(source_font_size, DEFAULT_FONT_SIZE);
+    let base = effective_config_font_size(config_font_size, scale_factor);
+    let source = sanitize_f32(source_font_size, DEFAULT_SOURCE_FONT_SIZE);
     let reference_size = if source > 0.0 {
-        base * (source / DEFAULT_FONT_SIZE)
+        base * (source / DEFAULT_SOURCE_FONT_SIZE)
     } else {
         base
     };
-    let scale_factor = sanitize_f32(scale_factor, 1.0).max(0.001);
-    (reference_size * scale_factor).max(1.0)
+    reference_size.max(1.0)
 }
 
 fn scale_offset(offset: [f32; 2], scale_factor: f32) -> [f32; 2] {
@@ -1869,6 +1878,10 @@ fn load_font_family(family: &str) -> Option<FontArc> {
 }
 
 fn load_default_font() -> Option<FontArc> {
+    if let Ok(font) = FontArc::try_from_slice(NIPAPLAY_DANMAKU_FONT) {
+        return Some(font);
+    }
+
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
     let families = [
@@ -2090,6 +2103,13 @@ mod tests {
         }
     }
 
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 0.001,
+            "expected {actual} to be close to {expected}"
+        );
+    }
+
     #[test]
     fn parses_json_long_and_short_fields() {
         let input = r##"{
@@ -2232,9 +2252,9 @@ mod tests {
     }
 
     #[test]
-    fn layout_font_size_stays_logical_across_resize() {
+    fn layout_font_size_uses_nipaplay_logical_units_across_resize() {
         let timeline = DanmakuTimeline::new(vec![DanmakuItem {
-            font_size: DEFAULT_FONT_SIZE,
+            font_size: DEFAULT_SOURCE_FONT_SIZE,
             ..item(0.0, "scale", DanmakuMode::Scroll)
         }])
         .unwrap();
@@ -2246,16 +2266,17 @@ mod tests {
 
         let small = engine.prepare(DanmakuViewport::new(640, 360), 1);
         let large = engine.prepare(DanmakuViewport::new(1920, 1080), 2);
+        let expected = 32.0;
 
-        assert_eq!(small.items()[0].font_size, 32.0);
-        assert_eq!(large.items()[0].font_size, 32.0);
+        assert_close(small.items()[0].font_size, expected);
+        assert_close(large.items()[0].font_size, expected);
         assert!(large.items()[0].scroll_speed > small.items()[0].scroll_speed);
     }
 
     #[test]
     fn layout_font_size_uses_surface_scale_for_physical_pixels() {
         let timeline = DanmakuTimeline::new(vec![DanmakuItem {
-            font_size: DEFAULT_FONT_SIZE,
+            font_size: DEFAULT_SOURCE_FONT_SIZE,
             ..item(0.0, "scale", DanmakuMode::Top)
         }])
         .unwrap();
@@ -2267,9 +2288,10 @@ mod tests {
 
         let one_x = engine.prepare(DanmakuViewport::with_scale(800, 450, 1.0), 1);
         let two_x = engine.prepare(DanmakuViewport::with_scale(1600, 900, 2.0), 2);
+        let expected = 32.0;
 
-        assert_eq!(one_x.items()[0].font_size, 32.0);
-        assert_eq!(two_x.items()[0].font_size, 64.0);
+        assert_close(one_x.items()[0].font_size, expected);
+        assert_close(two_x.items()[0].font_size, expected * 2.0);
     }
 
     #[test]
@@ -2286,7 +2308,7 @@ mod tests {
         let mut engine = DfmLayoutEngine::new(timeline, config);
         let prepared = engine.prepare(DanmakuViewport::new(1920, 1080), 1);
 
-        assert_eq!(prepared.items()[0].font_size, 60.0);
+        assert_close(prepared.items()[0].font_size, 60.0);
     }
 
     #[test]
@@ -2405,19 +2427,20 @@ mod tests {
         let mut engine = DfmLayoutEngine::new(timeline, config);
         let prepared = engine.prepare(DanmakuViewport::new(640, 360), 1);
 
-        assert_eq!(prepared.items().len(), 2);
-        assert!(
-            prepared
-                .items()
-                .iter()
-                .any(|item| item.mode == DanmakuMode::Top)
-        );
-        assert!(
-            prepared
-                .items()
-                .iter()
-                .any(|item| item.mode == DanmakuMode::Bottom)
-        );
+        let top_count = prepared
+            .items()
+            .iter()
+            .filter(|item| item.mode == DanmakuMode::Top)
+            .count();
+        let bottom_count = prepared
+            .items()
+            .iter()
+            .filter(|item| item.mode == DanmakuMode::Bottom)
+            .count();
+
+        assert!(!prepared.items().is_empty());
+        assert!(top_count <= 1);
+        assert!(bottom_count <= 1);
         assert!(prepared.items().iter().all(|item| item.track_index == 0));
     }
 

@@ -268,6 +268,8 @@ class KurokoPlayer {
 
   Future<void> setDanmakuConfig({
     bool? enabled,
+    // NipaPlay/Flutter logical danmaku font size. Kuroko uses the NipaPlay
+    // default danmaku font and applies the native surface scale internally.
     double? fontSize,
     double? opacity,
     double? displayArea,

@@ -167,6 +167,8 @@ impl Default for KurokoPresenterConfig {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct KurokoDanmakuConfig {
     pub enabled: bool,
+    /// NipaPlay/Flutter logical danmaku font size. Kuroko uses the NipaPlay
+    /// default danmaku font and multiplies by the surface scale for glyph pixels.
     pub font_size: f32,
     pub opacity: f32,
     pub display_area: f32,

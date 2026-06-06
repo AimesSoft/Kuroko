@@ -76,7 +76,8 @@ private struct KurokoPresenterStatsC {
 
 private struct KurokoDanmakuConfigC {
   var enabled: UInt8 = 1
-  var fontSize: Float = 25.0
+  // NipaPlay/Flutter logical font size; Kuroko applies the surface scale internally.
+  var fontSize: Float = 30.0
   var opacity: Float = 1.0
   var displayArea: Float = 1.0
   var scrollDurationSeconds: Float = 10.0

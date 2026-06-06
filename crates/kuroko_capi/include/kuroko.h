@@ -88,6 +88,8 @@ typedef struct KurokoPresenterConfig {
 
 typedef struct KurokoDanmakuConfig {
   bool enabled;
+  /* NipaPlay/Flutter logical danmaku font size. Kuroko uses the NipaPlay
+   * default danmaku font and multiplies by the surface scale for glyph pixels. */
   float font_size;
   float opacity;
   float display_area;
