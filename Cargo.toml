@@ -13,6 +13,7 @@ members = [
   "examples/player_tick",
   "examples/coreaudio_smoke",
   "examples/danmaku_sync_smoke",
+  "examples/danmaku_perf_lab",
   "examples/metal_presenter_check",
   "examples/ffmpeg_videotoolbox",
   "examples/metal_import_videotoolbox",
