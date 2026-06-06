@@ -10,7 +10,9 @@ use crossbeam_channel::Receiver;
 
 #[cfg(target_os = "macos")]
 use crate::apple::coreaudio::{CoreAudioOutput, CoreAudioOutputConfig};
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "ios")]
+use crate::apple::iosaudio::{IosAudioQueueOutput, IosAudioQueueOutputConfig};
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 use crate::audio::BufferedAudioOutput;
 use crate::audio::{AudioClockSnapshot, AudioOutputBackend, AudioRingBufferConfig};
 use crate::core::{
@@ -64,7 +66,14 @@ impl Default for PresenterAudioConfig {
                 ring_buffer: config.ring_buffer,
             }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "ios")]
+        {
+            let config = IosAudioQueueOutputConfig::default();
+            Self {
+                ring_buffer: config.ring_buffer,
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
             Self {
                 ring_buffer: AudioRingBufferConfig {
@@ -1136,7 +1145,13 @@ fn build_audio_output(config: PresenterAudioConfig) -> Box<dyn AudioOutputBacken
             ring_buffer: config.ring_buffer,
         }))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "ios")]
+    {
+        Box::new(IosAudioQueueOutput::new(IosAudioQueueOutputConfig {
+            ring_buffer: config.ring_buffer,
+        }))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         Box::new(BufferedAudioOutput::new(config.ring_buffer))
     }

@@ -16,6 +16,6 @@ Flutter iOS plugin that hosts a CAMetalLayer and drives Kuroko through its C ABI
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
     'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386',
-    'OTHER_LDFLAGS' => '$(inherited) -framework QuartzCore -framework Metal -framework CoreVideo -framework CoreMedia -framework VideoToolbox',
+    'OTHER_LDFLAGS' => '$(inherited) -framework AVFoundation -framework AudioToolbox -framework QuartzCore -framework Metal -framework CoreVideo -framework CoreMedia -framework VideoToolbox',
   }
 end
