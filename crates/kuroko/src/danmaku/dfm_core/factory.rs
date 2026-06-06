@@ -1,6 +1,6 @@
 /// Duration computation and viewport scaling.
 /// Ported from DanmakuFactory.java.
-use crate::danmaku_next2::dfm_core::model::Duration;
+use crate::danmaku::dfm_core::model::Duration;
 
 /// Reference Bilibili player width for duration scaling.
 const BILI_PLAYER_WIDTH: f32 = 682.0;

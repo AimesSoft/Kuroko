@@ -9,44 +9,29 @@ build = "build.rs"
 
 [features]
 default = []
-danmaku-next2 = [
-  "wgpu",
-  "dep:base64",
-  "dep:fdsm",
-  "dep:fdsm-ttf-parser",
-  "dep:image",
-  "dep:nalgebra",
-  "dep:serde",
-  "dep:serde_json",
-  "dep:ttf-parser",
-  "dep:wgpu-hal",
-]
 libass = []
 wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [dependencies]
-aho-corasick = "1"
-base64 = { version = "0.22.1", optional = true }
+ab_glyph.workspace = true
+aho-corasick.workspace = true
 crossbeam-channel.workspace = true
-fdsm = { version = "0.8.0", default-features = false, optional = true }
-fdsm-ttf-parser = { version = "0.2.0", optional = true }
-image = { version = "0.25.6", default-features = false, optional = true }
+fontdb.workspace = true
 libc.workspace = true
 kuroko_ffmpeg_sys = { path = "../kuroko_ffmpeg_sys" }
-nalgebra = { version = "0.34.1", default-features = false, features = ["std"], optional = true }
 objc2.workspace = true
 objc2-core-foundation.workspace = true
+objc2-core-graphics = { workspace = true, features = ["CGColorSpace"] }
 objc2-core-video.workspace = true
 objc2-foundation.workspace = true
 objc2-metal.workspace = true
 objc2-quartz-core.workspace = true
-regex = "1"
-rustc-hash = "2"
-serde = { version = "1", features = ["derive"], optional = true }
-serde_json = { version = "1", optional = true }
-smallvec = "1"
+regex.workspace = true
+rustc-hash.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smallvec.workspace = true
 thiserror.workspace = true
-ttf-parser = { version = "0.25.1", optional = true }
 ureq.workspace = true
 wgpu = { version = "29.0.3", optional = true }
 pollster = { version = "0.4.0", optional = true }
@@ -54,4 +39,3 @@ bytemuck = { version = "1.25.0", features = ["derive"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs.workspace = true
-wgpu-hal = { version = "29.0.3", features = ["metal"], optional = true }

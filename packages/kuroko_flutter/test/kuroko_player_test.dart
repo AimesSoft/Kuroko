@@ -134,6 +134,169 @@ void main() {
     await player.dispose();
   });
 
+  test('playback rate is forwarded to native player clock', () async {
+    final player = KurokoPlayer();
+
+    await player.setPlaybackRate(1.5);
+
+    final call = playerCalls.singleWhere(
+      (MethodCall call) => call.method == 'setPlaybackRate',
+    );
+    expect(call.arguments, <String, Object?>{
+      'playerId': 7,
+      'rate': 1.5,
+    });
+
+    await player.dispose();
+  });
+
+  test('danmaku config forwards block words as json', () async {
+    final player = KurokoPlayer();
+
+    await player.setDanmakuConfig(
+      maxQuantity: 80,
+      shadowStyle: 3,
+      customFontFamily: 'DanmakuRuntime_abc',
+      customFontFilePath: '/tmp/danmaku.otf',
+      blockWords: <String>['spoiler', 'regex/[0-9]+/'],
+    );
+
+    final call = playerCalls.singleWhere(
+      (MethodCall call) => call.method == 'setDanmakuConfig',
+    );
+    expect(call.arguments, <String, Object?>{
+      'playerId': 7,
+      'maxQuantity': 80,
+      'shadowStyle': 3,
+      'customFontFamily': 'DanmakuRuntime_abc',
+      'customFontFilePath': '/tmp/danmaku.otf',
+      'blockWordsJson': '["spoiler","regex/[0-9]+/"]',
+    });
+
+    await player.dispose();
+  });
+
+  test('danmaku track controls forward multi-track input', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(playerChannel, (MethodCall call) async {
+      playerCalls.add(call);
+      return switch (call.method) {
+        'create' => 7,
+        'addDanmakuTrackFile' => 11,
+        'addDanmakuTrackJson' => 12,
+        'dispose' => null,
+        _ => null,
+      };
+    });
+    final player = KurokoPlayer();
+
+    final fileTrack = await player.addDanmakuTrackFile(
+      '/tmp/a.xml',
+      name: 'A',
+      offset: const Duration(milliseconds: -500),
+    );
+    final jsonTrack = await player.addDanmakuTrackJson(
+      '{"comments":[]}',
+      name: 'B',
+      offset: const Duration(milliseconds: 250),
+    );
+    await player.setDanmakuTrackEnabled(fileTrack, false);
+    await player.setDanmakuTrackOffset(jsonTrack, const Duration(seconds: 1));
+    await player.setDanmakuGlobalOffset(const Duration(milliseconds: -100));
+    await player.removeDanmakuTrack(fileTrack);
+
+    expect(fileTrack, 11);
+    expect(jsonTrack, 12);
+    expect(
+      playerCalls
+          .singleWhere(
+              (MethodCall call) => call.method == 'addDanmakuTrackFile')
+          .arguments,
+      <String, Object?>{
+        'playerId': 7,
+        'uri': '/tmp/a.xml',
+        'name': 'A',
+        'offsetMicros': -500000,
+      },
+    );
+    expect(
+      playerCalls
+          .singleWhere(
+              (MethodCall call) => call.method == 'addDanmakuTrackJson')
+          .arguments,
+      <String, Object?>{
+        'playerId': 7,
+        'json': '{"comments":[]}',
+        'name': 'B',
+        'offsetMicros': 250000,
+      },
+    );
+    expect(
+      playerCalls
+          .singleWhere(
+              (MethodCall call) => call.method == 'setDanmakuTrackEnabled')
+          .arguments,
+      <String, Object?>{'playerId': 7, 'trackId': 11, 'enabled': false},
+    );
+    expect(
+      playerCalls
+          .singleWhere(
+              (MethodCall call) => call.method == 'setDanmakuTrackOffset')
+          .arguments,
+      <String, Object?>{'playerId': 7, 'trackId': 12, 'offsetMicros': 1000000},
+    );
+    expect(
+      playerCalls
+          .singleWhere(
+              (MethodCall call) => call.method == 'setDanmakuGlobalOffset')
+          .arguments,
+      <String, Object?>{'playerId': 7, 'offsetMicros': -100000},
+    );
+    expect(
+      playerCalls
+          .singleWhere((MethodCall call) => call.method == 'removeDanmakuTrack')
+          .arguments,
+      <String, Object?>{'playerId': 7, 'trackId': 11},
+    );
+
+    await player.dispose();
+  });
+
+  test('danmaku tracks query parses native track list', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(playerChannel, (MethodCall call) async {
+      playerCalls.add(call);
+      return switch (call.method) {
+        'create' => 7,
+        'danmakuTracks' => <Map<String, Object?>>[
+            <String, Object?>{
+              'id': 11,
+              'enabled': true,
+              'offsetMicros': -500000,
+              'itemCount': 42,
+              'name': 'A',
+              'source': '/tmp/a.xml',
+            },
+          ],
+        'dispose' => null,
+        _ => null,
+      };
+    });
+    final player = KurokoPlayer();
+
+    final tracks = await player.danmakuTracks();
+
+    expect(tracks, hasLength(1));
+    expect(tracks.single.id, 11);
+    expect(tracks.single.enabled, isTrue);
+    expect(tracks.single.offset, const Duration(milliseconds: -500));
+    expect(tracks.single.itemCount, 42);
+    expect(tracks.single.name, 'A');
+    expect(tracks.single.source, '/tmp/a.xml');
+
+    await player.dispose();
+  });
+
   test('tracks query parses native track list', () async {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(playerChannel, (MethodCall call) async {

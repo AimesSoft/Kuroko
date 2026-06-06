@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -12,6 +13,36 @@ enum KurokoOutputMode {
   const KurokoOutputMode(this.nativeValue);
 
   final int nativeValue;
+}
+
+class KurokoDanmakuTrackInfo {
+  const KurokoDanmakuTrackInfo({
+    required this.id,
+    required this.enabled,
+    required this.offset,
+    required this.itemCount,
+    this.name,
+    this.source,
+  });
+
+  final int id;
+  final bool enabled;
+  final Duration offset;
+  final int itemCount;
+  final String? name;
+  final String? source;
+
+  factory KurokoDanmakuTrackInfo.fromMap(Map<dynamic, dynamic> map) {
+    return KurokoDanmakuTrackInfo(
+      id: (map['id'] as num?)?.toInt() ?? 0,
+      enabled: map['enabled'] == true,
+      offset:
+          Duration(microseconds: (map['offsetMicros'] as num?)?.toInt() ?? 0),
+      itemCount: (map['itemCount'] as num?)?.toInt() ?? 0,
+      name: map['name'] as String?,
+      source: map['source'] as String?,
+    );
+  }
 }
 
 class KurokoPlayer {
@@ -88,6 +119,14 @@ class KurokoPlayer {
     });
   }
 
+  Future<void> setPlaybackRate(double rate) async {
+    final playerId = await ensureCreated();
+    await _invoke('setPlaybackRate', <String, Object?>{
+      'playerId': playerId,
+      'rate': rate,
+    });
+  }
+
   Future<int> addExternalSubtitle(String uri) async {
     final playerId = await ensureCreated();
     final trackId = await _channel.invokeMethod<int>(
@@ -105,6 +144,181 @@ class KurokoPlayer {
     await _invoke('removeSubtitleTrack', <String, Object?>{
       'playerId': playerId,
       'trackId': trackId,
+    });
+  }
+
+  Future<void> loadDanmakuFile(String uri) async {
+    final playerId = await ensureCreated();
+    await _invoke('loadDanmakuFile', <String, Object?>{
+      'playerId': playerId,
+      'uri': uri,
+    });
+  }
+
+  Future<void> loadDanmakuJson(String json) async {
+    final playerId = await ensureCreated();
+    await _invoke('loadDanmakuJson', <String, Object?>{
+      'playerId': playerId,
+      'json': json,
+    });
+  }
+
+  Future<int> addDanmakuTrackFile(
+    String uri, {
+    String? name,
+    Duration offset = Duration.zero,
+  }) async {
+    final playerId = await ensureCreated();
+    final trackId = await _channel.invokeMethod<int>(
+      'addDanmakuTrackFile',
+      <String, Object?>{
+        'playerId': playerId,
+        'uri': uri,
+        if (name != null) 'name': name,
+        'offsetMicros': offset.inMicroseconds,
+      },
+    );
+    if (trackId == null || trackId <= 0) {
+      throw StateError('Kuroko danmaku track add returned no track id.');
+    }
+    return trackId;
+  }
+
+  Future<int> addDanmakuTrackJson(
+    String json, {
+    String? name,
+    Duration offset = Duration.zero,
+  }) async {
+    final playerId = await ensureCreated();
+    final trackId = await _channel.invokeMethod<int>(
+      'addDanmakuTrackJson',
+      <String, Object?>{
+        'playerId': playerId,
+        'json': json,
+        if (name != null) 'name': name,
+        'offsetMicros': offset.inMicroseconds,
+      },
+    );
+    if (trackId == null || trackId <= 0) {
+      throw StateError('Kuroko danmaku track add returned no track id.');
+    }
+    return trackId;
+  }
+
+  Future<void> removeDanmakuTrack(int trackId) async {
+    final playerId = await ensureCreated();
+    await _invoke('removeDanmakuTrack', <String, Object?>{
+      'playerId': playerId,
+      'trackId': trackId,
+    });
+  }
+
+  Future<void> setDanmakuTrackEnabled(int trackId, bool enabled) async {
+    final playerId = await ensureCreated();
+    await _invoke('setDanmakuTrackEnabled', <String, Object?>{
+      'playerId': playerId,
+      'trackId': trackId,
+      'enabled': enabled,
+    });
+  }
+
+  Future<void> setDanmakuTrackOffset(int trackId, Duration offset) async {
+    final playerId = await ensureCreated();
+    await _invoke('setDanmakuTrackOffset', <String, Object?>{
+      'playerId': playerId,
+      'trackId': trackId,
+      'offsetMicros': offset.inMicroseconds,
+    });
+  }
+
+  Future<void> setDanmakuGlobalOffset(Duration offset) async {
+    final playerId = await ensureCreated();
+    await _invoke('setDanmakuGlobalOffset', <String, Object?>{
+      'playerId': playerId,
+      'offsetMicros': offset.inMicroseconds,
+    });
+  }
+
+  Future<List<KurokoDanmakuTrackInfo>> danmakuTracks() async {
+    final playerId = await ensureCreated();
+    final rawTracks = await _channel.invokeMethod<List<dynamic>>(
+      'danmakuTracks',
+      <String, Object?>{'playerId': playerId},
+    );
+    if (rawTracks == null) {
+      return const <KurokoDanmakuTrackInfo>[];
+    }
+    return rawTracks
+        .whereType<Map<dynamic, dynamic>>()
+        .map(KurokoDanmakuTrackInfo.fromMap)
+        .toList(growable: false);
+  }
+
+  Future<void> clearDanmaku() async {
+    await _invokeForPlayer('clearDanmaku');
+  }
+
+  Future<void> setDanmakuEnabled(bool enabled) async {
+    final playerId = await ensureCreated();
+    await _invoke('setDanmakuEnabled', <String, Object?>{
+      'playerId': playerId,
+      'enabled': enabled,
+    });
+  }
+
+  Future<void> setDanmakuConfig({
+    bool? enabled,
+    // NipaPlay/Flutter logical danmaku font size. Kuroko uses the NipaPlay
+    // default danmaku font and applies the native surface scale internally.
+    double? fontSize,
+    double? opacity,
+    double? displayArea,
+    double? scrollDurationSeconds,
+    double? scrollSpeedFactor,
+    double? trackGapRatio,
+    double? outlineWidth,
+    double? shadowOffsetX,
+    double? shadowOffsetY,
+    int? shadowStyle,
+    String? customFontFamily,
+    String? customFontFilePath,
+    bool? mergeDuplicates,
+    bool? allowStacking,
+    bool? allowScrollOverwrite,
+    int? maxQuantity,
+    int? maxLinesPerMode,
+    bool? blockTop,
+    bool? blockBottom,
+    bool? blockScroll,
+    List<String>? blockWords,
+  }) async {
+    final playerId = await ensureCreated();
+    await _invoke('setDanmakuConfig', <String, Object?>{
+      'playerId': playerId,
+      if (enabled != null) 'enabled': enabled,
+      if (fontSize != null) 'fontSize': fontSize,
+      if (opacity != null) 'opacity': opacity,
+      if (displayArea != null) 'displayArea': displayArea,
+      if (scrollDurationSeconds != null)
+        'scrollDurationSeconds': scrollDurationSeconds,
+      if (scrollSpeedFactor != null) 'scrollSpeedFactor': scrollSpeedFactor,
+      if (trackGapRatio != null) 'trackGapRatio': trackGapRatio,
+      if (outlineWidth != null) 'outlineWidth': outlineWidth,
+      if (shadowOffsetX != null) 'shadowOffsetX': shadowOffsetX,
+      if (shadowOffsetY != null) 'shadowOffsetY': shadowOffsetY,
+      if (shadowStyle != null) 'shadowStyle': shadowStyle,
+      if (customFontFamily != null) 'customFontFamily': customFontFamily,
+      if (customFontFilePath != null) 'customFontFilePath': customFontFilePath,
+      if (mergeDuplicates != null) 'mergeDuplicates': mergeDuplicates,
+      if (allowStacking != null) 'allowStacking': allowStacking,
+      if (allowScrollOverwrite != null)
+        'allowScrollOverwrite': allowScrollOverwrite,
+      if (maxQuantity != null) 'maxQuantity': maxQuantity,
+      if (maxLinesPerMode != null) 'maxLinesPerMode': maxLinesPerMode,
+      if (blockTop != null) 'blockTop': blockTop,
+      if (blockBottom != null) 'blockBottom': blockBottom,
+      if (blockScroll != null) 'blockScroll': blockScroll,
+      if (blockWords != null) 'blockWordsJson': jsonEncode(blockWords),
     });
   }
 

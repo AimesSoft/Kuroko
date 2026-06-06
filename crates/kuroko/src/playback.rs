@@ -11,6 +11,7 @@ use crate::ffmpeg::{
 };
 use crate::source::{self, source_from_uri_with_hint};
 use crate::subtitle::{DecodedSubtitleFrame, SubtitleTrackConfig, SubtitleTrackSource};
+use crate::trace;
 
 #[derive(Debug, Error)]
 pub enum PlaybackError {
@@ -829,7 +830,7 @@ impl Default for PlaybackTimingConfig {
         Self {
             clock_mode: PlaybackClockMode::default(),
             video_scheduler: VideoFrameScheduler::default(),
-            audio_lead_time: Duration::from_millis(12),
+            audio_lead_time: Duration::from_millis(120),
             audio_sync: AudioSyncConfig::default(),
         }
     }
@@ -1227,6 +1228,7 @@ pub struct VideoPlaybackEngine {
     last_presented_pts: Option<Duration>,
     eof: bool,
     waiting_for_first_frame: bool,
+    seek_floor: Option<Duration>,
 }
 
 unsafe impl Send for VideoPlaybackEngine {}
@@ -1259,6 +1261,7 @@ impl VideoPlaybackEngine {
             last_presented_pts: None,
             eof: false,
             waiting_for_first_frame: false,
+            seek_floor: None,
         }
     }
 
@@ -1326,17 +1329,18 @@ impl VideoPlaybackEngine {
 
     fn reset_streams_at(&mut self, media_time: Duration) -> Result<()> {
         self.session.seek(media_time)?;
-        self.clock.reset(
-            media_time,
-            self.state == PlaybackRunState::Playing,
-            Instant::now(),
-        );
+        let now = Instant::now();
+        let before = self.clock.media_time_at(now);
+        self.clock
+            .reset(media_time, self.state == PlaybackRunState::Playing, now);
+        trace_clock_reset("reset_streams_at", before, media_time, self.state);
         self.pending_frame = None;
         self.pending_audio = None;
         self.pending_subtitle = None;
         self.last_presented_pts = None;
         self.eof = false;
         self.waiting_for_first_frame = self.state == PlaybackRunState::Playing;
+        self.seek_floor = Some(media_time);
         Ok(())
     }
 
@@ -1351,21 +1355,43 @@ impl VideoPlaybackEngine {
         ) {
             return;
         }
-        self.clock.play(Instant::now());
+        let now = Instant::now();
+        let before = self.clock.media_time_at(now);
+        let waiting_for_first_frame = self.last_presented_pts.is_none();
+        if !waiting_for_first_frame {
+            self.clock.play(now);
+        }
+        trace::log(format!(
+            "[kuroko-clock-trace] stage=engine_play before={} after={} state_before={:?} waiting_for_first_frame={}",
+            trace::duration_label(Some(before)),
+            trace::duration_label(Some(self.clock.media_time_at(now))),
+            self.state,
+            waiting_for_first_frame,
+        ));
         self.state = PlaybackRunState::Playing;
-        self.waiting_for_first_frame = self.last_presented_pts.is_none();
+        self.waiting_for_first_frame = waiting_for_first_frame;
     }
 
     pub fn pause(&mut self) {
         if self.state != PlaybackRunState::Playing {
             return;
         }
-        self.clock.pause(Instant::now());
+        let now = Instant::now();
+        let before = self.clock.media_time_at(now);
+        self.clock.pause(now);
+        trace::log(format!(
+            "[kuroko-clock-trace] stage=engine_pause before={} after={}",
+            trace::duration_label(Some(before)),
+            trace::duration_label(Some(self.clock.media_time_at(now))),
+        ));
         self.state = PlaybackRunState::Paused;
     }
 
     pub fn stop(&mut self) {
-        self.clock.reset(Duration::ZERO, false, Instant::now());
+        let now = Instant::now();
+        let before = self.clock.media_time_at(now);
+        self.clock.reset(Duration::ZERO, false, now);
+        trace_clock_reset("stop", before, Duration::ZERO, self.state);
         self.pending_frame = None;
         self.pending_audio = None;
         self.pending_subtitle = None;
@@ -1373,21 +1399,23 @@ impl VideoPlaybackEngine {
         self.state = PlaybackRunState::Stopped;
         self.eof = false;
         self.waiting_for_first_frame = false;
+        self.seek_floor = None;
     }
 
     pub fn seek(&mut self, position: Duration) -> Result<()> {
         self.session.seek(position)?;
-        self.clock.reset(
-            position,
-            self.state == PlaybackRunState::Playing,
-            Instant::now(),
-        );
+        let now = Instant::now();
+        let before = self.clock.media_time_at(now);
+        self.clock
+            .reset(position, self.state == PlaybackRunState::Playing, now);
+        trace_clock_reset("seek", before, position, self.state);
         self.pending_frame = None;
         self.pending_audio = None;
         self.pending_subtitle = None;
         self.last_presented_pts = None;
         self.eof = false;
         self.waiting_for_first_frame = self.state == PlaybackRunState::Playing;
+        self.seek_floor = Some(position);
         Ok(())
     }
 
@@ -1408,7 +1436,17 @@ impl VideoPlaybackEngine {
     }
 
     pub fn set_playback_rate(&mut self, rate: f64) {
-        self.clock.set_rate(rate, Instant::now());
+        let now = Instant::now();
+        let before = self.clock.media_time_at(now);
+        let before_rate = self.clock.rate();
+        self.clock.set_rate(rate, now);
+        trace::log(format!(
+            "[kuroko-clock-trace] stage=engine_set_rate before={} after={} rate_before={:.3} rate_after={:.3}",
+            trace::duration_label(Some(before)),
+            trace::duration_label(Some(self.clock.media_time_at(now))),
+            before_rate,
+            self.clock.rate(),
+        ));
     }
 
     pub fn sync_to_audio_clock(&mut self, snapshot: AudioClockSnapshot) -> Option<ClockCorrection> {
@@ -1416,12 +1454,24 @@ impl VideoPlaybackEngine {
             return None;
         }
         let media_time = snapshot.media_time?;
-        Some(self.clock.discipline_to(
+        let now = Instant::now();
+        let before = self.clock.media_time_at(now);
+        let correction = self.clock.discipline_to(
             media_time,
-            Instant::now(),
+            now,
             PlaybackClockSource::Audio,
             self.timing.audio_sync,
-        ))
+        );
+        let after = self.clock.media_time_at(now);
+        trace_clock_correction(
+            "output_audio_clock",
+            before,
+            media_time,
+            after,
+            correction,
+            Some(snapshot),
+        );
+        Some(correction)
     }
 
     pub fn next_audio_frame(&mut self) -> Result<Option<PcmAudioFrame>> {
@@ -1446,9 +1496,6 @@ impl VideoPlaybackEngine {
 
         let frame = self.pending_audio.take().expect("pending audio exists");
         let late_by = pts.and_then(|pts| media_time.checked_sub(pts));
-        if let Some(pts) = pts {
-            self.sync_clock_to_audio(pts, now);
-        }
         Ok(Some(TimedAudioFrame {
             frame,
             pts,
@@ -1497,15 +1544,27 @@ impl VideoPlaybackEngine {
             };
 
             let pts = frame.pts().and_then(|pts| pts.as_duration());
+            if self.should_drop_seek_preroll(pts) {
+                let _ = self.pending_frame.take();
+                continue;
+            }
             let should_present_first = self.last_presented_pts.is_none();
             if should_present_first && self.waiting_for_first_frame {
                 let now = Instant::now();
+                let before = self.clock.media_time_at(now);
                 self.clock.sync_to(
                     pts.unwrap_or(Duration::ZERO),
                     now,
                     PlaybackClockSource::Wall,
                 );
                 self.clock.play(now);
+                trace::log(format!(
+                    "[kuroko-clock-trace] stage=first_video_sync pts={} before={} after={} state={:?}",
+                    trace::duration_label(pts),
+                    trace::duration_label(Some(before)),
+                    trace::duration_label(Some(self.clock.media_time_at(now))),
+                    self.state,
+                ));
                 self.waiting_for_first_frame = false;
             }
 
@@ -1536,6 +1595,22 @@ impl VideoPlaybackEngine {
         }
     }
 
+    fn should_drop_seek_preroll(&mut self, pts: Option<Duration>) -> bool {
+        let Some(target) = self.seek_floor else {
+            return false;
+        };
+        let Some(pts) = pts else {
+            self.seek_floor = None;
+            return false;
+        };
+        if pts < target {
+            true
+        } else {
+            self.seek_floor = None;
+            false
+        }
+    }
+
     fn ensure_pending_frame(&mut self) -> Result<()> {
         if self.pending_frame.is_some() || self.eof {
             return Ok(());
@@ -1546,7 +1621,9 @@ impl VideoPlaybackEngine {
             self.state = PlaybackRunState::Ended;
             let now = Instant::now();
             let media_time = self.info().duration.unwrap_or_else(|| self.media_time());
+            let before = self.clock.media_time_at(now);
             self.clock.reset(media_time, false, now);
+            trace_clock_reset("eof", before, media_time, self.state);
         }
         Ok(())
     }
@@ -1566,15 +1643,61 @@ impl VideoPlaybackEngine {
         self.pending_subtitle = self.session.next_subtitle_frame(media_time)?;
         Ok(())
     }
+}
 
-    fn sync_clock_to_audio(&mut self, pts: Duration, now: Instant) {
-        if self.timing.clock_mode != PlaybackClockMode::AudioMaster {
-            return;
-        }
-        let _ =
-            self.clock
-                .discipline_to(pts, now, PlaybackClockSource::Audio, self.timing.audio_sync);
+fn trace_clock_reset(
+    stage: &'static str,
+    before: Duration,
+    target: Duration,
+    state: PlaybackRunState,
+) {
+    trace::log(format!(
+        "[kuroko-clock-trace] stage=clock_reset:{stage} before={} target={} delta={:.3} state={:?} back={}",
+        trace::duration_label(Some(before)),
+        trace::duration_label(Some(target)),
+        trace::duration_diff(before, target).as_secs_f64(),
+        state,
+        trace::duration_regressed(target, before),
+    ));
+}
+
+fn trace_clock_correction(
+    stage: &'static str,
+    before: Duration,
+    reference: Duration,
+    after: Duration,
+    correction: ClockCorrection,
+    snapshot: Option<AudioClockSnapshot>,
+) {
+    let should_log = correction.direction != ClockCorrectionDirection::None
+        || correction.snapped
+        || trace::duration_regressed(after, before)
+        || trace::duration_diff(before, reference) > Duration::from_millis(50);
+    if !should_log {
+        return;
     }
+    let snapshot_suffix = snapshot.map_or_else(String::new, |snapshot| {
+        format!(
+            " queued={} queued_frames={} read={} written={} underflow={}",
+            trace::duration_label(snapshot.queued_duration),
+            snapshot.queued_frames,
+            snapshot.read_frames,
+            snapshot.written_frames,
+            snapshot.underflow_frames,
+        )
+    });
+    trace::log(format!(
+        "[kuroko-clock-trace] stage=clock_discipline:{stage} before={} reference={} after={} drift={} applied={} direction={:?} snapped={} back={}{}",
+        trace::duration_label(Some(before)),
+        trace::duration_label(Some(reference)),
+        trace::duration_label(Some(after)),
+        trace::duration_label(Some(correction.drift)),
+        trace::duration_label(Some(correction.applied)),
+        correction.direction,
+        correction.snapped,
+        trace::duration_regressed(after, before),
+        snapshot_suffix,
+    ));
 }
 
 fn drain_video_frames(decoder: &mut Decoder, frames: &mut VecDeque<Frame>) -> Result<()> {

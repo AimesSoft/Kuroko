@@ -26,7 +26,7 @@ impl HeuristicMeasurer {
 }
 
 pub fn measure_text_width_heuristic(text: &str, font_size: f32) -> f32 {
-    crate::danmaku_next2::dfm_core::model::measure_text_width(text, font_size)
+    crate::danmaku::dfm_core::model::measure_text_width(text, font_size)
 }
 
 pub fn measure_line_height_heuristic(font_size: f32) -> f32 {

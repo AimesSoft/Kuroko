@@ -9,7 +9,9 @@ use std::process;
 use std::time::Duration;
 
 use kuroko::renderer::wgpu::{VideoUniforms, WgpuRenderer};
-use kuroko::{PlatformSurface, RendererBackend, WgpuSurfaceHandle, WgpuSurfaceKind};
+use kuroko::{
+    PlatformSurface, RenderFrameContext, RendererBackend, WgpuSurfaceHandle, WgpuSurfaceKind,
+};
 
 unsafe extern "C" {
     fn kuroko_wgpu_window_create(width: f64, height: f64, scale: f64) -> *mut c_void;
@@ -78,7 +80,7 @@ fn run(layer: *mut c_void, scale: f64, seconds: f64) -> Result<(), String> {
     let frames = (seconds * 60.0) as u32;
     for _ in 0..frames {
         if !renderer
-            .render_current_frame(None)
+            .render_current_frame(RenderFrameContext::new(Duration::ZERO, 1))
             .map_err(|e| e.to_string())?
         {
             return Err("render_current_frame returned false (no surface/frame)".to_string());

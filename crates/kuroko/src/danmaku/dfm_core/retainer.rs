@@ -6,7 +6,7 @@
 /// compute Y from track index.
 use smallvec::SmallVec;
 
-use crate::danmaku_next2::dfm_core::model::{DanmakuItem, DanmakuType, GlobalFlags};
+use crate::danmaku::dfm_core::model::{DanmakuItem, DanmakuType, GlobalFlags};
 
 type DisplacedIndices = SmallVec<[usize; 4]>;
 
@@ -451,6 +451,7 @@ fn entry_left_at(entry: &TrackEntry, time_ms: i64, view_width: f32) -> f32 {
 }
 
 #[inline]
+#[allow(dead_code)]
 fn entry_right_at(entry: &TrackEntry, time_ms: i64, view_width: f32) -> f32 {
     entry_left_at(entry, time_ms, view_width) + entry.paint_width
 }
@@ -475,7 +476,7 @@ fn entry_x_at(entry: &TrackEntry, time_ms: i64, view_width: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::danmaku_next2::dfm_core::model::DanmakuItem;
+    use crate::danmaku::dfm_core::model::DanmakuItem;
 
     fn calc_step_x(paint_width: f32, duration_ms: i64, view_width: f32) -> f32 {
         (view_width + paint_width) / duration_ms as f32

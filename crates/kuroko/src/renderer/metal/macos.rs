@@ -7,6 +7,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_core_foundation::CFRetained;
 use objc2_core_foundation::CGSize;
+use objc2_core_graphics::{CGColorSpace, kCGColorSpaceExtendedLinearSRGB, kCGColorSpaceSRGB};
 use objc2_core_video::kCVReturnSuccess;
 use objc2_core_video::{
     CVImageBuffer, CVMetalTexture, CVMetalTextureCache, CVMetalTextureGetTexture,
@@ -39,12 +40,12 @@ use objc2_metal::{
 use objc2_metal::{MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerState};
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
-use crate::overlay::OverlayViewport;
+use crate::danmaku::{DanmakuGlyphAtlas, DanmakuGlyphInstance, DanmakuRenderPlan};
 use crate::renderer::metal::{
-    ClearColor, ImportedVideoFormat, ImportedVideoFrameInfo, ImportedVideoPlaneInfo,
-    MetalDrawablePixelFormat, MetalOutputMode, MetalRendererConfig, MetalRendererStats,
-    OverlayRenderFrame, PreparedOverlayFrameInfo, VideoFrameTextureSource, VideoRenderFrame,
-    fourcc_string,
+    ClearColor, DanmakuRenderFrame, ImportedVideoFormat, ImportedVideoFrameInfo,
+    ImportedVideoPlaneInfo, MetalDrawablePixelFormat, MetalOutputMode, MetalRendererConfig,
+    MetalRendererStats, OverlayRenderFrame, PreparedOverlayFrameInfo, VideoFrameTextureSource,
+    VideoRenderFrame, fourcc_string,
 };
 use crate::renderer::pipeline::{ColorRange, ToneMapOperator};
 use crate::subtitle::{AssColor, SubtitleAlphaBitmap};
@@ -105,6 +106,7 @@ pub struct MetalRendererImpl {
     overlay_pipeline: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
     video_sampler: Option<Retained<ProtocolObject<dyn MTLSamplerState>>>,
     overlay_alpha_atlas_cache: Option<OverlayAlphaAtlasCache>,
+    danmaku_alpha_atlas_cache: Option<DanmakuAlphaAtlasCache>,
     stats: MetalRendererStats,
 }
 
@@ -127,6 +129,7 @@ impl MetalRendererImpl {
             overlay_pipeline: None,
             video_sampler: None,
             overlay_alpha_atlas_cache: None,
+            danmaku_alpha_atlas_cache: None,
             stats: MetalRendererStats::default(),
         })
     }
@@ -176,6 +179,14 @@ impl MetalRendererImpl {
         self.drawable_pixel_format = self.output_mode.pixel_format();
         layer.setPixelFormat(metal_pixel_format(self.drawable_pixel_format));
         layer.setWantsExtendedDynamicRangeContent(self.output_mode.is_edr());
+        let color_space_name = if self.output_mode.is_edr() {
+            Some(unsafe { kCGColorSpaceExtendedLinearSRGB })
+        } else {
+            Some(unsafe { kCGColorSpaceSRGB })
+        };
+        if let Some(color_space) = CGColorSpace::with_name(color_space_name) {
+            layer.setColorspace(Some(&color_space));
+        }
         self.video_pipeline = None;
         self.overlay_pipeline = None;
         self.overlay_alpha_atlas_cache = None;
@@ -184,7 +195,6 @@ impl MetalRendererImpl {
     pub fn record_prepared_overlay_frame(&mut self, info: PreparedOverlayFrameInfo) {
         self.stats.prepared_overlay_frames += 1;
         self.stats.prepared_overlay_subtitle_planes += info.subtitle_planes as u64;
-        self.stats.prepared_overlay_danmaku_boxes += info.danmaku_boxes as u64;
     }
 
     pub fn render_clear(&mut self, color: ClearColor) -> Result<()> {
@@ -241,7 +251,7 @@ impl MetalRendererImpl {
     }
 
     pub fn render_video_frame(&mut self, frame: VideoRenderFrame<'_>) -> Result<()> {
-        self.render_video_frame_inner(frame, None)
+        self.render_video_frame_inner(frame, None, None)
     }
 
     pub fn render_video_frame_with_overlay(
@@ -249,7 +259,16 @@ impl MetalRendererImpl {
         frame: VideoRenderFrame<'_>,
         overlay: OverlayRenderFrame<'_>,
     ) -> Result<()> {
-        self.render_video_frame_inner(frame, Some(overlay))
+        self.render_video_frame_inner(frame, Some(overlay), None)
+    }
+
+    pub fn render_video_frame_with_context(
+        &mut self,
+        frame: VideoRenderFrame<'_>,
+        overlay: Option<OverlayRenderFrame<'_>>,
+        danmaku: Option<DanmakuRenderFrame<'_>>,
+    ) -> Result<()> {
+        self.render_video_frame_inner(frame, overlay, danmaku)
     }
 
     pub fn render_overlay_frame(&mut self, overlay: OverlayRenderFrame<'_>) -> Result<()> {
@@ -315,7 +334,11 @@ impl MetalRendererImpl {
         &mut self,
         mut frame: VideoRenderFrame<'_>,
         overlay: Option<OverlayRenderFrame<'_>>,
+        danmaku: Option<DanmakuRenderFrame<'_>>,
     ) -> Result<()> {
+        let danmaku_item_count = danmaku
+            .as_ref()
+            .map_or(0usize, |danmaku| danmaku.plan.items.len());
         let Some(layer) = &self.layer else {
             return Err(PlayerError::Renderer(
                 "no CAMetalLayer attached".to_string(),
@@ -432,6 +455,9 @@ impl MetalRendererImpl {
             if let Some(overlay) = overlay {
                 self.draw_overlay_planes(&encoder, overlay, layout)?;
             }
+            if let Some(danmaku) = danmaku.as_ref() {
+                self.draw_danmaku_plan(&encoder, danmaku.plan, layout)?;
+            }
 
             encoder.endEncoding();
             let drawable_ref: &ProtocolObject<dyn MTLDrawable> =
@@ -441,6 +467,10 @@ impl MetalRendererImpl {
         }
 
         self.stats.rendered_frames += 1;
+        if danmaku_item_count > 0 {
+            self.stats.danmaku_passes += 1;
+            self.stats.danmaku_items += danmaku_item_count as u64;
+        }
 
         Ok(())
     }
@@ -454,7 +484,6 @@ impl MetalRendererImpl {
         let _ = crate::renderer::metal::inspect_overlay_frame(overlay.frame)?;
         if overlay.frame.subtitle_planes.is_empty()
             && overlay.frame.subtitle_alpha_planes.is_empty()
-            && overlay.frame.danmaku_planes.is_empty()
         {
             return Ok(());
         }
@@ -469,41 +498,6 @@ impl MetalRendererImpl {
             )?;
             let uniforms =
                 OverlayUniforms::from_plane(plane.x, plane.y, plane.width, plane.height, layout);
-            unsafe {
-                encoder.setRenderPipelineState(&pipeline);
-                encoder.setFragmentTexture_atIndex(Some(&*texture), 0);
-                encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
-                encoder.setVertexBytes_length_atIndex(
-                    overlay_uniform_pointer(&uniforms),
-                    mem::size_of::<OverlayUniforms>(),
-                    0,
-                );
-                encoder.setFragmentBytes_length_atIndex(
-                    overlay_uniform_pointer(&uniforms),
-                    mem::size_of::<OverlayUniforms>(),
-                    0,
-                );
-                encoder.drawPrimitives_vertexStart_vertexCount(
-                    MTLPrimitiveType::TriangleStrip,
-                    0,
-                    4,
-                );
-            }
-        }
-        for plane in &overlay.frame.danmaku_planes {
-            let texture = self.create_overlay_texture(
-                plane.width as usize,
-                plane.height as usize,
-                &plane.rgba,
-            )?;
-            let uniforms = OverlayUniforms::from_surface_plane(
-                plane.x,
-                plane.y,
-                plane.width,
-                plane.height,
-                overlay.frame.surface_viewport,
-                layout,
-            );
             unsafe {
                 encoder.setRenderPipelineState(&pipeline);
                 encoder.setFragmentTexture_atIndex(Some(&*texture), 0);
@@ -566,6 +560,121 @@ impl MetalRendererImpl {
             }
         }
         Ok(())
+    }
+
+    fn draw_danmaku_plan(
+        &mut self,
+        encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+        plan: &DanmakuRenderPlan,
+        layout: VideoPresentationLayout,
+    ) -> Result<()> {
+        if plan.is_empty() {
+            return Ok(());
+        }
+        let Some(atlas) = plan.atlas.as_ref() else {
+            return Ok(());
+        };
+        if !atlas.is_valid() {
+            return Err(PlayerError::Renderer(format!(
+                "danmaku glyph atlas has fill={} outline={} bytes, expected at least {} for {}x{} stride {}",
+                atlas.fill_alpha.len(),
+                atlas.outline_alpha.len(),
+                atlas.required_len(),
+                atlas.width,
+                atlas.height,
+                atlas.stride
+            )));
+        }
+        let pipeline = self.overlay_pipeline_state()?;
+        let sampler = self.video_sampler_state()?;
+        let (fill_texture, outline_texture) = self.prepare_danmaku_alpha_atlas(atlas)?;
+        for item in &plan.items {
+            self.draw_danmaku_glyph(
+                encoder,
+                &pipeline,
+                &sampler,
+                item,
+                &fill_texture,
+                &outline_texture,
+                layout,
+            );
+        }
+        Ok(())
+    }
+
+    fn prepare_danmaku_alpha_atlas(
+        &mut self,
+        atlas: &DanmakuGlyphAtlas,
+    ) -> Result<(
+        Retained<ProtocolObject<dyn MTLTexture>>,
+        Retained<ProtocolObject<dyn MTLTexture>>,
+    )> {
+        if let Some(cache) = &self.danmaku_alpha_atlas_cache {
+            if cache.can_reuse_for(atlas) {
+                return Ok((cache.fill_texture.clone(), cache.outline_texture.clone()));
+            }
+        }
+        let fill_texture = self.create_overlay_alpha_texture(
+            atlas.width as usize,
+            atlas.height as usize,
+            atlas.stride,
+            &atlas.fill_alpha,
+        )?;
+        let outline_texture = self.create_overlay_alpha_texture(
+            atlas.width as usize,
+            atlas.height as usize,
+            atlas.stride,
+            &atlas.outline_alpha,
+        )?;
+        self.danmaku_alpha_atlas_cache = Some(DanmakuAlphaAtlasCache {
+            version: atlas.version,
+            width: atlas.width,
+            height: atlas.height,
+            stride: atlas.stride,
+            fill_texture: fill_texture.clone(),
+            outline_texture: outline_texture.clone(),
+        });
+        Ok((fill_texture, outline_texture))
+    }
+
+    fn draw_danmaku_glyph(
+        &self,
+        encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+        pipeline: &ProtocolObject<dyn MTLRenderPipelineState>,
+        sampler: &ProtocolObject<dyn MTLSamplerState>,
+        item: &DanmakuGlyphInstance,
+        fill_texture: &ProtocolObject<dyn MTLTexture>,
+        outline_texture: &ProtocolObject<dyn MTLTexture>,
+        layout: VideoPresentationLayout,
+    ) {
+        if item.shadow_rgba[3] > 0.0 {
+            let mut rect = item.rect;
+            rect[0] += item.shadow_offset[0];
+            rect[1] += item.shadow_offset[1];
+            let uniforms = OverlayUniforms::from_output_alpha_atlas_rect(
+                item.shadow_rgba,
+                rect,
+                item.tex_rect,
+                layout,
+            );
+            draw_alpha_mask(encoder, pipeline, sampler, outline_texture, &uniforms);
+        }
+        if item.outline_rgba[3] > 0.0 {
+            let uniforms = OverlayUniforms::from_output_alpha_atlas_rect(
+                item.outline_rgba,
+                item.rect,
+                item.tex_rect,
+                layout,
+            );
+            draw_alpha_mask(encoder, pipeline, sampler, outline_texture, &uniforms);
+        }
+        let uniforms = OverlayUniforms::from_output_alpha_atlas_rect(
+            item.color_rgba,
+            item.rect,
+            item.tex_rect,
+            layout,
+        );
+        draw_alpha_mask(encoder, pipeline, sampler, fill_texture, &uniforms);
     }
 
     fn prepare_overlay_alpha_atlas(
@@ -646,11 +755,21 @@ impl MetalRendererImpl {
         &self,
         atlas: &OverlayAlphaAtlasPlan,
     ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
+        self.create_overlay_alpha_texture(atlas.width, atlas.height, atlas.stride, &atlas.pixels)
+    }
+
+    fn create_overlay_alpha_texture(
+        &self,
+        width: usize,
+        height: usize,
+        stride: usize,
+        pixels: &[u8],
+    ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>> {
         let descriptor = unsafe {
             MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
                 MTLPixelFormat::R8Unorm,
-                atlas.width,
-                atlas.height,
+                width,
+                height,
                 false,
             )
         };
@@ -665,8 +784,8 @@ impl MetalRendererImpl {
         let region = MTLRegion {
             origin: objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
             size: objc2_metal::MTLSize {
-                width: atlas.width,
-                height: atlas.height,
+                width,
+                height,
                 depth: 1,
             },
         };
@@ -674,9 +793,9 @@ impl MetalRendererImpl {
             texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
                 region,
                 0,
-                NonNull::new(atlas.pixels.as_ptr().cast::<c_void>().cast_mut())
+                NonNull::new(pixels.as_ptr().cast::<c_void>().cast_mut())
                     .expect("overlay atlas pointer is non-null"),
-                atlas.stride,
+                stride,
             );
         }
         Ok(texture)
@@ -985,19 +1104,6 @@ impl VideoPresentationLayout {
         [self.drawable_width, self.drawable_height]
     }
 
-    fn map_surface_rect(
-        self,
-        viewport: OverlayViewport,
-        x: f32,
-        y: f32,
-        width: f32,
-        height: f32,
-    ) -> [f32; 4] {
-        let scale_x = self.drawable_width / viewport.width.max(1) as f32;
-        let scale_y = self.drawable_height / viewport.height.max(1) as f32;
-        [x * scale_x, y * scale_y, width * scale_x, height * scale_y]
-    }
-
     fn map_source_rect(self, x: f32, y: f32, width: f32, height: f32) -> [f32; 4] {
         let scale_x = self.target_rect[2] / self.source_width;
         let scale_y = self.target_rect[3] / self.source_height;
@@ -1023,7 +1129,7 @@ fn transfer_code(transfer: crate::core::TransferFunction) -> u32 {
         crate::core::TransferFunction::Bt1886 => 2,
         crate::core::TransferFunction::Pq => 3,
         crate::core::TransferFunction::Hlg => 4,
-        crate::core::TransferFunction::Unknown => 0,
+        crate::core::TransferFunction::Unknown => 1,
     }
 }
 
@@ -1068,30 +1174,6 @@ impl OverlayUniforms {
         }
     }
 
-    fn from_surface_plane(
-        x: i32,
-        y: i32,
-        width: u32,
-        height: u32,
-        surface_viewport: OverlayViewport,
-        layout: VideoPresentationLayout,
-    ) -> Self {
-        Self {
-            rect: layout.map_surface_rect(
-                surface_viewport,
-                x as f32,
-                y as f32,
-                width as f32,
-                height as f32,
-            ),
-            tex_rect: [0.0, 0.0, 1.0, 1.0],
-            viewport: layout.overlay_viewport(),
-            overlay_mode: 0,
-            _reserved0: 0,
-            color: [1.0, 1.0, 1.0, 1.0],
-        }
-    }
-
     fn from_alpha_atlas_bitmap(
         bitmap: &SubtitleAlphaBitmap,
         placement: &OverlayAlphaAtlasPlacement,
@@ -1126,6 +1208,22 @@ impl OverlayUniforms {
             ],
         }
     }
+
+    fn from_output_alpha_atlas_rect(
+        color: [f32; 4],
+        rect: [f32; 4],
+        tex_rect: [f32; 4],
+        layout: VideoPresentationLayout,
+    ) -> Self {
+        Self {
+            rect,
+            tex_rect,
+            viewport: layout.overlay_viewport(),
+            overlay_mode: 1,
+            _reserved0: 0,
+            color,
+        }
+    }
 }
 
 fn overlay_uniform_pointer(uniforms: &OverlayUniforms) -> NonNull<c_void> {
@@ -1135,6 +1233,31 @@ fn overlay_uniform_pointer(uniforms: &OverlayUniforms) -> NonNull<c_void> {
             .cast_mut(),
     )
     .expect("overlay uniform pointer is non-null")
+}
+
+fn draw_alpha_mask(
+    encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+    pipeline: &ProtocolObject<dyn MTLRenderPipelineState>,
+    sampler: &ProtocolObject<dyn MTLSamplerState>,
+    texture: &ProtocolObject<dyn MTLTexture>,
+    uniforms: &OverlayUniforms,
+) {
+    unsafe {
+        encoder.setRenderPipelineState(pipeline);
+        encoder.setFragmentTexture_atIndex(Some(texture), 0);
+        encoder.setFragmentSamplerState_atIndex(Some(sampler), 0);
+        encoder.setVertexBytes_length_atIndex(
+            overlay_uniform_pointer(uniforms),
+            mem::size_of::<OverlayUniforms>(),
+            0,
+        );
+        encoder.setFragmentBytes_length_atIndex(
+            overlay_uniform_pointer(uniforms),
+            mem::size_of::<OverlayUniforms>(),
+            0,
+        );
+        encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1159,6 +1282,24 @@ struct OverlayAlphaAtlasCache {
     height: usize,
     placements: Vec<OverlayAlphaAtlasPlacement>,
     signature: OverlayAlphaAtlasSignature,
+}
+
+struct DanmakuAlphaAtlasCache {
+    version: u64,
+    width: u32,
+    height: u32,
+    stride: usize,
+    fill_texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    outline_texture: Retained<ProtocolObject<dyn MTLTexture>>,
+}
+
+impl DanmakuAlphaAtlasCache {
+    fn can_reuse_for(&self, atlas: &DanmakuGlyphAtlas) -> bool {
+        self.version == atlas.version
+            && self.width == atlas.width
+            && self.height == atlas.height
+            && self.stride == atlas.stride
+    }
 }
 
 impl OverlayAlphaAtlasCache {
@@ -1943,37 +2084,6 @@ mod tests {
         for (actual, expected) in uniforms.rect.into_iter().zip([500.0, 500.0, 100.0, 56.25]) {
             assert!((actual - expected).abs() < 0.001, "{actual} != {expected}");
         }
-    }
-
-    #[test]
-    fn overlay_uniforms_map_danmaku_rect_in_surface_space() {
-        let layout = super::VideoPresentationLayout::aspect_fit(1920, 1080, 1000, 1000);
-        let uniforms = super::OverlayUniforms::from_surface_plane(
-            0,
-            0,
-            1000,
-            1000,
-            crate::overlay::OverlayViewport::new(1000, 1000),
-            layout,
-        );
-
-        assert_eq!(uniforms.viewport, [1000.0, 1000.0]);
-        assert_eq!(uniforms.rect, [0.0, 0.0, 1000.0, 1000.0]);
-    }
-
-    #[test]
-    fn overlay_uniforms_scale_surface_space_to_drawable() {
-        let layout = super::VideoPresentationLayout::aspect_fit(1920, 1080, 1000, 1000);
-        let uniforms = super::OverlayUniforms::from_surface_plane(
-            100,
-            50,
-            200,
-            100,
-            crate::overlay::OverlayViewport::new(500, 500),
-            layout,
-        );
-
-        assert_eq!(uniforms.rect, [200.0, 100.0, 400.0, 200.0]);
     }
 
     #[test]

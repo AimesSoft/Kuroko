@@ -67,9 +67,43 @@ private struct KurokoPresenterStatsC {
   var renderedTestFrames: UInt64 = 0
   var pushedAudioFrames: UInt64 = 0
   var overlayFrames: UInt64 = 0
+  var danmakuFrames: UInt64 = 0
+  var danmakuItems: UInt64 = 0
   var importFailures: UInt64 = 0
   var renderFailures: UInt64 = 0
   var audioFailures: UInt64 = 0
+}
+
+private struct KurokoDanmakuConfigC {
+  var enabled: UInt8 = 1
+  // NipaPlay/Flutter logical font size; Kuroko applies the surface scale internally.
+  var fontSize: Float = 30.0
+  var opacity: Float = 1.0
+  var displayArea: Float = 1.0
+  var scrollDurationSeconds: Float = 10.0
+  var scrollSpeedFactor: Float = 1.0
+  var trackGapRatio: Float = 0.15
+  var outlineWidth: Float = 1.0
+  var shadowOffsetX: Float = 1.0
+  var shadowOffsetY: Float = 1.0
+  var mergeDuplicates: UInt8 = 0
+  var allowStacking: UInt8 = 0
+  var allowScrollOverwrite: UInt8 = 1
+  var maxQuantity: UInt32 = 0
+  var maxLinesPerMode: UInt32 = 0
+  var blockTop: UInt8 = 0
+  var blockBottom: UInt8 = 0
+  var blockScroll: UInt8 = 0
+  var shadowStyle: Int32 = 3
+}
+
+private struct KurokoDanmakuTrackInfoC {
+  var id: UInt64 = 0
+  var enabled: UInt8 = 0
+  var offsetMicros: Int64 = 0
+  var itemCount: Int = 0
+  var name: UnsafeMutablePointer<CChar>?
+  var source: UnsafeMutablePointer<CChar>?
 }
 
 private enum KurokoPluginError: Error, CustomStringConvertible {
@@ -117,6 +151,7 @@ private final class KurokoNativeLibrary {
   typealias OpenFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> Int32
   typealias CommandFn = @convention(c) (UnsafeMutableRawPointer?) -> Int32
   typealias SeekFn = @convention(c) (UnsafeMutableRawPointer?, UInt64) -> Int32
+  typealias SetPlaybackRateFn = @convention(c) (UnsafeMutableRawPointer?, Double) -> Int32
   typealias SelectTrackFn = @convention(c) (UnsafeMutableRawPointer?, Int64) -> Int32
   typealias AddExternalSubtitleFn = @convention(c) (
     UnsafeMutableRawPointer?,
@@ -124,6 +159,27 @@ private final class KurokoNativeLibrary {
     UnsafeMutablePointer<Int64>?
   ) -> Int32
   typealias RemoveSubtitleTrackFn = @convention(c) (UnsafeMutableRawPointer?, Int64) -> Int32
+  typealias LoadDanmakuFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> Int32
+  typealias AddDanmakuTrackFn = @convention(c) (
+    UnsafeMutableRawPointer?,
+    UnsafePointer<CChar>?,
+    UnsafePointer<CChar>?,
+    Int64,
+    UnsafeMutablePointer<UInt64>?
+  ) -> Int32
+  typealias ClearDanmakuFn = @convention(c) (UnsafeMutableRawPointer?) -> Int32
+  typealias SetDanmakuEnabledFn = @convention(c) (UnsafeMutableRawPointer?, Bool) -> Int32
+  typealias SetDanmakuConfigFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeRawPointer?) -> Int32
+  typealias SetDanmakuFontFn = @convention(c) (
+    UnsafeMutableRawPointer?,
+    UnsafePointer<CChar>?,
+    UnsafePointer<CChar>?
+  ) -> Int32
+  typealias SetDanmakuBlockWordsFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> Int32
+  typealias RemoveDanmakuTrackFn = @convention(c) (UnsafeMutableRawPointer?, UInt64) -> Int32
+  typealias SetDanmakuTrackEnabledFn = @convention(c) (UnsafeMutableRawPointer?, UInt64, Bool) -> Int32
+  typealias SetDanmakuTrackOffsetFn = @convention(c) (UnsafeMutableRawPointer?, UInt64, Int64) -> Int32
+  typealias SetDanmakuGlobalOffsetFn = @convention(c) (UnsafeMutableRawPointer?, Int64) -> Int32
   typealias TrackSelectionFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Int32
   typealias TracksFn = @convention(c) (
     UnsafeMutableRawPointer?,
@@ -132,6 +188,7 @@ private final class KurokoNativeLibrary {
     UnsafeMutablePointer<Int>?
   ) -> Int32
   typealias TrackInfoFreeFn = @convention(c) (UnsafeMutableRawPointer?) -> Void
+  typealias DanmakuTrackInfoFreeFn = @convention(c) (UnsafeMutableRawPointer?) -> Void
   typealias AttachMetalLayerFn = @convention(c) (UnsafeMutableRawPointer?, UInt64, UInt32, UInt32, Double) -> Int32
   typealias ResizeSurfaceFn = @convention(c) (UnsafeMutableRawPointer?, UInt32, UInt32, Double) -> Int32
   typealias RenderTickFn = @convention(c) (UnsafeMutableRawPointer?, Double, UnsafeMutableRawPointer?) -> Int32
@@ -148,13 +205,29 @@ private final class KurokoNativeLibrary {
   let stop: CommandFn
   let close: CommandFn
   let seek: SeekFn
+  let setPlaybackRate: SetPlaybackRateFn?
   let selectAudioTrack: SelectTrackFn
   let selectSubtitleTrack: SelectTrackFn
   let addExternalSubtitle: AddExternalSubtitleFn
   let removeSubtitleTrack: RemoveSubtitleTrackFn
+  let loadDanmakuFile: LoadDanmakuFn?
+  let loadDanmakuJson: LoadDanmakuFn?
+  let addDanmakuTrackFile: AddDanmakuTrackFn?
+  let addDanmakuTrackJson: AddDanmakuTrackFn?
+  let removeDanmakuTrack: RemoveDanmakuTrackFn?
+  let setDanmakuTrackEnabled: SetDanmakuTrackEnabledFn?
+  let setDanmakuTrackOffset: SetDanmakuTrackOffsetFn?
+  let setDanmakuGlobalOffset: SetDanmakuGlobalOffsetFn?
+  let danmakuTracks: TracksFn?
+  let clearDanmaku: ClearDanmakuFn?
+  let setDanmakuEnabled: SetDanmakuEnabledFn?
+  let setDanmakuConfig: SetDanmakuConfigFn?
+  let setDanmakuFont: SetDanmakuFontFn?
+  let setDanmakuBlockWords: SetDanmakuBlockWordsFn?
   let trackSelection: TrackSelectionFn
   let tracks: TracksFn
   let freeTrackInfo: TrackInfoFreeFn
+  let freeDanmakuTrackInfo: DanmakuTrackInfoFreeFn?
   let attachMetalLayer: AttachMetalLayerFn
   let resizeSurface: ResizeSurfaceFn
   let detachSurface: CommandFn
@@ -176,13 +249,29 @@ private final class KurokoNativeLibrary {
     stop = try Self.load("kuroko_presenter_stop", from: libraryHandle, as: CommandFn.self)
     close = try Self.load("kuroko_presenter_close", from: libraryHandle, as: CommandFn.self)
     seek = try Self.load("kuroko_presenter_seek", from: libraryHandle, as: SeekFn.self)
+    setPlaybackRate = Self.loadOptional("kuroko_presenter_set_playback_rate", from: libraryHandle, as: SetPlaybackRateFn.self)
     selectAudioTrack = try Self.load("kuroko_presenter_select_audio_track", from: libraryHandle, as: SelectTrackFn.self)
     selectSubtitleTrack = try Self.load("kuroko_presenter_select_subtitle_track", from: libraryHandle, as: SelectTrackFn.self)
     addExternalSubtitle = try Self.load("kuroko_presenter_add_external_subtitle", from: libraryHandle, as: AddExternalSubtitleFn.self)
     removeSubtitleTrack = try Self.load("kuroko_presenter_remove_subtitle_track", from: libraryHandle, as: RemoveSubtitleTrackFn.self)
+    loadDanmakuFile = Self.loadOptional("kuroko_presenter_load_danmaku_file", from: libraryHandle, as: LoadDanmakuFn.self)
+    loadDanmakuJson = Self.loadOptional("kuroko_presenter_load_danmaku_json", from: libraryHandle, as: LoadDanmakuFn.self)
+    addDanmakuTrackFile = Self.loadOptional("kuroko_presenter_add_danmaku_track_file", from: libraryHandle, as: AddDanmakuTrackFn.self)
+    addDanmakuTrackJson = Self.loadOptional("kuroko_presenter_add_danmaku_track_json", from: libraryHandle, as: AddDanmakuTrackFn.self)
+    removeDanmakuTrack = Self.loadOptional("kuroko_presenter_remove_danmaku_track", from: libraryHandle, as: RemoveDanmakuTrackFn.self)
+    setDanmakuTrackEnabled = Self.loadOptional("kuroko_presenter_set_danmaku_track_enabled", from: libraryHandle, as: SetDanmakuTrackEnabledFn.self)
+    setDanmakuTrackOffset = Self.loadOptional("kuroko_presenter_set_danmaku_track_offset", from: libraryHandle, as: SetDanmakuTrackOffsetFn.self)
+    setDanmakuGlobalOffset = Self.loadOptional("kuroko_presenter_set_danmaku_global_offset", from: libraryHandle, as: SetDanmakuGlobalOffsetFn.self)
+    danmakuTracks = Self.loadOptional("kuroko_presenter_danmaku_tracks", from: libraryHandle, as: TracksFn.self)
+    clearDanmaku = Self.loadOptional("kuroko_presenter_clear_danmaku", from: libraryHandle, as: ClearDanmakuFn.self)
+    setDanmakuEnabled = Self.loadOptional("kuroko_presenter_set_danmaku_enabled", from: libraryHandle, as: SetDanmakuEnabledFn.self)
+    setDanmakuConfig = Self.loadOptional("kuroko_presenter_set_danmaku_config_ptr", from: libraryHandle, as: SetDanmakuConfigFn.self)
+    setDanmakuFont = Self.loadOptional("kuroko_presenter_set_danmaku_font", from: libraryHandle, as: SetDanmakuFontFn.self)
+    setDanmakuBlockWords = Self.loadOptional("kuroko_presenter_set_danmaku_block_words_json", from: libraryHandle, as: SetDanmakuBlockWordsFn.self)
     trackSelection = try Self.load("kuroko_presenter_track_selection", from: libraryHandle, as: TrackSelectionFn.self)
     tracks = try Self.load("kuroko_presenter_tracks", from: libraryHandle, as: TracksFn.self)
     freeTrackInfo = try Self.load("kuroko_track_info_free", from: libraryHandle, as: TrackInfoFreeFn.self)
+    freeDanmakuTrackInfo = Self.loadOptional("kuroko_danmaku_track_info_free", from: libraryHandle, as: DanmakuTrackInfoFreeFn.self)
     attachMetalLayer = try Self.load("kuroko_presenter_attach_metal_layer", from: libraryHandle, as: AttachMetalLayerFn.self)
     resizeSurface = try Self.load("kuroko_presenter_resize_surface", from: libraryHandle, as: ResizeSurfaceFn.self)
     detachSurface = try Self.load("kuroko_presenter_detach_surface", from: libraryHandle, as: CommandFn.self)
@@ -212,7 +301,9 @@ private final class KurokoNativeLibrary {
       let executableDirectory = URL(fileURLWithPath: executablePath).deletingLastPathComponent().path
       candidates.append(URL(fileURLWithPath: executableDirectory).appendingPathComponent("libkuroko_capi.dylib").path)
     }
-    candidates.append("/Users/sakiko/Desktop/Kuroko/target/debug/libkuroko_capi.dylib")
+    if let sourceTreePath = Self.sourceTreeDebugLibraryPath() {
+      candidates.append(sourceTreePath)
+    }
     candidates.append("libkuroko_capi.dylib")
 
     var failures: [KurokoPluginError] = []
@@ -225,6 +316,21 @@ private final class KurokoNativeLibrary {
       failures.append(.libraryLoadFailed(path, detail))
     }
     throw KurokoPluginError.libraryNotFound(failures.map(String.init(describing:)))
+  }
+
+  fileprivate static func sourceTreeDebugLibraryPath() -> String? {
+    let sourceFile = URL(fileURLWithPath: #filePath)
+    let kurokoRoot = sourceFile
+      .deletingLastPathComponent() // Classes
+      .deletingLastPathComponent() // macos
+      .deletingLastPathComponent() // kuroko_flutter
+      .deletingLastPathComponent() // packages
+      .deletingLastPathComponent() // Kuroko repo root
+    return kurokoRoot
+      .appendingPathComponent("target")
+      .appendingPathComponent("debug")
+      .appendingPathComponent("libkuroko_capi.dylib")
+      .path
   }
 
   private static func load<T>(_ symbol: String, from handle: UnsafeMutableRawPointer, as type: T.Type) throws -> T {
@@ -299,6 +405,13 @@ private final class KurokoPlayerHost {
     try check(library.seek(handle, positionMicros), operation: "seek")
   }
 
+  func setPlaybackRate(_ rate: Double) throws {
+    guard let setRate = library.setPlaybackRate else {
+      throw KurokoPluginError.symbolMissing("kuroko_presenter_set_playback_rate")
+    }
+    try check(setRate(handle, rate), operation: "set_playback_rate")
+  }
+
   func addExternalSubtitle(uri: String) throws -> Int64 {
     var trackId: Int64 = 0
     try uri.withCString { cString in
@@ -315,6 +428,154 @@ private final class KurokoPlayerHost {
       library.removeSubtitleTrack(handle, trackId),
       operation: "remove_subtitle_track"
     )
+  }
+
+  func loadDanmakuFile(uri: String) throws {
+    guard let load = library.loadDanmakuFile else {
+      throw KurokoPluginError.symbolMissing("kuroko_presenter_load_danmaku_file")
+    }
+    try uri.withCString { cString in
+      try check(load(handle, cString), operation: "load_danmaku_file")
+    }
+  }
+
+  func loadDanmakuJson(_ json: String) throws {
+    guard let load = library.loadDanmakuJson else {
+      throw KurokoPluginError.symbolMissing("kuroko_presenter_load_danmaku_json")
+    }
+    try json.withCString { cString in
+      try check(load(handle, cString), operation: "load_danmaku_json")
+    }
+  }
+
+  func addDanmakuTrackFile(uri: String, name: String?, offsetMicros: Int64) throws -> UInt64 {
+    guard let add = library.addDanmakuTrackFile else {
+      throw KurokoPluginError.symbolMissing("kuroko_presenter_add_danmaku_track_file")
+    }
+    var trackId: UInt64 = 0
+    let status = uri.withCString { uriCString in
+      withOptionalCString(name) { nameCString in
+        add(handle, uriCString, nameCString, offsetMicros, &trackId)
+      }
+    }
+    try check(status, operation: "add_danmaku_track_file")
+    return trackId
+  }
+
+  func addDanmakuTrackJson(_ json: String, name: String?, offsetMicros: Int64) throws -> UInt64 {
+    guard let add = library.addDanmakuTrackJson else {
+      throw KurokoPluginError.symbolMissing("kuroko_presenter_add_danmaku_track_json")
+    }
+    var trackId: UInt64 = 0
+    let status = json.withCString { jsonCString in
+      withOptionalCString(name) { nameCString in
+        add(handle, jsonCString, nameCString, offsetMicros, &trackId)
+      }
+    }
+    try check(status, operation: "add_danmaku_track_json")
+    return trackId
+  }
+
+  func removeDanmakuTrack(trackId: UInt64) throws {
+    guard let remove = library.removeDanmakuTrack else {
+      throw KurokoPluginError.symbolMissing("kuroko_presenter_remove_danmaku_track")
+    }
+    try check(remove(handle, trackId), operation: "remove_danmaku_track")
+  }
+
+  func setDanmakuTrackEnabled(trackId: UInt64, enabled: Bool) throws {
+    guard let setEnabled = library.setDanmakuTrackEnabled else {
+      throw KurokoPluginError.symbolMissing("kuroko_presenter_set_danmaku_track_enabled")
+    }
+    try check(setEnabled(handle, trackId, enabled), operation: "set_danmaku_track_enabled")
+  }
+
+  func setDanmakuTrackOffset(trackId: UInt64, offsetMicros: Int64) throws {
+    guard let setOffset = library.setDanmakuTrackOffset else {
+      throw KurokoPluginError.symbolMissing("kuroko_presenter_set_danmaku_track_offset")
+    }
+    try check(setOffset(handle, trackId, offsetMicros), operation: "set_danmaku_track_offset")
+  }
+
+  func setDanmakuGlobalOffset(offsetMicros: Int64) throws {
+    guard let setOffset = library.setDanmakuGlobalOffset else {
+      throw KurokoPluginError.symbolMissing("kuroko_presenter_set_danmaku_global_offset")
+    }
+    try check(setOffset(handle, offsetMicros), operation: "set_danmaku_global_offset")
+  }
+
+  func danmakuTracks() throws -> [[String: Any]] {
+    guard let danmakuTracks = library.danmakuTracks else {
+      throw KurokoPluginError.symbolMissing("kuroko_presenter_danmaku_tracks")
+    }
+    var count: Int = 0
+    try check(danmakuTracks(handle, nil, 0, &count), operation: "danmaku_tracks_len")
+    if count <= 0 {
+      return []
+    }
+    var tracks = Array(repeating: KurokoDanmakuTrackInfoC(), count: count)
+    var written: Int = 0
+    let status = tracks.withUnsafeMutableBufferPointer { buffer in
+      danmakuTracks(handle, UnsafeMutableRawPointer(buffer.baseAddress), buffer.count, &written)
+    }
+    try check(status, operation: "danmaku_tracks")
+    let result = tracks.prefix(min(written, tracks.count)).map { $0.toFlutterMap() }
+    if let free = library.freeDanmakuTrackInfo {
+      for index in tracks.indices {
+        withUnsafeMutablePointer(to: &tracks[index]) { pointer in
+          free(UnsafeMutableRawPointer(pointer))
+        }
+      }
+    }
+    return result
+  }
+
+  func clearDanmaku() throws {
+    guard let clear = library.clearDanmaku else {
+      throw KurokoPluginError.symbolMissing("kuroko_presenter_clear_danmaku")
+    }
+    try check(clear(handle), operation: "clear_danmaku")
+  }
+
+  func setDanmakuEnabled(_ enabled: Bool) throws {
+    guard let setEnabled = library.setDanmakuEnabled else {
+      throw KurokoPluginError.symbolMissing("kuroko_presenter_set_danmaku_enabled")
+    }
+    try check(setEnabled(handle, enabled), operation: "set_danmaku_enabled")
+  }
+
+  func setDanmakuConfig(_ config: KurokoDanmakuConfigC) throws {
+    guard let setConfig = library.setDanmakuConfig else {
+      throw KurokoPluginError.symbolMissing("kuroko_presenter_set_danmaku_config_ptr")
+    }
+    var config = config
+    let status = withUnsafePointer(to: &config) { pointer in
+      setConfig(handle, UnsafeRawPointer(pointer))
+    }
+    try check(status, operation: "set_danmaku_config")
+  }
+
+  func setDanmakuFont(family: String?, filePath: String?) throws {
+    guard let setFont = library.setDanmakuFont else {
+      throw KurokoPluginError.symbolMissing("kuroko_presenter_set_danmaku_font")
+    }
+    let family = family ?? ""
+    let filePath = filePath ?? ""
+    let status = withOptionalCString(family) { familyCString in
+      withOptionalCString(filePath) { filePathCString in
+        setFont(handle, familyCString, filePathCString)
+      }
+    }
+    try check(status, operation: "set_danmaku_font")
+  }
+
+  func setDanmakuBlockWordsJson(_ json: String) throws {
+    guard let setBlockWords = library.setDanmakuBlockWords else {
+      throw KurokoPluginError.symbolMissing("kuroko_presenter_set_danmaku_block_words_json")
+    }
+    try json.withCString { cString in
+      try check(setBlockWords(handle, cString), operation: "set_danmaku_block_words")
+    }
   }
 
   func selectAudioTrack(trackId: Int64?) throws {
@@ -523,6 +784,28 @@ private extension KurokoTrackInfoC {
       "language": language.map { String(cString: $0) } as Any,
       "codec": codec.map { String(cString: $0) } as Any,
     ]
+  }
+}
+
+private extension KurokoDanmakuTrackInfoC {
+  func toFlutterMap() -> [String: Any] {
+    [
+      "id": Int64(clamping: id),
+      "enabled": enabled != 0,
+      "offsetMicros": offsetMicros,
+      "itemCount": itemCount,
+      "name": name.map { String(cString: $0) } as Any,
+      "source": source.map { String(cString: $0) } as Any,
+    ]
+  }
+}
+
+private func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) -> R) -> R {
+  guard let value, !value.isEmpty else {
+    return body(nil)
+  }
+  return value.withCString { pointer in
+    body(pointer)
   }
 }
 
@@ -844,6 +1127,14 @@ public final class KurokoFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHa
         let positionMicros = try requiredUInt64(args["positionMicros"], name: "positionMicros")
         try host.seek(positionMicros: positionMicros)
         result(nil)
+      case "setPlaybackRate":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        guard let rate = doubleValue(args["rate"]) else {
+          throw KurokoPluginError.invalidArguments("rate is required.")
+        }
+        try host.setPlaybackRate(rate)
+        result(nil)
       case "addExternalSubtitle":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
@@ -856,6 +1147,98 @@ public final class KurokoFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHa
         let host = try playerHost(from: args)
         let trackId = try requiredInt64(args["trackId"], name: "trackId")
         try host.removeSubtitleTrack(trackId: trackId)
+        result(nil)
+      case "loadDanmakuFile":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        guard let uri = args["uri"] as? String, !uri.isEmpty else {
+          throw KurokoPluginError.invalidArguments("uri is required.")
+        }
+        try host.loadDanmakuFile(uri: uri)
+        result(nil)
+      case "loadDanmakuJson":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        guard let json = args["json"] as? String, !json.isEmpty else {
+          throw KurokoPluginError.invalidArguments("json is required.")
+        }
+        try host.loadDanmakuJson(json)
+        result(nil)
+      case "addDanmakuTrackFile":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        guard let uri = args["uri"] as? String, !uri.isEmpty else {
+          throw KurokoPluginError.invalidArguments("uri is required.")
+        }
+        let offsetMicros = int64Value(args["offsetMicros"]) ?? 0
+        result(Int64(clamping: try host.addDanmakuTrackFile(
+          uri: uri,
+          name: args["name"] as? String,
+          offsetMicros: offsetMicros
+        )))
+      case "addDanmakuTrackJson":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        guard let json = args["json"] as? String, !json.isEmpty else {
+          throw KurokoPluginError.invalidArguments("json is required.")
+        }
+        let offsetMicros = int64Value(args["offsetMicros"]) ?? 0
+        result(Int64(clamping: try host.addDanmakuTrackJson(
+          json,
+          name: args["name"] as? String,
+          offsetMicros: offsetMicros
+        )))
+      case "removeDanmakuTrack":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        try host.removeDanmakuTrack(trackId: try requiredUInt64(args["trackId"], name: "trackId"))
+        result(nil)
+      case "setDanmakuTrackEnabled":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        try host.setDanmakuTrackEnabled(
+          trackId: try requiredUInt64(args["trackId"], name: "trackId"),
+          enabled: boolValue(args["enabled"]) ?? true
+        )
+        result(nil)
+      case "setDanmakuTrackOffset":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        try host.setDanmakuTrackOffset(
+          trackId: try requiredUInt64(args["trackId"], name: "trackId"),
+          offsetMicros: int64Value(args["offsetMicros"]) ?? 0
+        )
+        result(nil)
+      case "setDanmakuGlobalOffset":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        try host.setDanmakuGlobalOffset(offsetMicros: int64Value(args["offsetMicros"]) ?? 0)
+        result(nil)
+      case "danmakuTracks":
+        let host = try playerHost(from: try dictionaryArgs(call.arguments))
+        result(try host.danmakuTracks())
+      case "clearDanmaku":
+        let host = try playerHost(from: try dictionaryArgs(call.arguments))
+        try host.clearDanmaku()
+        result(nil)
+      case "setDanmakuEnabled":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        try host.setDanmakuEnabled(boolValue(args["enabled"]) ?? true)
+        result(nil)
+      case "setDanmakuConfig":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        try host.setDanmakuConfig(danmakuConfig(from: args))
+        if args.keys.contains("customFontFamily") || args.keys.contains("customFontFilePath") {
+          try host.setDanmakuFont(
+            family: args["customFontFamily"] as? String,
+            filePath: args["customFontFilePath"] as? String
+          )
+        }
+        if let blockWordsJson = args["blockWordsJson"] as? String {
+          try host.setDanmakuBlockWordsJson(blockWordsJson)
+        }
         result(nil)
       case "selectAudioTrack":
         let args = try dictionaryArgs(call.arguments)
@@ -1060,7 +1443,7 @@ public final class KurokoFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHa
     guard let library = KurokoNativeLibrary.shared else {
       throw KurokoPluginError.libraryNotFound([
         ProcessInfo.processInfo.environment["KUROKO_CAPI_DYLIB"] ?? "",
-        "/Users/sakiko/Desktop/Kuroko/target/debug/libkuroko_capi.dylib",
+        KurokoNativeLibrary.sourceTreeDebugLibraryPath() ?? "",
         "libkuroko_capi.dylib",
       ].filter { !$0.isEmpty })
     }
@@ -1206,6 +1589,68 @@ public final class KurokoFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHa
       throw KurokoPluginError.invalidArguments("trackId must be an integer or null.")
     }
     return trackId >= 0 ? trackId : nil
+  }
+
+  private func danmakuConfig(from args: [String: Any]) -> KurokoDanmakuConfigC {
+    var config = KurokoDanmakuConfigC()
+    if let value = boolValue(args["enabled"]) {
+      config.enabled = value ? 1 : 0
+    }
+    if let value = doubleValue(args["fontSize"]) {
+      config.fontSize = Float(value)
+    }
+    if let value = doubleValue(args["opacity"]) {
+      config.opacity = Float(value)
+    }
+    if let value = doubleValue(args["displayArea"]) {
+      config.displayArea = Float(value)
+    }
+    if let value = doubleValue(args["scrollDurationSeconds"]) {
+      config.scrollDurationSeconds = Float(value)
+    }
+    if let value = doubleValue(args["scrollSpeedFactor"]) {
+      config.scrollSpeedFactor = Float(value)
+    }
+    if let value = doubleValue(args["trackGapRatio"]) {
+      config.trackGapRatio = Float(value)
+    }
+    if let value = doubleValue(args["outlineWidth"]) {
+      config.outlineWidth = Float(value)
+    }
+    if let value = doubleValue(args["shadowOffsetX"]) {
+      config.shadowOffsetX = Float(value)
+    }
+    if let value = doubleValue(args["shadowOffsetY"]) {
+      config.shadowOffsetY = Float(value)
+    }
+    if let value = boolValue(args["mergeDuplicates"]) {
+      config.mergeDuplicates = value ? 1 : 0
+    }
+    if let value = boolValue(args["allowStacking"]) {
+      config.allowStacking = value ? 1 : 0
+    }
+    if let value = boolValue(args["allowScrollOverwrite"]) {
+      config.allowScrollOverwrite = value ? 1 : 0
+    }
+    if let value = int64Value(args["maxQuantity"]), value > 0 {
+      config.maxQuantity = UInt32(clamping: value)
+    }
+    if let value = int64Value(args["maxLinesPerMode"]), value > 0 {
+      config.maxLinesPerMode = UInt32(clamping: value)
+    }
+    if let value = boolValue(args["blockTop"]) {
+      config.blockTop = value ? 1 : 0
+    }
+    if let value = boolValue(args["blockBottom"]) {
+      config.blockBottom = value ? 1 : 0
+    }
+    if let value = boolValue(args["blockScroll"]) {
+      config.blockScroll = value ? 1 : 0
+    }
+    if let value = int64Value(args["shadowStyle"]) {
+      config.shadowStyle = Int32(clamping: value)
+    }
+    return config
   }
 
   private func startPollTimerIfNeeded() {

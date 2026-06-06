@@ -1,6 +1,6 @@
 /// Danmaku type-specific position computation.
 /// Ported from R2LDanmaku, L2RDanmaku, FTDanmaku, FBDanmaku, SpecialDanmaku.
-use crate::danmaku_next2::dfm_core::model::{DanmakuItem, DanmakuType, GlobalFlags, LinePath};
+use crate::danmaku::dfm_core::model::{DanmakuItem, DanmakuType, GlobalFlags, LinePath};
 
 /// Layout result for a single danmaku item.
 #[derive(Debug, Clone)]
@@ -146,7 +146,7 @@ pub fn layout_item(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::danmaku_next2::dfm_core::model::DanmakuItem;
+    use crate::danmaku::dfm_core::model::DanmakuItem;
 
     #[test]
     fn test_r2l_x_at_start() {

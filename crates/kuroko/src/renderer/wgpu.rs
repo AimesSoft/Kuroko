@@ -1,11 +1,11 @@
 use std::ffi::c_void;
-
 use wgpu::util::DeviceExt;
 
 use crate::core::{
-    ColorPrimaries, PlatformSurface, PlayerError, PlayerVideoFrame, RendererBackend, Result,
-    TransferFunction, WgpuSurfaceHandle, WgpuSurfaceKind,
+    ColorPrimaries, PlatformSurface, PlayerError, PlayerVideoFrame, RenderFrameContext,
+    RendererBackend, Result, TransferFunction, WgpuSurfaceHandle, WgpuSurfaceKind,
 };
+use crate::danmaku::{DanmakuGlyphAtlas, DanmakuGlyphInstance, DanmakuRenderPlan};
 use crate::ffmpeg::{PlanarFrame, PlanarPixelFormat};
 use crate::overlay::OverlayFrame;
 use crate::renderer::pipeline::{
@@ -19,6 +19,8 @@ pub struct WgpuRendererStats {
     pub surface_height: u32,
     pub rendered_frames: u64,
     pub offscreen_frames: u64,
+    pub danmaku_passes: u64,
+    pub danmaku_items: u64,
     pub attached: bool,
 }
 
@@ -139,7 +141,7 @@ fn transfer_code(transfer: TransferFunction) -> u32 {
         TransferFunction::Bt1886 => 2,
         TransferFunction::Pq => 3,
         TransferFunction::Hlg => 4,
-        TransferFunction::Unknown => 0,
+        TransferFunction::Unknown => 1,
     }
 }
 
@@ -152,9 +154,7 @@ fn tone_map_code(operator: ToneMapOperator) -> u32 {
 }
 
 fn overlay_has_planes(frame: &OverlayFrame) -> bool {
-    !frame.subtitle_planes.is_empty()
-        || !frame.subtitle_alpha_planes.is_empty()
-        || !frame.danmaku_planes.is_empty()
+    !frame.subtitle_planes.is_empty() || !frame.subtitle_alpha_planes.is_empty()
 }
 
 /// Overlay quad uniforms, byte-compatible with the Metal `OverlayUniforms`.
@@ -231,6 +231,23 @@ impl OverlayUniforms {
             ],
         }
     }
+
+    fn alpha_atlas_rect(
+        color: [f32; 4],
+        rect: [f32; 4],
+        tex_rect: [f32; 4],
+        viewport_w: u32,
+        viewport_h: u32,
+    ) -> Self {
+        Self {
+            rect,
+            tex_rect,
+            viewport: [viewport_w.max(1) as f32, viewport_h.max(1) as f32],
+            overlay_mode: 1,
+            reserved0: 0,
+            color,
+        }
+    }
 }
 
 /// Lazily-built GPU objects for the NV12/P010 video pipeline, tied to the color
@@ -259,6 +276,24 @@ struct OverlayDraw {
     _uniform: wgpu::Buffer,
 }
 
+struct WgpuDanmakuAtlasCache {
+    version: u64,
+    width: u32,
+    height: u32,
+    stride: usize,
+    fill_texture: wgpu::Texture,
+    outline_texture: wgpu::Texture,
+}
+
+impl WgpuDanmakuAtlasCache {
+    fn can_reuse_for(&self, atlas: &DanmakuGlyphAtlas) -> bool {
+        self.version == atlas.version
+            && self.width == atlas.width
+            && self.height == atlas.height
+            && self.stride == atlas.stride
+    }
+}
+
 /// The currently uploaded video frame: GPU plane textures plus the color uniforms
 /// to render it. Retained so the presenter can re-present it across vsync ticks.
 struct UploadedVideoFrame {
@@ -284,6 +319,7 @@ pub struct WgpuRenderer {
     video_pipeline: Option<VideoPipeline>,
     overlay_pipeline: Option<OverlayPipeline>,
     current_video: Option<UploadedVideoFrame>,
+    danmaku_atlas_cache: Option<WgpuDanmakuAtlasCache>,
     supports_16bit_norm: bool,
     stats: WgpuRendererStats,
 }
@@ -333,6 +369,7 @@ impl WgpuRenderer {
             video_pipeline: None,
             overlay_pipeline: None,
             current_video: None,
+            danmaku_atlas_cache: None,
             supports_16bit_norm,
             stats: WgpuRendererStats::default(),
         })
@@ -533,6 +570,14 @@ impl WgpuRenderer {
     /// Upload a repacked planar frame (8-bit NV12 or 10-bit P010) as the current
     /// video frame. P010 requires the `TEXTURE_FORMAT_16BIT_NORM` adapter feature.
     pub fn upload_planar(&mut self, frame: PlanarFrame, uniforms: VideoUniforms) -> Result<()> {
+        self.upload_planar_with_context(frame, uniforms)
+    }
+
+    fn upload_planar_with_context(
+        &mut self,
+        frame: PlanarFrame,
+        uniforms: VideoUniforms,
+    ) -> Result<()> {
         let width = frame.width;
         let height = frame.height;
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
@@ -638,7 +683,7 @@ impl WgpuRenderer {
             view_formats: &[],
         });
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
-        self.draw_current_video(&target_view, overlay)?;
+        let _ = self.draw_current_video(&target_view, overlay, None)?;
         let rgba = self.read_back_rgba8(&target, width, height)?;
         self.stats.rendered_frames += 1;
         Ok(Some(WgpuOffscreenReadback {
@@ -652,10 +697,19 @@ impl WgpuRenderer {
     /// `target_view`. The caller must have uploaded a frame and the video pipeline
     /// must be initialized.
     fn draw_current_video(
-        &self,
+        &mut self,
         target_view: &wgpu::TextureView,
         overlay: Option<&OverlayFrame>,
-    ) -> Result<()> {
+        danmaku: Option<&DanmakuRenderPlan>,
+    ) -> Result<usize> {
+        let overlay_draws = match overlay {
+            Some(frame) if overlay_has_planes(frame) => self.prepare_overlay_draws(frame)?,
+            _ => Vec::new(),
+        };
+        let danmaku_draws = match danmaku {
+            Some(plan) if !plan.is_empty() => self.prepare_danmaku_draws(plan)?,
+            _ => Vec::new(),
+        };
         let video = self
             .current_video
             .as_ref()
@@ -664,11 +718,6 @@ impl WgpuRenderer {
             .video_pipeline
             .as_ref()
             .ok_or_else(|| PlayerError::Renderer("video pipeline not initialized".to_string()))?;
-
-        let overlay_draws = match overlay {
-            Some(frame) if overlay_has_planes(frame) => self.prepare_overlay_draws(frame)?,
-            _ => Vec::new(),
-        };
 
         let luma_view = video
             .luma
@@ -733,7 +782,7 @@ impl WgpuRenderer {
             pass.draw(0..3, 0..1);
         }
 
-        if !overlay_draws.is_empty() {
+        if !overlay_draws.is_empty() || !danmaku_draws.is_empty() {
             let overlay_pipeline = self.overlay_pipeline.as_ref().ok_or_else(|| {
                 PlayerError::Renderer("overlay pipeline not initialized".to_string())
             })?;
@@ -759,10 +808,14 @@ impl WgpuRenderer {
                 pass.set_bind_group(0, &draw.bind_group, &[]);
                 pass.draw(0..4, 0..1);
             }
+            for draw in &danmaku_draws {
+                pass.set_bind_group(0, &draw.bind_group, &[]);
+                pass.draw(0..4, 0..1);
+            }
         }
 
         self.queue.submit(Some(encoder.finish()));
-        Ok(())
+        Ok(danmaku_draws.len())
     }
 
     /// Build per-quad GPU resources for the overlay: straight-RGBA subtitle planes
@@ -808,40 +861,124 @@ impl WgpuRenderer {
             );
             draws.push(self.make_overlay_draw(&texture, uniforms));
         }
-        for plane in &frame.danmaku_planes {
-            if plane.width == 0 || plane.height == 0 {
-                continue;
-            }
-            let expected = plane.width as usize * plane.height as usize * 4;
-            if plane.rgba.len() != expected {
-                return Err(PlayerError::Renderer(format!(
-                    "overlay danmaku plane has {} bytes, expected {expected} for {}x{} RGBA",
-                    plane.rgba.len(),
-                    plane.width,
-                    plane.height
-                )));
-            }
-            let texture = self.create_plane_texture(
-                "kuroko-wgpu-overlay-danmaku-plane",
-                plane.width,
-                plane.height,
-                wgpu::TextureFormat::Rgba8Unorm,
-                &plane.rgba,
-                plane.width * 4,
-            );
-            let uniforms = OverlayUniforms::rgba_plane(
-                plane.x,
-                plane.y,
-                plane.width,
-                plane.height,
-                frame.surface_viewport.width,
-                frame.surface_viewport.height,
-            );
-            draws.push(self.make_overlay_draw(&texture, uniforms));
-        }
 
         self.append_alpha_atlas_draws(frame, viewport_w, viewport_h, &mut draws)?;
         Ok(draws)
+    }
+
+    fn prepare_danmaku_draws(&mut self, plan: &DanmakuRenderPlan) -> Result<Vec<OverlayDraw>> {
+        if self.overlay_pipeline.is_none() {
+            return Err(PlayerError::Renderer(
+                "overlay pipeline not initialized".to_string(),
+            ));
+        }
+        let Some(atlas) = plan.atlas.as_ref() else {
+            return Ok(Vec::new());
+        };
+        if !atlas.is_valid() {
+            return Err(PlayerError::Renderer(format!(
+                "danmaku glyph atlas has fill={} outline={} bytes, expected at least {} for {}x{} stride {}",
+                atlas.fill_alpha.len(),
+                atlas.outline_alpha.len(),
+                atlas.required_len(),
+                atlas.width,
+                atlas.height,
+                atlas.stride
+            )));
+        }
+        let viewport_w = plan.viewport.width;
+        let viewport_h = plan.viewport.height;
+        let mut draws = Vec::with_capacity(plan.items.len() * 3);
+        let (fill_texture, outline_texture) = self.prepare_danmaku_atlas_textures(atlas);
+        for item in &plan.items {
+            self.append_danmaku_glyph_draws(
+                item,
+                &fill_texture,
+                &outline_texture,
+                viewport_w,
+                viewport_h,
+                &mut draws,
+            );
+        }
+        Ok(draws)
+    }
+
+    fn prepare_danmaku_atlas_textures(
+        &mut self,
+        atlas: &DanmakuGlyphAtlas,
+    ) -> (wgpu::Texture, wgpu::Texture) {
+        if let Some(cache) = &self.danmaku_atlas_cache {
+            if cache.can_reuse_for(atlas) {
+                return (cache.fill_texture.clone(), cache.outline_texture.clone());
+            }
+        }
+        let fill_texture = self.create_plane_texture(
+            "kuroko-wgpu-danmaku-fill-atlas",
+            atlas.width,
+            atlas.height,
+            wgpu::TextureFormat::R8Unorm,
+            &atlas.fill_alpha,
+            atlas.stride as u32,
+        );
+        let outline_texture = self.create_plane_texture(
+            "kuroko-wgpu-danmaku-outline-atlas",
+            atlas.width,
+            atlas.height,
+            wgpu::TextureFormat::R8Unorm,
+            &atlas.outline_alpha,
+            atlas.stride as u32,
+        );
+        self.danmaku_atlas_cache = Some(WgpuDanmakuAtlasCache {
+            version: atlas.version,
+            width: atlas.width,
+            height: atlas.height,
+            stride: atlas.stride,
+            fill_texture: fill_texture.clone(),
+            outline_texture: outline_texture.clone(),
+        });
+        (fill_texture, outline_texture)
+    }
+
+    fn append_danmaku_glyph_draws(
+        &self,
+        item: &DanmakuGlyphInstance,
+        fill_texture: &wgpu::Texture,
+        outline_texture: &wgpu::Texture,
+        viewport_w: u32,
+        viewport_h: u32,
+        draws: &mut Vec<OverlayDraw>,
+    ) {
+        if item.shadow_rgba[3] > 0.0 {
+            let mut rect = item.rect;
+            rect[0] += item.shadow_offset[0];
+            rect[1] += item.shadow_offset[1];
+            let uniforms = OverlayUniforms::alpha_atlas_rect(
+                item.shadow_rgba,
+                rect,
+                item.tex_rect,
+                viewport_w,
+                viewport_h,
+            );
+            draws.push(self.make_overlay_draw(outline_texture, uniforms));
+        }
+        if item.outline_rgba[3] > 0.0 {
+            let uniforms = OverlayUniforms::alpha_atlas_rect(
+                item.outline_rgba,
+                item.rect,
+                item.tex_rect,
+                viewport_w,
+                viewport_h,
+            );
+            draws.push(self.make_overlay_draw(outline_texture, uniforms));
+        }
+        let uniforms = OverlayUniforms::alpha_atlas_rect(
+            item.color_rgba,
+            item.rect,
+            item.tex_rect,
+            viewport_w,
+            viewport_h,
+        );
+        draws.push(self.make_overlay_draw(fill_texture, uniforms));
     }
 
     /// Pack libass alpha coverage bitmaps horizontally into one R8 atlas and add a
@@ -1286,6 +1423,16 @@ impl WgpuRenderer {
     }
 }
 
+fn scaled_surface_size(width: u32, height: u32, scale: f64) -> (u32, u32) {
+    let scale = if scale.is_finite() {
+        scale.max(1.0)
+    } else {
+        1.0
+    };
+    let scaled = |value: u32| ((value.max(1) as f64) * scale).round().min(u32::MAX as f64) as u32;
+    (scaled(width), scaled(height))
+}
+
 impl RendererBackend for WgpuRenderer {
     fn attach_surface(&mut self, surface: PlatformSurface) -> Result<()> {
         let PlatformSurface::Wgpu(handle) = surface else {
@@ -1320,11 +1467,13 @@ impl RendererBackend for WgpuRenderer {
             .copied()
             .find(|format| !format.is_srgb())
             .unwrap_or_else(|| caps.formats[0]);
+        let (surface_width, surface_height) =
+            scaled_surface_size(handle.width, handle.height, handle.scale);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
-            width: handle.width.max(1),
-            height: handle.height.max(1),
+            width: surface_width,
+            height: surface_height,
             present_mode: caps.present_modes[0],
             desired_maximum_frame_latency: 2,
             alpha_mode: caps.alpha_modes[0],
@@ -1349,16 +1498,18 @@ impl RendererBackend for WgpuRenderer {
         Ok(())
     }
 
-    fn resize_surface(&mut self, width: u32, height: u32, _scale: f64) -> Result<()> {
+    fn resize_surface(&mut self, width: u32, height: u32, scale: f64) -> Result<()> {
         if self.surface.is_none() {
             return Err(PlayerError::Renderer(
                 "no wgpu surface attached".to_string(),
             ));
         }
-        self.configure_surface(width, height);
+        let (surface_width, surface_height) = scaled_surface_size(width, height, scale);
+        self.configure_surface(surface_width, surface_height);
         if let Some(attached) = self.surface.as_mut() {
             attached.handle.width = width;
             attached.handle.height = height;
+            attached.handle.scale = scale;
         }
         Ok(())
     }
@@ -1397,10 +1548,10 @@ impl RendererBackend for WgpuRenderer {
         let pipeline =
             VideoRenderPipeline::new(source, TargetColorState::sdr(ColorPrimaries::Bt709));
         let uniforms = VideoUniforms::from_pipeline(&pipeline, is_p010, false);
-        self.upload_planar(planar, uniforms)
+        self.upload_planar_with_context(planar, uniforms)
     }
 
-    fn render_current_frame(&mut self, overlay: Option<&OverlayFrame>) -> Result<bool> {
+    fn render_current_frame(&mut self, context: RenderFrameContext<'_>) -> Result<bool> {
         if self.current_video.is_none() {
             return Ok(false);
         }
@@ -1410,7 +1561,15 @@ impl RendererBackend for WgpuRenderer {
             return Ok(false);
         };
         self.ensure_video_pipeline(format);
-        if overlay.is_some_and(overlay_has_planes) {
+        let danmaku = context.danmaku.filter(|plan| {
+            plan.generation == context.generation
+                && plan.media_time == context.media_time
+                && (context.output_width == 0 || plan.viewport.width == context.output_width)
+                && (context.output_height == 0 || plan.viewport.height == context.output_height)
+        });
+        if context.overlay.is_some_and(overlay_has_planes)
+            || danmaku.is_some_and(|plan| !plan.is_empty())
+        {
             self.ensure_overlay_pipeline(format);
         }
         let attached = self.surface.as_ref().expect("surface present");
@@ -1426,9 +1585,13 @@ impl RendererBackend for WgpuRenderer {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        self.draw_current_video(&view, overlay)?;
+        let danmaku_draws = self.draw_current_video(&view, context.overlay, danmaku)?;
         frame.present();
         self.stats.rendered_frames += 1;
+        if danmaku_draws > 0 {
+            self.stats.danmaku_passes += 1;
+            self.stats.danmaku_items += danmaku_draws as u64;
+        }
         Ok(true)
     }
 }
@@ -1437,6 +1600,10 @@ impl RendererBackend for WgpuRenderer {
 mod tests {
     use super::*;
     use crate::core::MetalSurfaceHandle;
+    use crate::danmaku::{
+        DanmakuGlyphAtlas, DanmakuGlyphInstance, DanmakuRenderPlan, DanmakuViewport,
+    };
+    use std::time::Duration;
 
     fn to_u8(component: f64) -> u8 {
         (component * 255.0).round() as u8
@@ -1486,6 +1653,53 @@ mod tests {
         assert_eq!(stats.rendered_frames, 1);
         assert_eq!(stats.offscreen_frames, 1);
         assert!(!stats.attached);
+    }
+
+    #[test]
+    fn wgpu_renderer_prepares_danmaku_glyph_atlas_draws_and_reuses_cache() {
+        let mut renderer = WgpuRenderer::new().unwrap();
+        renderer.ensure_overlay_pipeline(OFFSCREEN_FORMAT);
+        let atlas = DanmakuGlyphAtlas {
+            width: 4,
+            height: 4,
+            stride: 4,
+            fill_alpha: vec![255; 16],
+            outline_alpha: vec![64; 16],
+            version: 42,
+        };
+        let plan = DanmakuRenderPlan {
+            media_time: Duration::from_millis(10),
+            generation: 7,
+            viewport: DanmakuViewport::new(32, 18),
+            atlas: Some(std::sync::Arc::new(atlas.clone())),
+            items: vec![DanmakuGlyphInstance {
+                item_id: 1,
+                rect: [1.0, 2.0, 4.0, 4.0],
+                tex_rect: [0.0, 0.0, 1.0, 1.0],
+                color_rgba: [1.0, 1.0, 1.0, 1.0],
+                outline_rgba: [0.0, 0.0, 0.0, 0.75],
+                shadow_rgba: [0.0, 0.0, 0.0, 0.0],
+                shadow_offset: [1.0, 1.0],
+            }],
+        };
+
+        let draws = renderer.prepare_danmaku_draws(&plan).unwrap();
+        assert_eq!(draws.len(), 2);
+        assert!(
+            renderer
+                .danmaku_atlas_cache
+                .as_ref()
+                .is_some_and(|cache| cache.can_reuse_for(&atlas))
+        );
+
+        let cached_draws = renderer.prepare_danmaku_draws(&plan).unwrap();
+        assert_eq!(cached_draws.len(), 2);
+        assert!(
+            renderer
+                .danmaku_atlas_cache
+                .as_ref()
+                .is_some_and(|cache| cache.can_reuse_for(&atlas))
+        );
     }
 
     #[test]
@@ -1637,6 +1851,8 @@ mod tests {
         let mut renderer = WgpuRenderer::new().unwrap();
 
         let sdr = VideoUniforms::from_pipeline(&VideoRenderPipeline::sdr_default(), false, false);
+        assert_eq!(sdr.source_transfer, 1);
+        assert_eq!(sdr.nits[2], 100.0);
 
         // A full-range BT.709 identity configuration: linear in/out, clip tone map,
         // matched nits, identity gamut. Output should be the plain clamped YCbCr->RGB.
@@ -1708,7 +1924,11 @@ mod tests {
         // wgpu renderer is object-safe through the trait and reports no current frame
         // so the presenter falls back to a test frame.
         let backend: &mut dyn RendererBackend = &mut renderer;
-        assert!(!backend.render_current_frame(None).unwrap());
+        assert!(
+            !backend
+                .render_current_frame(RenderFrameContext::new(Duration::ZERO, 1))
+                .unwrap()
+        );
     }
 
     #[test]

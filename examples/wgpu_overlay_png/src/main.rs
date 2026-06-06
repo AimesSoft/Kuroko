@@ -35,7 +35,6 @@ fn main() {
     let overlay = OverlayFrame {
         pts: std::time::Duration::ZERO,
         viewport: OverlayViewport::new(WIDTH, HEIGHT),
-        surface_viewport: OverlayViewport::new(WIDTH, HEIGHT),
         subtitle_planes: vec![
             // A translucent white caption bar near the bottom.
             SubtitleBitmapPlane {
@@ -59,9 +58,7 @@ fn main() {
             // Exercises the mode-1 alpha-atlas path (coverage tinted by color).
             alpha_gradient_bitmap(60, 96, 200, 20, 0x00FF_FF00),
         ],
-        danmaku_planes: Vec::new(),
         subtitle_changed: true,
-        danmaku_boxes: Vec::new(),
     };
 
     let readback = renderer

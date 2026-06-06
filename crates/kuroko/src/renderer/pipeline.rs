@@ -353,7 +353,7 @@ impl SourceColorState {
             range: ColorRange::default(),
             hdr_metadata: None,
             nominal_peak_nits: nominal_peak_for_transfer(transfer),
-            reference_white_nits: 203.0,
+            reference_white_nits: reference_white_for_transfer(transfer),
         }
     }
 
@@ -632,6 +632,13 @@ fn nominal_peak_for_transfer(transfer: TransferFunction) -> f32 {
     }
 }
 
+fn reference_white_for_transfer(transfer: TransferFunction) -> f32 {
+    match transfer {
+        TransferFunction::Pq | TransferFunction::Hlg => 203.0,
+        TransferFunction::Srgb | TransferFunction::Bt1886 | TransferFunction::Unknown => 100.0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,6 +664,15 @@ mod tests {
 
         assert!(!pipeline.requires_tone_mapping());
         assert!(!pipeline.graph.contains(RenderPassKind::ToneMap));
+    }
+
+    #[test]
+    fn unknown_sdr_source_uses_sdr_reference_white() {
+        let source = SourceColorState::new(ColorPrimaries::Unknown, TransferFunction::Unknown);
+
+        assert_eq!(source.nominal_peak_nits, 100.0);
+        assert_eq!(source.reference_white_nits, 100.0);
+        assert!(!source.is_hdr());
     }
 
     #[test]

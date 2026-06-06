@@ -11,7 +11,7 @@ use regex::Regex;
 /// - Keyword/user blocking
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::danmaku_next2::dfm_core::model::{DanmakuItem, DanmakuType, Duration, GlobalFlags};
+use crate::danmaku::dfm_core::model::{DanmakuItem, DanmakuType, Duration, GlobalFlags};
 
 /// Context passed to filters during the rendering loop.
 #[derive(Debug)]
@@ -272,7 +272,7 @@ fn parse_regex_rule(word: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::danmaku_next2::dfm_core::model::Duration;
+    use crate::danmaku::dfm_core::model::Duration;
 
     fn make_ctx(timer_ms: i64) -> FilterContext {
         FilterContext {
