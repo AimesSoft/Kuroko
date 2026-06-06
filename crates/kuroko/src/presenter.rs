@@ -445,21 +445,18 @@ impl PresenterRuntime {
     fn sync_media_time_from_player(&mut self) {
         let player_time = self.player.current_media_time();
         let player_generation = self.player.playback_generation();
-        let new_generation = self
+        self.current_generation = self
             .current_generation
             .max(player_generation)
             .max(self.danmaku_generation)
             .max(1);
-        // A generation change marks a discontinuity (seek / track switch / stop):
-        // there the clock is allowed to jump to the new position. Within the same
-        // generation the danmaku/subtitle clock is kept monotonic, so a small
-        // backward correction of the audio master clock (A/V re-anchor) cannot make
-        // the whole screen of scrolling danmaku jump backwards.
-        let discontinuity = new_generation != self.current_generation;
-        self.current_generation = new_generation;
-        let should_update = player_time != self.current_media_time
-            && (discontinuity || player_time > self.current_media_time);
-        if should_update {
+        // Danmaku/subtitle time follows the audio master clock directly. We do
+        // NOT clamp it monotonic here: clamping turns the master clock's small
+        // A/V re-anchor dips into visible stalls (danmaku freezes until the clock
+        // catches up), which reads as the whole picture hitching. Following the
+        // clock as-is keeps motion smooth; any residual sub-frame jitter is far
+        // less visible than a stall.
+        if player_time != self.current_media_time {
             self.current_media_time = player_time;
             if let Some(viewport) = self.current_danmaku_viewport {
                 let mut overlay = self.overlay.render(
