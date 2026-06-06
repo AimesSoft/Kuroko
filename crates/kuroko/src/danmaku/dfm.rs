@@ -39,6 +39,7 @@ pub struct PrepareRequest {
     pub display_area: f64,
     pub scroll_duration_seconds: f64,
     pub allow_stacking: bool,
+    pub allow_scroll_overwrite: bool,
     pub merge_danmaku: bool,
     pub max_quantity: Option<u32>,
     pub max_lines_per_type: Option<u32>,
@@ -93,6 +94,7 @@ pub struct FrameLayout {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FrameItem {
     pub item_index: usize,
+    pub track_index: i32,
     pub x: f64,
     pub y: f64,
     pub offstage_x: f64,
@@ -103,7 +105,6 @@ pub fn prepare_layout(request: PrepareRequest) -> Result<PreparedLayout, String>
     let height = request.height.max(1.0) as f32;
     let font_size = request.font_size.max(1.0) as f32;
     let display_area = request.display_area.clamp(0.1, 1.0) as f32;
-    let _allow_stacking = request.allow_stacking;
     let scroll_dur_secs = request.scroll_duration_seconds.max(1.0);
     let scroll_dur_ms = (scroll_dur_secs * 1000.0) as i64;
     let global_flags = GlobalFlags::default();
@@ -221,15 +222,19 @@ pub fn prepare_layout(request: PrepareRequest) -> Result<PreparedLayout, String>
     for (type_idx, _) in type_order.iter().enumerate() {
         for &i in &type_indices[type_idx] {
             let is_me = items[i].1;
-            let (placed, displaced_index) = retainer.fix(
+            let (placed, displaced_index) = retainer.fix_with_options(
                 &mut items[i].4,
                 width,
                 height,
                 &global_flags,
                 display_area,
                 is_me,
+                request.allow_stacking,
+                request.allow_scroll_overwrite,
             );
             if !placed {
+                items[i].4.is_filtered = true;
+                items[i].4.filter_param = 99;
                 continue;
             }
             if exceeds_max_line(
@@ -276,7 +281,7 @@ pub fn prepare_layout(request: PrepareRequest) -> Result<PreparedLayout, String>
             font_size_multiplier: 1.0,
             count_text: None,
             duplicate_count: *duplicate_count,
-            track_index: 0,
+            track_index: track_index_from_y(item.y, item.paint_height, track_gap_ratio),
             y_position: item.y as f64,
             width: item.paint_width as f64,
             height: item.paint_height as f64,
@@ -303,6 +308,14 @@ pub fn prepare_layout(request: PrepareRequest) -> Result<PreparedLayout, String>
         item_times,
         track_count: ((height * display_area) / (font_size * 1.2 * 1.25)).max(1.0) as i32,
     })
+}
+
+fn track_index_from_y(y: f32, height: f32, track_gap_ratio: f32) -> i32 {
+    if !y.is_finite() || y < 0.0 {
+        return 0;
+    }
+    let track_height = (height + height * track_gap_ratio).max(1.0);
+    ((y - 2.0).max(0.0) / track_height).round().max(0.0) as i32
 }
 
 pub fn layout_frame(layout: &PreparedLayout, current_time: f64) -> FrameLayout {
@@ -342,6 +355,7 @@ pub fn layout_frame(layout: &PreparedLayout, current_time: f64) -> FrameLayout {
         }
         frame_items.push(FrameItem {
             item_index: i,
+            track_index: item.track_index,
             x,
             y: item.y_position,
             offstage_x,

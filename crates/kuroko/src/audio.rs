@@ -323,6 +323,8 @@ pub trait AudioOutputBackend {
     fn start(&mut self) -> Result<()>;
     fn pause(&mut self) -> Result<()>;
     fn stop(&mut self) -> Result<()>;
+    fn set_volume(&mut self, volume: f32);
+    fn volume(&self) -> f32;
     fn push(&mut self, frame: PcmAudioFrame) -> Result<AudioPushResult>;
     fn state(&self) -> AudioOutputState;
     fn stats(&self) -> AudioRingBufferStats;
@@ -335,6 +337,7 @@ pub trait AudioOutputBackend {
 pub struct BufferedAudioOutput {
     state: AudioOutputState,
     buffer: AudioRingBuffer,
+    volume: f32,
 }
 
 impl BufferedAudioOutput {
@@ -342,6 +345,7 @@ impl BufferedAudioOutput {
         Self {
             state: AudioOutputState::Stopped,
             buffer: AudioRingBuffer::new(config),
+            volume: 1.0,
         }
     }
 
@@ -354,7 +358,9 @@ impl BufferedAudioOutput {
     }
 
     pub fn read_interleaved(&mut self, output: &mut [f32]) -> Result<AudioReadResult> {
-        self.buffer.read_interleaved(output)
+        let result = self.buffer.read_interleaved(output)?;
+        apply_volume(output, self.volume);
+        Ok(result)
     }
 
     pub fn clock_snapshot(&self) -> AudioClockSnapshot {
@@ -383,6 +389,14 @@ impl AudioOutputBackend for BufferedAudioOutput {
         Ok(())
     }
 
+    fn set_volume(&mut self, volume: f32) {
+        self.volume = normalize_volume(volume);
+    }
+
+    fn volume(&self) -> f32 {
+        self.volume
+    }
+
     fn push(&mut self, frame: PcmAudioFrame) -> Result<AudioPushResult> {
         self.buffer.push_frame(frame)
     }
@@ -397,6 +411,24 @@ impl AudioOutputBackend for BufferedAudioOutput {
 
     fn clock_snapshot(&self) -> Option<AudioClockSnapshot> {
         Some(self.buffer.clock_snapshot())
+    }
+}
+
+pub fn normalize_volume(volume: f32) -> f32 {
+    if volume.is_finite() {
+        volume.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
+pub fn apply_volume(samples: &mut [f32], volume: f32) {
+    let volume = normalize_volume(volume);
+    if (volume - 1.0).abs() <= f32::EPSILON {
+        return;
+    }
+    for sample in samples {
+        *sample *= volume;
     }
 }
 
@@ -491,6 +523,31 @@ mod tests {
         assert_eq!(output.state(), AudioOutputState::Paused);
         output.stop().unwrap();
         assert_eq!(output.state(), AudioOutputState::Stopped);
+    }
+
+    #[test]
+    fn volume_helpers_clamp_and_apply_gain() {
+        assert_eq!(normalize_volume(1.0), 1.0);
+        assert_eq!(normalize_volume(-1.0), 0.0);
+        assert_eq!(normalize_volume(2.0), 1.0);
+        assert_eq!(normalize_volume(f32::NAN), 1.0);
+
+        let mut samples = [1.0, -0.5, 0.25, 0.0];
+        apply_volume(&mut samples, 0.5);
+        assert_eq!(samples, [0.5, -0.25, 0.125, 0.0]);
+    }
+
+    #[test]
+    fn buffered_audio_output_volume_is_clamped() {
+        let mut output = BufferedAudioOutput::new(AudioRingBufferConfig::default());
+
+        assert_eq!(output.volume(), 1.0);
+        output.set_volume(0.25);
+        assert_eq!(output.volume(), 0.25);
+        output.set_volume(-1.0);
+        assert_eq!(output.volume(), 0.0);
+        output.set_volume(f32::NAN);
+        assert_eq!(output.volume(), 1.0);
     }
 
     #[test]

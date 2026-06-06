@@ -1,15 +1,14 @@
-import AppKit
 import Darwin
-import FlutterMacOS
+import Flutter
 import Metal
-import ObjectiveC.runtime
 import QuartzCore
+import UIKit
 
-private let kurokoWindowHostedVideoSurfaceId: Int64 = -1
-private let kurokoDebugLabelsEnabled =
-  ProcessInfo.processInfo.environment["KUROKO_DEBUG_LABELS"] == "1"
-private let kurokoDefaultDisplayFps = 60.0
-private let kurokoDisplayFpsEpsilon = 0.5
+private struct KurokoTrackSelectionC {
+  var video: Int64 = -1
+  var audio: Int64 = -1
+  var subtitle: Int64 = -1
+}
 
 private struct KurokoVideoParamsC {
   var width: UInt32 = 0
@@ -22,12 +21,6 @@ private struct KurokoTrackCountsC {
   var video: UInt32 = 0
   var audio: UInt32 = 0
   var subtitle: UInt32 = 0
-}
-
-private struct KurokoTrackSelectionC {
-  var video: Int64 = -1
-  var audio: Int64 = -1
-  var subtitle: Int64 = -1
 }
 
 private struct KurokoTrackInfoC {
@@ -78,7 +71,6 @@ private struct KurokoPresenterStatsC {
 
 private struct KurokoDanmakuConfigC {
   var enabled: UInt8 = 1
-  // NipaPlay/Flutter logical font size; Kuroko applies the surface scale internally.
   var fontSize: Float = 30.0
   var opacity: Float = 1.0
   var displayArea: Float = 1.0
@@ -122,7 +114,7 @@ private enum KurokoPluginError: Error, CustomStringConvertible {
   var description: String {
     switch self {
     case .libraryNotFound(let paths):
-      return "Unable to load libkuroko_capi.dylib. Tried: \(paths.joined(separator: ", "))"
+      return "Unable to load Kuroko C ABI. Tried: \(paths.joined(separator: ", "))"
     case .symbolMissing(let symbol):
       return "Missing Kuroko C ABI symbol: \(symbol)"
     case .invalidArguments(let message):
@@ -132,7 +124,7 @@ private enum KurokoPluginError: Error, CustomStringConvertible {
     case .viewNotFound(let viewId):
       return "Kuroko video view \(viewId) was not found."
     case .overlayNotAvailable:
-      return "No window-hosted Kuroko overlay is available."
+      return "Window overlay is not available on iOS. Use KurokoVideoView."
     case .presenterCreateFailed:
       return "kuroko_presenter_create returned null."
     case .kurokoStatus(let operation, let status):
@@ -154,7 +146,6 @@ private final class KurokoNativeLibrary {
   typealias CommandFn = @convention(c) (UnsafeMutableRawPointer?) -> Int32
   typealias SeekFn = @convention(c) (UnsafeMutableRawPointer?, UInt64) -> Int32
   typealias SetPlaybackRateFn = @convention(c) (UnsafeMutableRawPointer?, Double) -> Int32
-  typealias SetVolumeFn = @convention(c) (UnsafeMutableRawPointer?, Double) -> Int32
   typealias SelectTrackFn = @convention(c) (UnsafeMutableRawPointer?, Int64) -> Int32
   typealias AddExternalSubtitleFn = @convention(c) (
     UnsafeMutableRawPointer?,
@@ -173,7 +164,6 @@ private final class KurokoNativeLibrary {
   typealias ClearDanmakuFn = @convention(c) (UnsafeMutableRawPointer?) -> Int32
   typealias SetDanmakuEnabledFn = @convention(c) (UnsafeMutableRawPointer?, Bool) -> Int32
   typealias SetDanmakuConfigFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeRawPointer?) -> Int32
-  typealias GetDanmakuConfigFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Int32
   typealias SetDanmakuFontFn = @convention(c) (
     UnsafeMutableRawPointer?,
     UnsafePointer<CChar>?,
@@ -210,7 +200,6 @@ private final class KurokoNativeLibrary {
   let close: CommandFn
   let seek: SeekFn
   let setPlaybackRate: SetPlaybackRateFn?
-  let setVolume: SetVolumeFn?
   let selectAudioTrack: SelectTrackFn
   let selectSubtitleTrack: SelectTrackFn
   let addExternalSubtitle: AddExternalSubtitleFn
@@ -227,7 +216,6 @@ private final class KurokoNativeLibrary {
   let clearDanmaku: ClearDanmakuFn?
   let setDanmakuEnabled: SetDanmakuEnabledFn?
   let setDanmakuConfig: SetDanmakuConfigFn?
-  let getDanmakuConfig: GetDanmakuConfigFn?
   let setDanmakuFont: SetDanmakuFontFn?
   let setDanmakuBlockWords: SetDanmakuBlockWordsFn?
   let trackSelection: TrackSelectionFn
@@ -256,7 +244,6 @@ private final class KurokoNativeLibrary {
     close = try Self.load("kuroko_presenter_close", from: libraryHandle, as: CommandFn.self)
     seek = try Self.load("kuroko_presenter_seek", from: libraryHandle, as: SeekFn.self)
     setPlaybackRate = Self.loadOptional("kuroko_presenter_set_playback_rate", from: libraryHandle, as: SetPlaybackRateFn.self)
-    setVolume = Self.loadOptional("kuroko_presenter_set_volume", from: libraryHandle, as: SetVolumeFn.self)
     selectAudioTrack = try Self.load("kuroko_presenter_select_audio_track", from: libraryHandle, as: SelectTrackFn.self)
     selectSubtitleTrack = try Self.load("kuroko_presenter_select_subtitle_track", from: libraryHandle, as: SelectTrackFn.self)
     addExternalSubtitle = try Self.load("kuroko_presenter_add_external_subtitle", from: libraryHandle, as: AddExternalSubtitleFn.self)
@@ -273,7 +260,6 @@ private final class KurokoNativeLibrary {
     clearDanmaku = Self.loadOptional("kuroko_presenter_clear_danmaku", from: libraryHandle, as: ClearDanmakuFn.self)
     setDanmakuEnabled = Self.loadOptional("kuroko_presenter_set_danmaku_enabled", from: libraryHandle, as: SetDanmakuEnabledFn.self)
     setDanmakuConfig = Self.loadOptional("kuroko_presenter_set_danmaku_config_ptr", from: libraryHandle, as: SetDanmakuConfigFn.self)
-    getDanmakuConfig = Self.loadOptional("kuroko_presenter_get_danmaku_config", from: libraryHandle, as: GetDanmakuConfigFn.self)
     setDanmakuFont = Self.loadOptional("kuroko_presenter_set_danmaku_font", from: libraryHandle, as: SetDanmakuFontFn.self)
     setDanmakuBlockWords = Self.loadOptional("kuroko_presenter_set_danmaku_block_words_json", from: libraryHandle, as: SetDanmakuBlockWordsFn.self)
     trackSelection = try Self.load("kuroko_presenter_track_selection", from: libraryHandle, as: TrackSelectionFn.self)
@@ -287,58 +273,37 @@ private final class KurokoNativeLibrary {
     pollEvent = try Self.load("kuroko_presenter_poll_event", from: libraryHandle, as: PollEventFn.self)
   }
 
-  deinit {
-    dlclose(libraryHandle)
-  }
-
   private static func openLibrary() throws -> (handle: UnsafeMutableRawPointer, path: String) {
-    let environment = ProcessInfo.processInfo.environment
-    let bundle = Bundle(for: KurokoFlutterPlugin.self)
-    var candidates: [String] = []
-
-    if let explicitPath = environment["KUROKO_CAPI_DYLIB"], !explicitPath.isEmpty {
-      candidates.append(explicitPath)
+    if let handle = dlopen(nil, RTLD_NOW), dlsym(handle, "kuroko_presenter_create") != nil {
+      return (handle, "main executable")
     }
+
+    var candidates: [String] = []
+    let environment = ProcessInfo.processInfo.environment
+    if let override = environment["KUROKO_CAPI_DYLIB"], !override.isEmpty {
+      candidates.append(override)
+    }
+    let bundle = Bundle(for: KurokoFlutterPlugin.self)
     if let resourcePath = bundle.path(forResource: "libkuroko_capi", ofType: "dylib") {
       candidates.append(resourcePath)
     }
-    if let frameworkPath = Bundle.main.privateFrameworksPath {
-      candidates.append(URL(fileURLWithPath: frameworkPath).appendingPathComponent("libkuroko_capi.dylib").path)
+    if let frameworksPath = Bundle.main.privateFrameworksPath {
+      candidates.append(URL(fileURLWithPath: frameworksPath).appendingPathComponent("libkuroko_capi.dylib").path)
     }
     if let executablePath = Bundle.main.executablePath {
       let executableDirectory = URL(fileURLWithPath: executablePath).deletingLastPathComponent().path
       candidates.append(URL(fileURLWithPath: executableDirectory).appendingPathComponent("libkuroko_capi.dylib").path)
     }
-    if let sourceTreePath = Self.sourceTreeDebugLibraryPath() {
-      candidates.append(sourceTreePath)
-    }
-    candidates.append("libkuroko_capi.dylib")
 
     var failures: [KurokoPluginError] = []
     for path in candidates {
       if let handle = dlopen(path, RTLD_NOW | RTLD_LOCAL) {
-        NSLog("KurokoFlutterPlugin: loaded Kuroko C API from \(path)")
         return (handle, path)
       }
       let detail = dlerror().map { String(cString: $0) }
       failures.append(.libraryLoadFailed(path, detail))
     }
     throw KurokoPluginError.libraryNotFound(failures.map(String.init(describing:)))
-  }
-
-  fileprivate static func sourceTreeDebugLibraryPath() -> String? {
-    let sourceFile = URL(fileURLWithPath: #filePath)
-    let kurokoRoot = sourceFile
-      .deletingLastPathComponent() // Classes
-      .deletingLastPathComponent() // macos
-      .deletingLastPathComponent() // kuroko_flutter
-      .deletingLastPathComponent() // packages
-      .deletingLastPathComponent() // Kuroko repo root
-    return kurokoRoot
-      .appendingPathComponent("target")
-      .appendingPathComponent("debug")
-      .appendingPathComponent("libkuroko_capi.dylib")
-      .path
   }
 
   private static func load<T>(_ symbol: String, from handle: UnsafeMutableRawPointer, as type: T.Type) throws -> T {
@@ -369,10 +334,9 @@ private final class KurokoPlayerHost {
   private let library: KurokoNativeLibrary
   private let handle: UnsafeMutableRawPointer
   private weak var attachedView: KurokoMetalSurfaceView?
-  private var displayTimer: Timer?
-  private var displayTimerFps: Double = 0.0
+  private var displayLink: CADisplayLink?
+  private var displayLinkProxy: DisplayLinkProxy?
   private var startTimeSeconds: CFTimeInterval = CACurrentMediaTime()
-  private var currentDanmakuConfig = KurokoDanmakuConfigC()
 
   init(id: Int64, library: KurokoNativeLibrary, config: KurokoPresenterConfigC) throws {
     self.id = id
@@ -381,11 +345,10 @@ private final class KurokoPlayerHost {
       throw KurokoPluginError.presenterCreateFailed
     }
     self.handle = handle
-    refreshDanmakuConfigSnapshot()
   }
 
   deinit {
-    stopDisplayTimer()
+    displayLink?.invalidate()
     _ = library.detachSurface(handle)
     library.destroy(handle)
   }
@@ -396,21 +359,10 @@ private final class KurokoPlayerHost {
     }
   }
 
-  func play() throws {
-    try check(library.play(handle), operation: "play")
-  }
-
-  func pause() throws {
-    try check(library.pause(handle), operation: "pause")
-  }
-
-  func stop() throws {
-    try check(library.stop(handle), operation: "stop")
-  }
-
-  func close() throws {
-    try check(library.close(handle), operation: "close")
-  }
+  func play() throws { try check(library.play(handle), operation: "play") }
+  func pause() throws { try check(library.pause(handle), operation: "pause") }
+  func stop() throws { try check(library.stop(handle), operation: "stop") }
+  func close() throws { try check(library.close(handle), operation: "close") }
 
   func seek(positionMicros: UInt64) throws {
     try check(library.seek(handle, positionMicros), operation: "seek")
@@ -423,30 +375,16 @@ private final class KurokoPlayerHost {
     try check(setRate(handle, rate), operation: "set_playback_rate")
   }
 
-  func setVolume(_ volume: Double) throws {
-    guard let setVolume = library.setVolume else {
-      throw KurokoPluginError.symbolMissing("kuroko_presenter_set_volume")
-    }
-    let clampedVolume = volume.isFinite ? min(max(volume, 0.0), 1.0) : 1.0
-    try check(setVolume(handle, clampedVolume), operation: "set_volume")
-  }
-
   func addExternalSubtitle(uri: String) throws -> Int64 {
     var trackId: Int64 = 0
     try uri.withCString { cString in
-      try check(
-        library.addExternalSubtitle(handle, cString, &trackId),
-        operation: "add_external_subtitle"
-      )
+      try check(library.addExternalSubtitle(handle, cString, &trackId), operation: "add_external_subtitle")
     }
     return trackId
   }
 
   func removeSubtitleTrack(trackId: Int64) throws {
-    try check(
-      library.removeSubtitleTrack(handle, trackId),
-      operation: "remove_subtitle_track"
-    )
+    try check(library.removeSubtitleTrack(handle, trackId), operation: "remove_subtitle_track")
   }
 
   func loadDanmakuFile(uri: String) throws {
@@ -529,9 +467,7 @@ private final class KurokoPlayerHost {
     }
     var count: Int = 0
     try check(danmakuTracks(handle, nil, 0, &count), operation: "danmaku_tracks_len")
-    if count <= 0 {
-      return []
-    }
+    if count <= 0 { return [] }
     var tracks = Array(repeating: KurokoDanmakuTrackInfoC(), count: count)
     var written: Int = 0
     let status = tracks.withUnsafeMutableBufferPointer { buffer in
@@ -561,24 +497,6 @@ private final class KurokoPlayerHost {
       throw KurokoPluginError.symbolMissing("kuroko_presenter_set_danmaku_enabled")
     }
     try check(setEnabled(handle, enabled), operation: "set_danmaku_enabled")
-    currentDanmakuConfig.enabled = enabled ? 1 : 0
-  }
-
-  func danmakuConfigSnapshot() -> KurokoDanmakuConfigC {
-    currentDanmakuConfig
-  }
-
-  private func refreshDanmakuConfigSnapshot() {
-    guard let getConfig = library.getDanmakuConfig else {
-      return
-    }
-    var config = KurokoDanmakuConfigC()
-    let status = withUnsafeMutablePointer(to: &config) { pointer in
-      getConfig(handle, UnsafeMutableRawPointer(pointer))
-    }
-    if status == 0 {
-      currentDanmakuConfig = config
-    }
   }
 
   func setDanmakuConfig(_ config: KurokoDanmakuConfigC) throws {
@@ -590,22 +508,18 @@ private final class KurokoPlayerHost {
       setConfig(handle, UnsafeRawPointer(pointer))
     }
     try check(status, operation: "set_danmaku_config")
-    currentDanmakuConfig = config
   }
 
   func setDanmakuFont(family: String?, filePath: String?) throws {
     guard let setFont = library.setDanmakuFont else {
       throw KurokoPluginError.symbolMissing("kuroko_presenter_set_danmaku_font")
     }
-    let family = family ?? ""
-    let filePath = filePath ?? ""
-    let status = withOptionalCString(family) { familyCString in
-      withOptionalCString(filePath) { filePathCString in
+    let status = withOptionalCString(family ?? "") { familyCString in
+      withOptionalCString(filePath ?? "") { filePathCString in
         setFont(handle, familyCString, filePathCString)
       }
     }
     try check(status, operation: "set_danmaku_font")
-    refreshDanmakuConfigSnapshot()
   }
 
   func setDanmakuBlockWordsJson(_ json: String) throws {
@@ -615,33 +529,20 @@ private final class KurokoPlayerHost {
     try json.withCString { cString in
       try check(setBlockWords(handle, cString), operation: "set_danmaku_block_words")
     }
-    refreshDanmakuConfigSnapshot()
   }
 
   func selectAudioTrack(trackId: Int64?) throws {
-    try check(
-      library.selectAudioTrack(handle, trackId ?? -1),
-      operation: "select_audio_track"
-    )
+    try check(library.selectAudioTrack(handle, trackId ?? -1), operation: "select_audio_track")
   }
 
   func selectSubtitleTrack(trackId: Int64?) throws {
-    try check(
-      library.selectSubtitleTrack(handle, trackId ?? -1),
-      operation: "select_subtitle_track"
-    )
+    try check(library.selectSubtitleTrack(handle, trackId ?? -1), operation: "select_subtitle_track")
   }
 
   func tracks() throws -> [[String: Any]] {
     var count: Int = 0
-    try check(
-      library.tracks(handle, nil, 0, &count),
-      operation: "tracks_len"
-    )
-    if count <= 0 {
-      return []
-    }
-
+    try check(library.tracks(handle, nil, 0, &count), operation: "tracks_len")
+    if count <= 0 { return [] }
     var tracks = Array(repeating: KurokoTrackInfoC(), count: count)
     var written: Int = 0
     let status = tracks.withUnsafeMutableBufferPointer { buffer in
@@ -670,26 +571,23 @@ private final class KurokoPlayerHost {
     attachedView = view
     view.attachedPlayerId = id
     try attachOrResize(view: view, attach: true)
-    startDisplayTimerIfNeeded(resetClock: true)
+    startDisplayLinkIfNeeded()
   }
 
   func detach(viewId: Int64?) {
-    guard viewId == nil || attachedView?.platformViewId == viewId else {
-      return
-    }
+    guard viewId == nil || attachedView?.platformViewId == viewId else { return }
     attachedView?.attachedPlayerId = nil
     attachedView = nil
-    stopDisplayTimer()
+    displayLink?.invalidate()
+    displayLink = nil
+    displayLinkProxy = nil
     _ = library.detachSurface(handle)
   }
 
   func resizeFromAttachedView() {
-    guard let view = attachedView else {
-      return
-    }
+    guard let view = attachedView else { return }
     do {
       try attachOrResize(view: view, attach: false)
-      startDisplayTimerIfNeeded(resetClock: false)
     } catch {
       NSLog("KurokoFlutterPlugin: resize failed: \(error)")
     }
@@ -708,9 +606,7 @@ private final class KurokoPlayerHost {
   }
 
   func pollEvents(sendEvent: (([String: Any]) -> Void)?) {
-    guard let sendEvent else {
-      return
-    }
+    guard let sendEvent else { return }
     while true {
       var event = KurokoEventC()
       let status = withUnsafeMutablePointer(to: &event) { pointer in
@@ -731,66 +627,559 @@ private final class KurokoPlayerHost {
     view.updateDrawableSize()
     let width = UInt32(max(1.0, view.bounds.width).rounded())
     let height = UInt32(max(1.0, view.bounds.height).rounded())
-    let scale = view.currentBackingScale
+    let scale = view.currentScale
     if attach {
       let rawLayer = UInt64(UInt(bitPattern: Unmanaged.passUnretained(view.metalLayer).toOpaque()))
-      try check(
-        library.attachMetalLayer(handle, rawLayer, width, height, scale),
-        operation: "attach_metal_layer"
-      )
+      try check(library.attachMetalLayer(handle, rawLayer, width, height, scale), operation: "attach_metal_layer")
     } else {
-      try check(
-        library.resizeSurface(handle, width, height, scale),
-        operation: "resize_surface"
-      )
+      try check(library.resizeSurface(handle, width, height, scale), operation: "resize_surface")
     }
   }
 
-  private func startDisplayTimerIfNeeded(resetClock: Bool) {
-    let targetFps = resolvedDisplayTimerFps()
-    if displayTimer != nil && abs(displayTimerFps - targetFps) <= kurokoDisplayFpsEpsilon {
-      return
+  private func startDisplayLinkIfNeeded() {
+    guard displayLink == nil else { return }
+    startTimeSeconds = CACurrentMediaTime()
+    let proxy = DisplayLinkProxy { [weak self] in
+      self?.renderTick(sendEvent: KurokoFlutterPlugin.sharedEventSink)
     }
-    stopDisplayTimer()
-    if resetClock {
-      startTimeSeconds = CACurrentMediaTime()
-    }
-    let timer = Timer(timeInterval: 1.0 / targetFps, repeats: true) { [weak self] _ in
-      guard let self else {
-        return
-      }
-      self.renderTick(sendEvent: KurokoFlutterPlugin.sharedEventSink)
-    }
-    displayTimer = timer
-    displayTimerFps = targetFps
-    RunLoop.main.add(timer, forMode: .common)
-  }
-
-  private func stopDisplayTimer() {
-    displayTimer?.invalidate()
-    displayTimer = nil
-    displayTimerFps = 0.0
-  }
-
-  private func resolvedDisplayTimerFps() -> Double {
-    if let override = ProcessInfo.processInfo.environment["KUROKO_FLUTTER_TARGET_FPS"],
-       let fps = Double(override), fps.isFinite, fps > 0.0 {
-      return min(max(fps, 1.0), 1000.0)
-    }
-    let screen = attachedView?.window?.screen ?? NSScreen.main
-    if #available(macOS 10.15, *), let screen = screen {
-      let fps = Double(screen.maximumFramesPerSecond)
-      if fps.isFinite && fps > 0.0 {
-        return fps
-      }
-    }
-    return kurokoDefaultDisplayFps
+    let link = CADisplayLink(target: proxy, selector: #selector(DisplayLinkProxy.tick))
+    link.preferredFramesPerSecond = 60
+    link.add(to: .main, forMode: .common)
+    displayLinkProxy = proxy
+    displayLink = link
   }
 
   private func check(_ status: Int32, operation: String) throws {
     if status != 0 {
       throw KurokoPluginError.kurokoStatus(operation, status)
     }
+  }
+}
+
+private final class DisplayLinkProxy: NSObject {
+  private let body: () -> Void
+
+  init(_ body: @escaping () -> Void) {
+    self.body = body
+  }
+
+  @objc func tick() {
+    body()
+  }
+}
+
+private protocol KurokoMetalSurfaceView: AnyObject {
+  var platformViewId: Int64 { get }
+  var metalLayer: CAMetalLayer { get }
+  var attachedPlayerId: Int64? { get set }
+  var bounds: CGRect { get }
+  var currentScale: Double { get }
+
+  func updateDrawableSize()
+}
+
+private final class WeakKurokoVideoPlatformViewBox {
+  weak var view: KurokoMetalSurfaceView?
+
+  init(view: KurokoMetalSurfaceView) {
+    self.view = view
+  }
+}
+
+private final class KurokoMetalUIView: UIView, KurokoMetalSurfaceView {
+  let platformViewId: Int64
+  weak var plugin: KurokoFlutterPlugin?
+  var attachedPlayerId: Int64?
+
+  override class var layerClass: AnyClass { CAMetalLayer.self }
+
+  var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
+
+  var currentScale: Double {
+    Double(max(1.0, window?.screen.scale ?? UIScreen.main.scale))
+  }
+
+  init(frame: CGRect, viewId: Int64, arguments: Any?, plugin: KurokoFlutterPlugin?) {
+    platformViewId = viewId
+    self.plugin = plugin
+    super.init(frame: frame)
+    isOpaque = true
+    backgroundColor = .black
+    contentScaleFactor = CGFloat(currentScale)
+    metalLayer.pixelFormat = .bgra8Unorm
+    metalLayer.framebufferOnly = true
+    metalLayer.isOpaque = true
+    metalLayer.backgroundColor = UIColor.black.cgColor
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  deinit {
+    plugin?.unregisterView(viewId: platformViewId)
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    updateDrawableSize()
+    plugin?.resizePlayerAttachedToView(viewId: platformViewId)
+  }
+
+  override func didMoveToWindow() {
+    super.didMoveToWindow()
+    updateDrawableSize()
+    plugin?.resizePlayerAttachedToView(viewId: platformViewId)
+  }
+
+  func updateDrawableSize() {
+    let scale = CGFloat(currentScale)
+    contentScaleFactor = scale
+    metalLayer.contentsScale = scale
+    metalLayer.frame = bounds
+    metalLayer.drawableSize = CGSize(
+      width: max(1.0, bounds.width * scale),
+      height: max(1.0, bounds.height * scale)
+    )
+  }
+}
+
+private final class KurokoVideoPlatformView: NSObject, FlutterPlatformView {
+  let metalView: KurokoMetalUIView
+
+  init(frame: CGRect, viewId: Int64, arguments: Any?, plugin: KurokoFlutterPlugin?) {
+    metalView = KurokoMetalUIView(frame: frame, viewId: viewId, arguments: arguments, plugin: plugin)
+    super.init()
+  }
+
+  func view() -> UIView {
+    metalView
+  }
+}
+
+private final class KurokoVideoViewFactory: NSObject, FlutterPlatformViewFactory {
+  private weak var plugin: KurokoFlutterPlugin?
+
+  init(plugin: KurokoFlutterPlugin) {
+    self.plugin = plugin
+    super.init()
+  }
+
+  func createArgsCodec() -> FlutterMessageCodec & NSObjectProtocol {
+    FlutterStandardMessageCodec.sharedInstance()
+  }
+
+  func create(
+    withFrame frame: CGRect,
+    viewIdentifier viewId: Int64,
+    arguments args: Any?
+  ) -> FlutterPlatformView {
+    let platformView = KurokoVideoPlatformView(frame: frame, viewId: viewId, arguments: args, plugin: plugin)
+    plugin?.registerView(platformView.metalView, viewId: viewId)
+    return platformView
+  }
+}
+
+public final class KurokoFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
+  static var sharedEventSink: FlutterEventSink?
+
+  private static let playerChannelName = "kuroko_flutter/player"
+  private static let eventsChannelName = "kuroko_flutter/events"
+  private static let videoViewType = "kuroko_flutter/video_view"
+
+  private var players: [Int64: KurokoPlayerHost] = [:]
+  private var views: [Int64: WeakKurokoVideoPlatformViewBox] = [:]
+  private var nextPlayerId: Int64 = 1
+  private var pollTimer: Timer?
+
+  public static func register(with registrar: FlutterPluginRegistrar) {
+    let instance = KurokoFlutterPlugin()
+    let playerChannel = FlutterMethodChannel(name: playerChannelName, binaryMessenger: registrar.messenger())
+    let eventsChannel = FlutterEventChannel(name: eventsChannelName, binaryMessenger: registrar.messenger())
+    registrar.addMethodCallDelegate(instance, channel: playerChannel)
+    eventsChannel.setStreamHandler(instance)
+    registrar.register(KurokoVideoViewFactory(plugin: instance), withId: videoViewType)
+  }
+
+  public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    do {
+      switch call.method {
+      case "create":
+        result(try createPlayer(arguments: call.arguments))
+      case "dispose":
+        let args = try dictionaryArgs(call.arguments)
+        let playerId = try requiredInt64(args["playerId"], name: "playerId")
+        players.removeValue(forKey: playerId)
+        result(nil)
+      case "open":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        guard let uri = args["uri"] as? String, !uri.isEmpty else {
+          throw KurokoPluginError.invalidArguments("uri is required.")
+        }
+        try host.open(uri: uri)
+        result(nil)
+      case "play":
+        try playerHost(from: try dictionaryArgs(call.arguments)).play()
+        result(nil)
+      case "pause":
+        try playerHost(from: try dictionaryArgs(call.arguments)).pause()
+        result(nil)
+      case "stop":
+        try playerHost(from: try dictionaryArgs(call.arguments)).stop()
+        result(nil)
+      case "close":
+        try playerHost(from: try dictionaryArgs(call.arguments)).close()
+        result(nil)
+      case "seek":
+        let args = try dictionaryArgs(call.arguments)
+        try playerHost(from: args).seek(positionMicros: try requiredUInt64(args["positionMicros"], name: "positionMicros"))
+        result(nil)
+      case "setPlaybackRate":
+        let args = try dictionaryArgs(call.arguments)
+        guard let rate = doubleValue(args["rate"]) else {
+          throw KurokoPluginError.invalidArguments("rate is required.")
+        }
+        try playerHost(from: args).setPlaybackRate(rate)
+        result(nil)
+      case "addExternalSubtitle":
+        let args = try dictionaryArgs(call.arguments)
+        guard let uri = args["uri"] as? String, !uri.isEmpty else {
+          throw KurokoPluginError.invalidArguments("uri is required.")
+        }
+        result(try playerHost(from: args).addExternalSubtitle(uri: uri))
+      case "removeSubtitleTrack":
+        let args = try dictionaryArgs(call.arguments)
+        try playerHost(from: args).removeSubtitleTrack(trackId: try requiredInt64(args["trackId"], name: "trackId"))
+        result(nil)
+      case "loadDanmakuFile":
+        let args = try dictionaryArgs(call.arguments)
+        guard let uri = args["uri"] as? String, !uri.isEmpty else {
+          throw KurokoPluginError.invalidArguments("uri is required.")
+        }
+        try playerHost(from: args).loadDanmakuFile(uri: uri)
+        result(nil)
+      case "loadDanmakuJson":
+        let args = try dictionaryArgs(call.arguments)
+        guard let json = args["json"] as? String, !json.isEmpty else {
+          throw KurokoPluginError.invalidArguments("json is required.")
+        }
+        try playerHost(from: args).loadDanmakuJson(json)
+        result(nil)
+      case "addDanmakuTrackFile":
+        let args = try dictionaryArgs(call.arguments)
+        guard let uri = args["uri"] as? String, !uri.isEmpty else {
+          throw KurokoPluginError.invalidArguments("uri is required.")
+        }
+        result(Int64(clamping: try playerHost(from: args).addDanmakuTrackFile(
+          uri: uri,
+          name: args["name"] as? String,
+          offsetMicros: int64Value(args["offsetMicros"]) ?? 0
+        )))
+      case "addDanmakuTrackJson":
+        let args = try dictionaryArgs(call.arguments)
+        guard let json = args["json"] as? String, !json.isEmpty else {
+          throw KurokoPluginError.invalidArguments("json is required.")
+        }
+        result(Int64(clamping: try playerHost(from: args).addDanmakuTrackJson(
+          json,
+          name: args["name"] as? String,
+          offsetMicros: int64Value(args["offsetMicros"]) ?? 0
+        )))
+      case "removeDanmakuTrack":
+        let args = try dictionaryArgs(call.arguments)
+        try playerHost(from: args).removeDanmakuTrack(trackId: try requiredUInt64(args["trackId"], name: "trackId"))
+        result(nil)
+      case "setDanmakuTrackEnabled":
+        let args = try dictionaryArgs(call.arguments)
+        try playerHost(from: args).setDanmakuTrackEnabled(
+          trackId: try requiredUInt64(args["trackId"], name: "trackId"),
+          enabled: boolValue(args["enabled"]) ?? true
+        )
+        result(nil)
+      case "setDanmakuTrackOffset":
+        let args = try dictionaryArgs(call.arguments)
+        try playerHost(from: args).setDanmakuTrackOffset(
+          trackId: try requiredUInt64(args["trackId"], name: "trackId"),
+          offsetMicros: int64Value(args["offsetMicros"]) ?? 0
+        )
+        result(nil)
+      case "setDanmakuGlobalOffset":
+        let args = try dictionaryArgs(call.arguments)
+        try playerHost(from: args).setDanmakuGlobalOffset(offsetMicros: int64Value(args["offsetMicros"]) ?? 0)
+        result(nil)
+      case "danmakuTracks":
+        result(try playerHost(from: try dictionaryArgs(call.arguments)).danmakuTracks())
+      case "clearDanmaku":
+        try playerHost(from: try dictionaryArgs(call.arguments)).clearDanmaku()
+        result(nil)
+      case "setDanmakuEnabled":
+        let args = try dictionaryArgs(call.arguments)
+        try playerHost(from: args).setDanmakuEnabled(boolValue(args["enabled"]) ?? true)
+        result(nil)
+      case "setDanmakuConfig":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        try host.setDanmakuConfig(danmakuConfig(from: args))
+        if args.keys.contains("customFontFamily") || args.keys.contains("customFontFilePath") {
+          try host.setDanmakuFont(
+            family: args["customFontFamily"] as? String,
+            filePath: args["customFontFilePath"] as? String
+          )
+        }
+        if let blockWordsJson = args["blockWordsJson"] as? String {
+          try host.setDanmakuBlockWordsJson(blockWordsJson)
+        }
+        result(nil)
+      case "selectAudioTrack":
+        let args = try dictionaryArgs(call.arguments)
+        try playerHost(from: args).selectAudioTrack(trackId: optionalTrackId(args["trackId"]))
+        result(nil)
+      case "selectSubtitleTrack":
+        let args = try dictionaryArgs(call.arguments)
+        try playerHost(from: args).selectSubtitleTrack(trackId: optionalTrackId(args["trackId"]))
+        result(nil)
+      case "tracks":
+        result(try playerHost(from: try dictionaryArgs(call.arguments)).tracks())
+      case "attachView":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        let viewId = try requiredInt64(args["viewId"], name: "viewId")
+        guard let view = views[viewId]?.view else {
+          throw KurokoPluginError.viewNotFound(viewId)
+        }
+        try host.attach(view: view)
+        result(nil)
+      case "detachView":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        let viewId = try requiredInt64(args["viewId"], name: "viewId")
+        host.detach(viewId: viewId)
+        result(nil)
+      case "attachOverlay", "detachOverlay", "setOverlayFrame":
+        throw KurokoPluginError.overlayNotAvailable
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    } catch {
+      result(flutterError(error))
+    }
+  }
+
+  public func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
+    Self.sharedEventSink = events
+    startPollTimerIfNeeded()
+    return nil
+  }
+
+  public func onCancel(withArguments arguments: Any?) -> FlutterError? {
+    Self.sharedEventSink = nil
+    pollTimer?.invalidate()
+    pollTimer = nil
+    return nil
+  }
+
+  fileprivate func registerView(_ view: KurokoMetalSurfaceView, viewId: Int64) {
+    views[viewId] = WeakKurokoVideoPlatformViewBox(view: view)
+  }
+
+  fileprivate func unregisterView(viewId: Int64) {
+    views.removeValue(forKey: viewId)
+    for host in players.values {
+      host.detach(viewId: viewId)
+    }
+  }
+
+  fileprivate func resizePlayerAttachedToView(viewId: Int64) {
+    for host in players.values {
+      if let attachedPlayerId = views[viewId]?.view?.attachedPlayerId,
+         attachedPlayerId == host.id {
+        host.resizeFromAttachedView()
+      }
+    }
+  }
+
+  private func createPlayer(arguments: Any?) throws -> Int64 {
+    guard let library = KurokoNativeLibrary.shared else {
+      throw KurokoPluginError.libraryNotFound(["main executable", "KUROKO_CAPI_DYLIB", "app bundle"])
+    }
+    let id = nextPlayerId
+    nextPlayerId += 1
+    players[id] = try KurokoPlayerHost(id: id, library: library, config: presenterConfigForNewPlayer(arguments: arguments))
+    startPollTimerIfNeeded()
+    return id
+  }
+
+  private func presenterConfigForNewPlayer(arguments: Any?) throws -> KurokoPresenterConfigC {
+    if let args = arguments as? [String: Any], let explicitMode = int32Value(args["outputMode"]) {
+      let headroom = floatValue(args["edrHeadroom"]) ?? 4.0
+      return explicitMode == 1 ? .appleEdr(headroom: headroom) : .sdr
+    }
+    let headroom = resolvedEdrHeadroom()
+    return headroom > 1.0 ? .appleEdr(headroom: headroom) : .sdr
+  }
+
+  private func resolvedEdrHeadroom() -> Float {
+    let environment = ProcessInfo.processInfo.environment
+    if boolEnvironmentFlag("KUROKO_DISABLE_EDR", environment: environment) { return 1.0 }
+    if let override = floatEnvironmentValue("KUROKO_EDR_HEADROOM", environment: environment), override > 1.0 {
+      return override
+    }
+    let screenHeadroom = currentScreenEdrHeadroom()
+    if screenHeadroom > 1.0 { return screenHeadroom }
+    if boolEnvironmentFlag("KUROKO_ENABLE_EDR", environment: environment) { return 4.0 }
+    return 1.0
+  }
+
+  private func currentScreenEdrHeadroom() -> Float {
+    let screen = UIScreen.main
+    for key in ["currentEDRHeadroom", "potentialEDRHeadroom", "maximumPotentialExtendedDynamicRangeColorComponentValue"] {
+      let selector = Selector(key)
+      if screen.responds(to: selector), let number = screen.value(forKey: key) as? NSNumber {
+        let value = number.floatValue
+        if value.isFinite && value > 1.0 { return value }
+      }
+    }
+    return 1.0
+  }
+
+  private func startPollTimerIfNeeded() {
+    guard pollTimer == nil else { return }
+    let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+      guard let self else { return }
+      let sink = Self.sharedEventSink
+      for host in self.players.values {
+        host.pollEvents(sendEvent: sink)
+      }
+    }
+    pollTimer = timer
+    RunLoop.main.add(timer, forMode: .common)
+  }
+
+  private func playerHost(from args: [String: Any]) throws -> KurokoPlayerHost {
+    let playerId = try requiredInt64(args["playerId"], name: "playerId")
+    guard let host = players[playerId] else {
+      throw KurokoPluginError.playerNotFound(playerId)
+    }
+    return host
+  }
+
+  private func optionalTrackId(_ value: Any?) throws -> Int64? {
+    if value == nil || value is NSNull { return nil }
+    guard let trackId = int64Value(value) else {
+      throw KurokoPluginError.invalidArguments("trackId must be an integer or null.")
+    }
+    return trackId >= 0 ? trackId : nil
+  }
+
+  private func danmakuConfig(from args: [String: Any]) -> KurokoDanmakuConfigC {
+    var config = KurokoDanmakuConfigC()
+    if let value = boolValue(args["enabled"]) { config.enabled = value ? 1 : 0 }
+    if let value = doubleValue(args["fontSize"]) { config.fontSize = Float(value) }
+    if let value = doubleValue(args["opacity"]) { config.opacity = Float(value) }
+    if let value = doubleValue(args["displayArea"]) { config.displayArea = Float(value) }
+    if let value = doubleValue(args["scrollDurationSeconds"]) { config.scrollDurationSeconds = Float(value) }
+    if let value = doubleValue(args["scrollSpeedFactor"]) { config.scrollSpeedFactor = Float(value) }
+    if let value = doubleValue(args["trackGapRatio"]) { config.trackGapRatio = Float(value) }
+    if let value = doubleValue(args["outlineWidth"]) { config.outlineWidth = Float(value) }
+    if let value = doubleValue(args["shadowOffsetX"]) { config.shadowOffsetX = Float(value) }
+    if let value = doubleValue(args["shadowOffsetY"]) { config.shadowOffsetY = Float(value) }
+    if let value = boolValue(args["mergeDuplicates"]) { config.mergeDuplicates = value ? 1 : 0 }
+    if let value = boolValue(args["allowStacking"]) { config.allowStacking = value ? 1 : 0 }
+    if let value = boolValue(args["allowScrollOverwrite"]) { config.allowScrollOverwrite = value ? 1 : 0 }
+    if let value = int64Value(args["maxQuantity"]), value > 0 { config.maxQuantity = UInt32(clamping: value) }
+    if let value = int64Value(args["maxLinesPerMode"]), value > 0 { config.maxLinesPerMode = UInt32(clamping: value) }
+    if let value = boolValue(args["blockTop"]) { config.blockTop = value ? 1 : 0 }
+    if let value = boolValue(args["blockBottom"]) { config.blockBottom = value ? 1 : 0 }
+    if let value = boolValue(args["blockScroll"]) { config.blockScroll = value ? 1 : 0 }
+    if let value = int64Value(args["shadowStyle"]) { config.shadowStyle = Int32(clamping: value) }
+    return config
+  }
+
+  private func dictionaryArgs(_ arguments: Any?) throws -> [String: Any] {
+    guard let args = arguments as? [String: Any] else {
+      throw KurokoPluginError.invalidArguments("Arguments must be a dictionary.")
+    }
+    return args
+  }
+
+  private func int32Value(_ value: Any?) -> Int32? {
+    if let value = value as? Int32 { return value }
+    if let value = value as? NSNumber { return value.int32Value }
+    if let value = value as? String { return Int32(value) }
+    return nil
+  }
+
+  private func int64Value(_ value: Any?) -> Int64? {
+    if let value = value as? Int64 { return value }
+    if let value = value as? NSNumber { return value.int64Value }
+    if let value = value as? String { return Int64(value) }
+    return nil
+  }
+
+  private func doubleValue(_ value: Any?) -> Double? {
+    if let value = value as? Double { return value }
+    if let value = value as? NSNumber { return value.doubleValue }
+    if let value = value as? String { return Double(value) }
+    return nil
+  }
+
+  private func floatValue(_ value: Any?) -> Float? {
+    if let value = value as? Float, value.isFinite { return value }
+    if let value = value as? Double, value.isFinite { return Float(value) }
+    if let value = value as? NSNumber {
+      let result = value.floatValue
+      return result.isFinite ? result : nil
+    }
+    if let value = value as? String, let result = Float(value), result.isFinite { return result }
+    return nil
+  }
+
+  private func boolValue(_ value: Any?) -> Bool? {
+    if let value = value as? Bool { return value }
+    if let value = value as? NSNumber { return value.boolValue }
+    if let value = value as? String {
+      switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+      case "1", "true", "yes", "on": return true
+      case "0", "false", "no", "off": return false
+      default: return nil
+      }
+    }
+    return nil
+  }
+
+  private func requiredInt64(_ value: Any?, name: String) throws -> Int64 {
+    if let value = int64Value(value) { return value }
+    throw KurokoPluginError.invalidArguments("\(name) is required.")
+  }
+
+  private func requiredUInt64(_ value: Any?, name: String) throws -> UInt64 {
+    if let value = value as? UInt64 { return value }
+    if let value = value as? Int64, value >= 0 { return UInt64(value) }
+    if let value = value as? NSNumber { return value.uint64Value }
+    if let value = value as? String, let parsed = UInt64(value) { return parsed }
+    throw KurokoPluginError.invalidArguments("\(name) is required.")
+  }
+
+  private func boolEnvironmentFlag(_ name: String, environment: [String: String]) -> Bool {
+    switch environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    case "1", "true", "yes", "on": return true
+    default: return false
+    }
+  }
+
+  private func floatEnvironmentValue(_ name: String, environment: [String: String]) -> Float? {
+    guard let raw = environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !raw.isEmpty,
+          let value = Float(raw),
+          value.isFinite else {
+      return nil
+    }
+    return value
+  }
+
+  private func flutterError(_ error: Error) -> FlutterError {
+    FlutterError(code: "KUROKO_ERROR", message: String(describing: error), details: nil)
   }
 }
 
@@ -830,11 +1219,7 @@ private extension KurokoEventC {
 
 private extension KurokoTrackSelectionC {
   func toFlutterMap() -> [String: Any] {
-    [
-      "video": Int(video),
-      "audio": Int(audio),
-      "subtitle": Int(subtitle),
-    ]
+    ["video": Int(video), "audio": Int(audio), "subtitle": Int(subtitle)]
   }
 }
 
@@ -870,972 +1255,5 @@ private func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CCh
   guard let value, !value.isEmpty else {
     return body(nil)
   }
-  return value.withCString { pointer in
-    body(pointer)
-  }
-}
-
-private protocol KurokoMetalSurfaceView: AnyObject {
-  var platformViewId: Int64 { get }
-  var metalLayer: CAMetalLayer { get }
-  var attachedPlayerId: Int64? { get set }
-  var bounds: NSRect { get }
-  var currentBackingScale: Double { get }
-
-  func updateDrawableSize()
-}
-
-private final class WeakKurokoVideoPlatformViewBox {
-  weak var view: (NSView & KurokoMetalSurfaceView)?
-
-  init(view: NSView & KurokoMetalSurfaceView) {
-    self.view = view
-  }
-}
-
-final class KurokoVideoPlatformView: NSView, KurokoMetalSurfaceView {
-  let platformViewId: Int64
-  let metalLayer: CAMetalLayer
-
-  weak var plugin: KurokoFlutterPlugin?
-  var attachedPlayerId: Int64?
-
-  var currentBackingScale: Double {
-    let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1.0
-    return Double(max(1.0, scale))
-  }
-
-  init(viewId: Int64, arguments: Any?, plugin: KurokoFlutterPlugin?) {
-    platformViewId = viewId
-    self.plugin = plugin
-    metalLayer = CAMetalLayer()
-    super.init(frame: .zero)
-
-    wantsLayer = true
-    metalLayer.pixelFormat = .bgra8Unorm
-    metalLayer.framebufferOnly = true
-    metalLayer.isOpaque = true
-    metalLayer.backgroundColor = NSColor.black.cgColor
-    layer = metalLayer
-    layerContentsRedrawPolicy = .duringViewResize
-    autoresizingMask = [.width, .height]
-
-    if let params = arguments as? [String: Any],
-       let debugLabel = params["debugLabel"] as? String,
-       !debugLabel.isEmpty,
-       ProcessInfo.processInfo.environment["KUROKO_DEBUG_LABELS"] == "1" {
-      let label = NSTextField(labelWithString: debugLabel)
-      label.textColor = NSColor(white: 1.0, alpha: 0.4)
-      label.font = NSFont.systemFont(ofSize: 12, weight: .medium)
-      label.translatesAutoresizingMaskIntoConstraints = false
-      addSubview(label)
-      NSLayoutConstraint.activate([
-        label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-        label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
-      ])
-    }
-  }
-
-  required init?(coder: NSCoder) {
-    fatalError("init(coder:) has not been implemented")
-  }
-
-  deinit {
-    plugin?.unregisterView(viewId: platformViewId)
-  }
-
-  override func layout() {
-    super.layout()
-    updateDrawableSize()
-    plugin?.resizePlayerAttachedToView(viewId: platformViewId)
-  }
-
-  override func viewDidMoveToWindow() {
-    super.viewDidMoveToWindow()
-    updateDrawableSize()
-    plugin?.resizePlayerAttachedToView(viewId: platformViewId)
-  }
-
-  override func viewDidChangeBackingProperties() {
-    super.viewDidChangeBackingProperties()
-    updateDrawableSize()
-    plugin?.resizePlayerAttachedToView(viewId: platformViewId)
-  }
-
-  func updateDrawableSize() {
-    let scale = CGFloat(currentBackingScale)
-    let width = max(1.0, bounds.width * scale)
-    let height = max(1.0, bounds.height * scale)
-    metalLayer.frame = bounds
-    metalLayer.drawableSize = CGSize(width: width, height: height)
-  }
-}
-
-final class KurokoWindowOverlayView: NSView, KurokoMetalSurfaceView {
-  let platformViewId: Int64 = kurokoWindowHostedVideoSurfaceId
-  let metalLayer: CAMetalLayer
-
-  weak var plugin: KurokoFlutterPlugin?
-  var attachedPlayerId: Int64?
-
-  private var overlayFrameGeneration: Int64?
-
-  var currentBackingScale: Double {
-    let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1.0
-    return Double(max(1.0, scale))
-  }
-
-  init(plugin: KurokoFlutterPlugin?) {
-    self.plugin = plugin
-    metalLayer = CAMetalLayer()
-    super.init(frame: .zero)
-
-    wantsLayer = true
-    metalLayer.pixelFormat = .bgra8Unorm
-    metalLayer.framebufferOnly = true
-    metalLayer.isOpaque = true
-    metalLayer.backgroundColor = NSColor.black.cgColor
-    layer = metalLayer
-    layerContentsRedrawPolicy = .duringViewResize
-    autoresizingMask = [.width, .height]
-    isHidden = true
-    layer?.actions = [
-      "bounds": NSNull(),
-      "frame": NSNull(),
-      "position": NSNull(),
-    ]
-  }
-
-  required init?(coder: NSCoder) {
-    fatalError("init(coder:) has not been implemented")
-  }
-
-  deinit {
-    plugin?.detachOverlayView(self)
-  }
-
-  override func hitTest(_ point: NSPoint) -> NSView? {
-    nil
-  }
-
-  override func layout() {
-    super.layout()
-    updateDrawableSize()
-    plugin?.resizePlayerAttachedToView(viewId: platformViewId)
-  }
-
-  override func viewDidMoveToWindow() {
-    super.viewDidMoveToWindow()
-    updateDrawableSize()
-    plugin?.resizePlayerAttachedToView(viewId: platformViewId)
-  }
-
-  override func viewDidChangeBackingProperties() {
-    super.viewDidChangeBackingProperties()
-    updateDrawableSize()
-    plugin?.resizePlayerAttachedToView(viewId: platformViewId)
-  }
-
-  func updateOverlayFrame(_ frame: CGRect?, visible: Bool, debugLabel: String?, generation: Int64?) {
-    if visible {
-      overlayFrameGeneration = generation
-    } else if let generation,
-              let overlayFrameGeneration,
-              generation != overlayFrameGeneration {
-      return
-    }
-
-    toolTip = kurokoDebugLabelsEnabled ? debugLabel : nil
-    let shouldShow = visible &&
-      (frame?.width ?? 0) > 0 &&
-      (frame?.height ?? 0) > 0
-
-    CATransaction.begin()
-    CATransaction.setDisableActions(true)
-    defer { CATransaction.commit() }
-
-    guard shouldShow, let frame else {
-      isHidden = true
-      return
-    }
-
-    let resolvedFrame = frame.integral
-    if self.frame != resolvedFrame {
-      self.frame = resolvedFrame
-    }
-    isHidden = false
-    updateDrawableSize()
-    plugin?.resizePlayerAttachedToView(viewId: platformViewId)
-  }
-
-  func updateDrawableSize() {
-    let scale = CGFloat(currentBackingScale)
-    let width = max(1.0, bounds.width * scale)
-    let height = max(1.0, bounds.height * scale)
-    metalLayer.frame = bounds
-    metalLayer.drawableSize = CGSize(width: width, height: height)
-  }
-}
-
-final class KurokoVideoViewFactory: NSObject, FlutterPlatformViewFactory {
-  private weak var plugin: KurokoFlutterPlugin?
-
-  init(plugin: KurokoFlutterPlugin) {
-    self.plugin = plugin
-    super.init()
-  }
-
-  func createArgsCodec() -> (FlutterMessageCodec & NSObjectProtocol)? {
-    FlutterStandardMessageCodec.sharedInstance()
-  }
-
-  func create(withViewIdentifier viewId: Int64, arguments args: Any?) -> NSView {
-    let view = KurokoVideoPlatformView(viewId: viewId, arguments: args, plugin: plugin)
-    plugin?.registerView(view, viewId: viewId)
-    return view
-  }
-}
-
-private enum KurokoAssociatedObjectKeys {
-  static var windowOverlayView: UInt8 = 0
-}
-
-private extension NSWindow {
-  var kurokoWindowOverlayView: KurokoWindowOverlayView? {
-    get {
-      objc_getAssociatedObject(
-        self,
-        &KurokoAssociatedObjectKeys.windowOverlayView
-      ) as? KurokoWindowOverlayView
-    }
-    set {
-      objc_setAssociatedObject(
-        self,
-        &KurokoAssociatedObjectKeys.windowOverlayView,
-        newValue,
-        .OBJC_ASSOCIATION_RETAIN_NONATOMIC
-      )
-    }
-  }
-}
-
-public final class KurokoFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
-  static var sharedEventSink: FlutterEventSink?
-
-  private static let playerChannelName = "kuroko_flutter/player"
-  private static let eventsChannelName = "kuroko_flutter/events"
-  private static let videoViewType = "kuroko_flutter/video_view"
-
-  private var players: [Int64: KurokoPlayerHost] = [:]
-  private var views: [Int64: WeakKurokoVideoPlatformViewBox] = [:]
-  private weak var flutterHostView: NSView?
-  private weak var flutterHostViewController: NSViewController?
-  private var nextPlayerId: Int64 = 1
-  private var pollTimer: Timer?
-
-  init(flutterHostView: NSView?, flutterHostViewController: NSViewController?) {
-    self.flutterHostView = flutterHostView
-    self.flutterHostViewController = flutterHostViewController
-    super.init()
-  }
-
-  public static func register(with registrar: FlutterPluginRegistrar) {
-    let instance = KurokoFlutterPlugin(
-      flutterHostView: registrar.view,
-      flutterHostViewController: registrar.viewController
-    )
-    let playerChannel = FlutterMethodChannel(
-      name: playerChannelName,
-      binaryMessenger: registrar.messenger
-    )
-    let eventsChannel = FlutterEventChannel(
-      name: eventsChannelName,
-      binaryMessenger: registrar.messenger
-    )
-    registrar.addMethodCallDelegate(instance, channel: playerChannel)
-    eventsChannel.setStreamHandler(instance)
-    registrar.register(KurokoVideoViewFactory(plugin: instance), withId: videoViewType)
-  }
-
-  public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-    do {
-      switch call.method {
-      case "create":
-        result(try createPlayer(arguments: call.arguments))
-      case "dispose":
-        let args = try dictionaryArgs(call.arguments)
-        let playerId = try requiredInt64(args["playerId"], name: "playerId")
-        players.removeValue(forKey: playerId)
-        result(nil)
-      case "open":
-        let args = try dictionaryArgs(call.arguments)
-        let host = try playerHost(from: args)
-        guard let uri = args["uri"] as? String, !uri.isEmpty else {
-          throw KurokoPluginError.invalidArguments("uri is required.")
-        }
-        try host.open(uri: uri)
-        result(nil)
-      case "play":
-        try playerHost(from: try dictionaryArgs(call.arguments)).play()
-        result(nil)
-      case "pause":
-        try playerHost(from: try dictionaryArgs(call.arguments)).pause()
-        result(nil)
-      case "stop":
-        try playerHost(from: try dictionaryArgs(call.arguments)).stop()
-        result(nil)
-      case "close":
-        try playerHost(from: try dictionaryArgs(call.arguments)).close()
-        result(nil)
-      case "seek":
-        let args = try dictionaryArgs(call.arguments)
-        let host = try playerHost(from: args)
-        let positionMicros = try requiredUInt64(args["positionMicros"], name: "positionMicros")
-        try host.seek(positionMicros: positionMicros)
-        result(nil)
-      case "setPlaybackRate":
-        let args = try dictionaryArgs(call.arguments)
-        let host = try playerHost(from: args)
-        guard let rate = doubleValue(args["rate"]) else {
-          throw KurokoPluginError.invalidArguments("rate is required.")
-        }
-        try host.setPlaybackRate(rate)
-        result(nil)
-      case "setVolume":
-        let args = try dictionaryArgs(call.arguments)
-        let host = try playerHost(from: args)
-        guard let volume = doubleValue(args["volume"]) else {
-          throw KurokoPluginError.invalidArguments("volume is required.")
-        }
-        try host.setVolume(volume)
-        result(nil)
-      case "addExternalSubtitle":
-        let args = try dictionaryArgs(call.arguments)
-        let host = try playerHost(from: args)
-        guard let uri = args["uri"] as? String, !uri.isEmpty else {
-          throw KurokoPluginError.invalidArguments("uri is required.")
-        }
-        result(try host.addExternalSubtitle(uri: uri))
-      case "removeSubtitleTrack":
-        let args = try dictionaryArgs(call.arguments)
-        let host = try playerHost(from: args)
-        let trackId = try requiredInt64(args["trackId"], name: "trackId")
-        try host.removeSubtitleTrack(trackId: trackId)
-        result(nil)
-      case "loadDanmakuFile":
-        let args = try dictionaryArgs(call.arguments)
-        let host = try playerHost(from: args)
-        guard let uri = args["uri"] as? String, !uri.isEmpty else {
-          throw KurokoPluginError.invalidArguments("uri is required.")
-        }
-        try host.loadDanmakuFile(uri: uri)
-        result(nil)
-      case "loadDanmakuJson":
-        let args = try dictionaryArgs(call.arguments)
-        let host = try playerHost(from: args)
-        guard let json = args["json"] as? String, !json.isEmpty else {
-          throw KurokoPluginError.invalidArguments("json is required.")
-        }
-        try host.loadDanmakuJson(json)
-        result(nil)
-      case "addDanmakuTrackFile":
-        let args = try dictionaryArgs(call.arguments)
-        let host = try playerHost(from: args)
-        guard let uri = args["uri"] as? String, !uri.isEmpty else {
-          throw KurokoPluginError.invalidArguments("uri is required.")
-        }
-        let offsetMicros = int64Value(args["offsetMicros"]) ?? 0
-        result(Int64(clamping: try host.addDanmakuTrackFile(
-          uri: uri,
-          name: args["name"] as? String,
-          offsetMicros: offsetMicros
-        )))
-      case "addDanmakuTrackJson":
-        let args = try dictionaryArgs(call.arguments)
-        let host = try playerHost(from: args)
-        guard let json = args["json"] as? String, !json.isEmpty else {
-          throw KurokoPluginError.invalidArguments("json is required.")
-        }
-        let offsetMicros = int64Value(args["offsetMicros"]) ?? 0
-        result(Int64(clamping: try host.addDanmakuTrackJson(
-          json,
-          name: args["name"] as? String,
-          offsetMicros: offsetMicros
-        )))
-      case "removeDanmakuTrack":
-        let args = try dictionaryArgs(call.arguments)
-        let host = try playerHost(from: args)
-        try host.removeDanmakuTrack(trackId: try requiredUInt64(args["trackId"], name: "trackId"))
-        result(nil)
-      case "setDanmakuTrackEnabled":
-        let args = try dictionaryArgs(call.arguments)
-        let host = try playerHost(from: args)
-        try host.setDanmakuTrackEnabled(
-          trackId: try requiredUInt64(args["trackId"], name: "trackId"),
-          enabled: boolValue(args["enabled"]) ?? true
-        )
-        result(nil)
-      case "setDanmakuTrackOffset":
-        let args = try dictionaryArgs(call.arguments)
-        let host = try playerHost(from: args)
-        try host.setDanmakuTrackOffset(
-          trackId: try requiredUInt64(args["trackId"], name: "trackId"),
-          offsetMicros: int64Value(args["offsetMicros"]) ?? 0
-        )
-        result(nil)
-      case "setDanmakuGlobalOffset":
-        let args = try dictionaryArgs(call.arguments)
-        let host = try playerHost(from: args)
-        try host.setDanmakuGlobalOffset(offsetMicros: int64Value(args["offsetMicros"]) ?? 0)
-        result(nil)
-      case "danmakuTracks":
-        let host = try playerHost(from: try dictionaryArgs(call.arguments))
-        result(try host.danmakuTracks())
-      case "clearDanmaku":
-        let host = try playerHost(from: try dictionaryArgs(call.arguments))
-        try host.clearDanmaku()
-        result(nil)
-      case "setDanmakuEnabled":
-        let args = try dictionaryArgs(call.arguments)
-        let host = try playerHost(from: args)
-        try host.setDanmakuEnabled(boolValue(args["enabled"]) ?? true)
-        result(nil)
-      case "setDanmakuConfig":
-        let args = try dictionaryArgs(call.arguments)
-        let host = try playerHost(from: args)
-        try host.setDanmakuConfig(
-          danmakuConfig(from: args, base: host.danmakuConfigSnapshot())
-        )
-        if args.keys.contains("customFontFamily") || args.keys.contains("customFontFilePath") {
-          try host.setDanmakuFont(
-            family: args["customFontFamily"] as? String,
-            filePath: args["customFontFilePath"] as? String
-          )
-        }
-        if let blockWordsJson = args["blockWordsJson"] as? String {
-          try host.setDanmakuBlockWordsJson(blockWordsJson)
-        }
-        result(nil)
-      case "selectAudioTrack":
-        let args = try dictionaryArgs(call.arguments)
-        let host = try playerHost(from: args)
-        try host.selectAudioTrack(trackId: optionalTrackId(args["trackId"]))
-        result(nil)
-      case "selectSubtitleTrack":
-        let args = try dictionaryArgs(call.arguments)
-        let host = try playerHost(from: args)
-        try host.selectSubtitleTrack(trackId: optionalTrackId(args["trackId"]))
-        result(nil)
-      case "tracks":
-        let host = try playerHost(from: try dictionaryArgs(call.arguments))
-        result(try host.tracks())
-      case "attachView":
-        let args = try dictionaryArgs(call.arguments)
-        let host = try playerHost(from: args)
-        let viewId = try requiredInt64(args["viewId"], name: "viewId")
-        guard let view = views[viewId]?.view else {
-          throw KurokoPluginError.viewNotFound(viewId)
-        }
-        try host.attach(view: view)
-        result(nil)
-      case "detachView":
-        let args = try dictionaryArgs(call.arguments)
-        let host = try playerHost(from: args)
-        let viewId = try requiredInt64(args["viewId"], name: "viewId")
-        host.detach(viewId: viewId)
-        result(nil)
-      case "attachOverlay":
-        let args = try dictionaryArgs(call.arguments)
-        let host = try playerHost(from: args)
-        let overlay = try ensureWindowOverlayInstalled()
-        try host.attach(view: overlay)
-        result(kurokoWindowHostedVideoSurfaceId)
-      case "detachOverlay":
-        let args = try dictionaryArgs(call.arguments)
-        let host = try playerHost(from: args)
-        host.detach(viewId: kurokoWindowHostedVideoSurfaceId)
-        if let overlay = resolveWindowOverlay() {
-          overlay.updateOverlayFrame(nil, visible: false, debugLabel: nil, generation: int64Value(args["generation"]))
-        }
-        result(nil)
-      case "setOverlayFrame":
-        let args = try dictionaryArgs(call.arguments)
-        let overlay = try ensureWindowOverlayInstalled()
-        let visible = boolValue(args["visible"]) ?? true
-        let frame = convertedOverlayRect(from: args, targetView: overlay)
-        overlay.updateOverlayFrame(
-          frame,
-          visible: visible,
-          debugLabel: args["debugLabel"] as? String,
-          generation: int64Value(args["generation"])
-        )
-        result(nil)
-      default:
-        result(FlutterMethodNotImplemented)
-      }
-    } catch {
-      result(flutterError(error))
-    }
-  }
-
-  public func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
-    Self.sharedEventSink = events
-    startPollTimerIfNeeded()
-    return nil
-  }
-
-  public func onCancel(withArguments arguments: Any?) -> FlutterError? {
-    Self.sharedEventSink = nil
-    pollTimer?.invalidate()
-    pollTimer = nil
-    return nil
-  }
-
-  fileprivate func registerView(_ view: NSView & KurokoMetalSurfaceView, viewId: Int64) {
-    views[viewId] = WeakKurokoVideoPlatformViewBox(view: view)
-  }
-
-  fileprivate func unregisterView(viewId: Int64) {
-    views.removeValue(forKey: viewId)
-    for host in players.values {
-      host.detach(viewId: viewId)
-    }
-  }
-
-  fileprivate func resizePlayerAttachedToView(viewId: Int64) {
-    for host in players.values {
-      if let attachedPlayerId = views[viewId]?.view?.attachedPlayerId,
-         attachedPlayerId == host.id {
-        host.resizeFromAttachedView()
-      }
-    }
-  }
-
-  fileprivate func detachOverlayView(_ view: KurokoWindowOverlayView) {
-    for host in players.values {
-      host.detach(viewId: view.platformViewId)
-    }
-    if views[view.platformViewId]?.view === view {
-      views.removeValue(forKey: view.platformViewId)
-    }
-    if view.window?.kurokoWindowOverlayView === view {
-      view.window?.kurokoWindowOverlayView = nil
-    }
-  }
-
-  private func ensureWindowOverlayInstalled() throws -> KurokoWindowOverlayView {
-    if let existing = resolveWindowOverlay(),
-       existing.superview != nil {
-      return existing
-    }
-
-    guard let flutterHostView else {
-      throw KurokoPluginError.overlayNotAvailable
-    }
-    guard let hostWindow = flutterHostView.window else {
-      throw KurokoPluginError.overlayNotAvailable
-    }
-    guard let hostSuperview = flutterHostView.superview else {
-      throw KurokoPluginError.overlayNotAvailable
-    }
-
-    let overlay = hostWindow.kurokoWindowOverlayView ??
-      KurokoWindowOverlayView(plugin: self)
-    overlay.plugin = self
-
-    if overlay.superview !== hostSuperview {
-      overlay.removeFromSuperview()
-      overlay.frame = .zero
-      overlay.translatesAutoresizingMaskIntoConstraints = true
-      hostSuperview.addSubview(
-        overlay,
-        positioned: shouldPlaceWindowOverlayAboveFlutter() ? .above : .below,
-        relativeTo: flutterHostView
-      )
-    } else {
-      hostSuperview.addSubview(
-        overlay,
-        positioned: shouldPlaceWindowOverlayAboveFlutter() ? .above : .below,
-        relativeTo: flutterHostView
-      )
-    }
-
-    hostWindow.kurokoWindowOverlayView = overlay
-    registerView(overlay, viewId: overlay.platformViewId)
-    return overlay
-  }
-
-  private func resolveWindowOverlay() -> KurokoWindowOverlayView? {
-    if let hostWindow = flutterHostView?.window,
-       let overlay = hostWindow.kurokoWindowOverlayView {
-      return overlay
-    }
-    if let hostWindow = flutterHostViewController?.view.window,
-       let overlay = hostWindow.kurokoWindowOverlayView {
-      return overlay
-    }
-    if let overlay = NSApp.keyWindow?.kurokoWindowOverlayView {
-      return overlay
-    }
-    if let overlay = NSApp.mainWindow?.kurokoWindowOverlayView {
-      return overlay
-    }
-    return NSApp.windows.compactMap(\.kurokoWindowOverlayView).first
-  }
-
-  private func shouldPlaceWindowOverlayAboveFlutter() -> Bool {
-    let environment = ProcessInfo.processInfo.environment
-    if environment["KUROKO_WINDOW_OVERLAY_BELOW"] == "1" {
-      return false
-    }
-    return environment["KUROKO_WINDOW_OVERLAY_ABOVE"] == "1"
-  }
-
-  private func convertedOverlayRect(
-    from args: [String: Any],
-    targetView: NSView
-  ) -> CGRect? {
-    guard let x = doubleValue(args["x"]),
-          let y = doubleValue(args["y"]),
-          let width = doubleValue(args["width"]),
-          let height = doubleValue(args["height"]) else {
-      return nil
-    }
-    guard width > 0, height > 0 else {
-      return nil
-    }
-    guard let flutterHostView,
-          let targetSuperview = targetView.superview else {
-      return CGRect(x: x, y: y, width: width, height: height)
-    }
-    let sourceY = flutterHostView.isFlipped
-      ? y
-      : flutterHostView.bounds.height - y - height
-    let rect = CGRect(x: x, y: sourceY, width: width, height: height)
-    return flutterHostView.convert(rect, to: targetSuperview)
-  }
-
-  private func createPlayer(arguments: Any?) throws -> Int64 {
-    guard let library = KurokoNativeLibrary.shared else {
-      throw KurokoPluginError.libraryNotFound([
-        ProcessInfo.processInfo.environment["KUROKO_CAPI_DYLIB"] ?? "",
-        KurokoNativeLibrary.sourceTreeDebugLibraryPath() ?? "",
-        "libkuroko_capi.dylib",
-      ].filter { !$0.isEmpty })
-    }
-    let id = nextPlayerId
-    nextPlayerId += 1
-    players[id] = try KurokoPlayerHost(
-      id: id,
-      library: library,
-      config: presenterConfigForNewPlayer(arguments: arguments)
-    )
-    startPollTimerIfNeeded()
-    return id
-  }
-
-  private func presenterConfigForNewPlayer(arguments: Any?) throws -> KurokoPresenterConfigC {
-    if let args = arguments as? [String: Any],
-       let explicitMode = int32Value(args["outputMode"]) {
-      let headroom = floatValue(args["edrHeadroom"]) ?? 4.0
-      switch explicitMode {
-      case 1:
-        return .appleEdr(headroom: headroom)
-      default:
-        return .sdr
-      }
-    }
-
-    let headroom = resolvedEdrHeadroom()
-    if headroom > 1.0 {
-      NSLog("KurokoFlutterPlugin: using Apple EDR output, headroom \(headroom)x")
-      return .appleEdr(headroom: headroom)
-    }
-    return .sdr
-  }
-
-  private func resolvedEdrHeadroom() -> Float {
-    let environment = ProcessInfo.processInfo.environment
-    if boolEnvironmentFlag("KUROKO_DISABLE_EDR", environment: environment) {
-      return 1.0
-    }
-    if let override = floatEnvironmentValue("KUROKO_EDR_HEADROOM", environment: environment),
-       override > 1.0 {
-      return override
-    }
-
-    let screenHeadroom = currentScreenEdrHeadroom()
-    if screenHeadroom > 1.0 {
-      return screenHeadroom
-    }
-    if boolEnvironmentFlag("KUROKO_ENABLE_EDR", environment: environment) {
-      return 4.0
-    }
-    return 1.0
-  }
-
-  private func currentScreenEdrHeadroom() -> Float {
-    let screen = flutterHostView?.window?.screen ??
-      flutterHostViewController?.view.window?.screen ??
-      NSApp.keyWindow?.screen ??
-      NSApp.mainWindow?.screen ??
-      NSScreen.main
-    guard let screen else {
-      return 1.0
-    }
-
-    let key = "maximumPotentialExtendedDynamicRangeColorComponentValue"
-    guard screen.responds(to: Selector((key))),
-          let number = screen.value(forKey: key) as? NSNumber else {
-      return 1.0
-    }
-    return max(1.0, number.floatValue)
-  }
-
-  private func boolEnvironmentFlag(
-    _ name: String,
-    environment: [String: String]
-  ) -> Bool {
-    switch environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-    case "1", "true", "yes", "on":
-      return true
-    default:
-      return false
-    }
-  }
-
-  private func floatEnvironmentValue(
-    _ name: String,
-    environment: [String: String]
-  ) -> Float? {
-    guard let raw = environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines),
-          !raw.isEmpty,
-          let value = Float(raw),
-          value.isFinite else {
-      return nil
-    }
-    return value
-  }
-
-  private func int32Value(_ value: Any?) -> Int32? {
-    if let value = value as? Int32 {
-      return value
-    }
-    if let value = value as? NSNumber {
-      return value.int32Value
-    }
-    if let value = value as? String {
-      return Int32(value)
-    }
-    return nil
-  }
-
-  private func floatValue(_ value: Any?) -> Float? {
-    if let value = value as? Float, value.isFinite {
-      return value
-    }
-    if let value = value as? Double, value.isFinite {
-      return Float(value)
-    }
-    if let value = value as? NSNumber {
-      let result = value.floatValue
-      return result.isFinite ? result : nil
-    }
-    if let value = value as? String,
-       let result = Float(value),
-       result.isFinite {
-      return result
-    }
-    return nil
-  }
-
-  private func playerHost(from args: [String: Any]) throws -> KurokoPlayerHost {
-    let playerId = try requiredInt64(args["playerId"], name: "playerId")
-    guard let host = players[playerId] else {
-      throw KurokoPluginError.playerNotFound(playerId)
-    }
-    return host
-  }
-
-  private func optionalTrackId(_ value: Any?) throws -> Int64? {
-    if value == nil || value is NSNull {
-      return nil
-    }
-    guard let trackId = int64Value(value) else {
-      throw KurokoPluginError.invalidArguments("trackId must be an integer or null.")
-    }
-    return trackId >= 0 ? trackId : nil
-  }
-
-  private func danmakuConfig(
-    from args: [String: Any],
-    base: KurokoDanmakuConfigC
-  ) -> KurokoDanmakuConfigC {
-    var config = base
-    if let value = boolValue(args["enabled"]) {
-      config.enabled = value ? 1 : 0
-    }
-    if let value = doubleValue(args["fontSize"]) {
-      config.fontSize = Float(value)
-    }
-    if let value = doubleValue(args["opacity"]) {
-      config.opacity = Float(value)
-    }
-    if let value = doubleValue(args["displayArea"]) {
-      config.displayArea = Float(value)
-    }
-    if let value = doubleValue(args["scrollDurationSeconds"]) {
-      config.scrollDurationSeconds = Float(value)
-    }
-    if let value = doubleValue(args["scrollSpeedFactor"]) {
-      config.scrollSpeedFactor = Float(value)
-    }
-    if let value = doubleValue(args["trackGapRatio"]) {
-      config.trackGapRatio = Float(value)
-    }
-    if let value = doubleValue(args["outlineWidth"]) {
-      config.outlineWidth = Float(value)
-    }
-    if let value = doubleValue(args["shadowOffsetX"]) {
-      config.shadowOffsetX = Float(value)
-    }
-    if let value = doubleValue(args["shadowOffsetY"]) {
-      config.shadowOffsetY = Float(value)
-    }
-    if let value = boolValue(args["mergeDuplicates"]) {
-      config.mergeDuplicates = value ? 1 : 0
-    }
-    if let value = boolValue(args["allowStacking"]) {
-      config.allowStacking = value ? 1 : 0
-    }
-    if let value = boolValue(args["allowScrollOverwrite"]) {
-      config.allowScrollOverwrite = value ? 1 : 0
-    }
-    if let value = int64Value(args["maxQuantity"]), value > 0 {
-      config.maxQuantity = UInt32(clamping: value)
-    }
-    if let value = int64Value(args["maxLinesPerMode"]), value > 0 {
-      config.maxLinesPerMode = UInt32(clamping: value)
-    }
-    if let value = boolValue(args["blockTop"]) {
-      config.blockTop = value ? 1 : 0
-    }
-    if let value = boolValue(args["blockBottom"]) {
-      config.blockBottom = value ? 1 : 0
-    }
-    if let value = boolValue(args["blockScroll"]) {
-      config.blockScroll = value ? 1 : 0
-    }
-    if let value = int64Value(args["shadowStyle"]) {
-      config.shadowStyle = Int32(clamping: value)
-    }
-    return config
-  }
-
-  private func startPollTimerIfNeeded() {
-    guard pollTimer == nil else {
-      return
-    }
-    let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
-      guard let self else {
-        return
-      }
-      let sink = Self.sharedEventSink
-      for host in self.players.values {
-        host.pollEvents(sendEvent: sink)
-      }
-    }
-    pollTimer = timer
-    RunLoop.main.add(timer, forMode: .common)
-  }
-
-  private func dictionaryArgs(_ arguments: Any?) throws -> [String: Any] {
-    guard let args = arguments as? [String: Any] else {
-      throw KurokoPluginError.invalidArguments("Arguments must be a dictionary.")
-    }
-    return args
-  }
-
-  private func int64Value(_ value: Any?) -> Int64? {
-    if let value = value as? Int64 {
-      return value
-    }
-    if let value = value as? NSNumber {
-      return value.int64Value
-    }
-    if let value = value as? String {
-      return Int64(value)
-    }
-    return nil
-  }
-
-  private func doubleValue(_ value: Any?) -> Double? {
-    if let value = value as? Double {
-      return value
-    }
-    if let value = value as? NSNumber {
-      return value.doubleValue
-    }
-    if let value = value as? String {
-      return Double(value)
-    }
-    return nil
-  }
-
-  private func boolValue(_ value: Any?) -> Bool? {
-    if let value = value as? Bool {
-      return value
-    }
-    if let value = value as? NSNumber {
-      return value.boolValue
-    }
-    if let value = value as? String {
-      switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-      case "1", "true", "yes", "on":
-        return true
-      case "0", "false", "no", "off":
-        return false
-      default:
-        return nil
-      }
-    }
-    return nil
-  }
-
-  private func requiredInt64(_ value: Any?, name: String) throws -> Int64 {
-    if let value = value as? Int64 {
-      return value
-    }
-    if let value = value as? NSNumber {
-      return value.int64Value
-    }
-    if let value = value as? String, let parsed = Int64(value) {
-      return parsed
-    }
-    throw KurokoPluginError.invalidArguments("\(name) is required.")
-  }
-
-  private func requiredUInt64(_ value: Any?, name: String) throws -> UInt64 {
-    if let value = value as? UInt64 {
-      return value
-    }
-    if let value = value as? Int64, value >= 0 {
-      return UInt64(value)
-    }
-    if let value = value as? NSNumber {
-      return value.uint64Value
-    }
-    if let value = value as? String, let parsed = UInt64(value) {
-      return parsed
-    }
-    throw KurokoPluginError.invalidArguments("\(name) is required.")
-  }
-
-  private func flutterError(_ error: Error) -> FlutterError {
-    FlutterError(
-      code: "KUROKO_ERROR",
-      message: String(describing: error),
-      details: nil
-    )
-  }
+  return value.withCString { pointer in body(pointer) }
 }

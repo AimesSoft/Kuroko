@@ -1,17 +1,27 @@
-use std::{env, fs::OpenOptions, io::Write, path::PathBuf, time::Duration};
+use std::{
+    env,
+    fs::OpenOptions,
+    io::Write,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use crossbeam_channel::Receiver;
 
+#[cfg(target_os = "macos")]
 use crate::apple::coreaudio::{CoreAudioOutput, CoreAudioOutputConfig};
-use crate::audio::AudioClockSnapshot;
+#[cfg(not(target_os = "macos"))]
+use crate::audio::BufferedAudioOutput;
+use crate::audio::{AudioClockSnapshot, AudioOutputBackend, AudioRingBufferConfig};
 use crate::core::{
     MediaRequest, PlatformSurface, Player, PlayerAudioFrame, PlayerConfig, PlayerSubtitleFrame,
-    PlayerVideoFrame, RenderFrameContext, RendererBackend, RendererBackendPreference, TrackInfo,
-    TrackSelection,
+    PlayerVideoFrame, RenderFrameContext, RendererBackend, RendererBackendPreference,
+    RendererRuntimeStats, TrackInfo, TrackSelection,
 };
 use crate::danmaku::{
-    DanmakuLayoutConfig, DanmakuRenderPlan, DanmakuSession, DanmakuTimeline, DanmakuTrackInfo,
-    DanmakuTrackSource, DanmakuViewport, DfmLayoutEngine,
+    DANMAKU_DEBUG_BUCKETS, DanmakuDebugBucket, DanmakuLayoutConfig, DanmakuPreparedStats,
+    DanmakuRenderPlan, DanmakuSession, DanmakuTimeline, DanmakuTrackInfo, DanmakuTrackSource,
+    DanmakuViewport, DfmLayoutEngine,
 };
 use crate::overlay::{OverlayFrame, OverlayTimeline, OverlayViewport};
 use crate::renderer::metal::{MetalRenderer, MetalRendererConfig};
@@ -33,18 +43,44 @@ const AUDIO_START_BUFFER: Duration = Duration::from_millis(50);
 #[derive(Debug, Clone)]
 pub struct PresenterConfig {
     pub player: PlayerConfig,
-    pub audio: CoreAudioOutputConfig,
+    pub audio: PresenterAudioConfig,
     pub renderer: MetalRendererConfig,
     pub overlay: OverlayTimeline,
     pub danmaku: Option<DanmakuTimeline>,
     pub danmaku_config: DanmakuLayoutConfig,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresenterAudioConfig {
+    pub ring_buffer: AudioRingBufferConfig,
+}
+
+impl Default for PresenterAudioConfig {
+    fn default() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            let config = CoreAudioOutputConfig::default();
+            Self {
+                ring_buffer: config.ring_buffer,
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self {
+                ring_buffer: AudioRingBufferConfig {
+                    capacity_frames: 96_000,
+                    drop_oldest_on_overflow: true,
+                },
+            }
+        }
+    }
+}
+
 impl Default for PresenterConfig {
     fn default() -> Self {
         Self {
             player: PlayerConfig::default(),
-            audio: CoreAudioOutputConfig::default(),
+            audio: PresenterAudioConfig::default(),
             renderer: MetalRendererConfig::default(),
             overlay: OverlayTimeline::default(),
             danmaku: None,
@@ -68,13 +104,49 @@ pub struct PresenterStats {
     pub audio_failures: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PresenterRuntimeSnapshot {
+    pub stats: PresenterStats,
+    pub renderer: RendererRuntimeStats,
+    pub media_time: Duration,
+    pub generation: u64,
+    pub playing: bool,
+    pub current_danmaku_items: usize,
+    pub current_danmaku_atlas_version: u64,
+    pub current_danmaku_atlas_bytes: usize,
+    pub current_danmaku_viewport_width: u32,
+    pub current_danmaku_viewport_height: u32,
+    pub current_danmaku_placed_items: usize,
+    pub current_danmaku_scroll_items: usize,
+    pub current_danmaku_top_items: usize,
+    pub current_danmaku_bottom_items: usize,
+    pub current_danmaku_scroll_rows: usize,
+    pub current_danmaku_scroll_track_min: usize,
+    pub current_danmaku_scroll_track_max: usize,
+    pub current_danmaku_scroll_min_y: f32,
+    pub current_danmaku_scroll_max_y: f32,
+    pub current_danmaku_scroll_bucket_count: usize,
+    pub current_danmaku_scroll_buckets: [DanmakuDebugBucket; DANMAKU_DEBUG_BUCKETS],
+    pub current_danmaku_prepared: DanmakuPreparedStats,
+    pub last_tick_duration: Duration,
+    pub last_pump_duration: Duration,
+    pub last_audio_pump_duration: Duration,
+    pub last_subtitle_pump_duration: Duration,
+    pub last_video_pump_duration: Duration,
+    pub last_clock_sync_duration: Duration,
+    pub last_danmaku_plan_duration: Duration,
+    pub last_render_duration: Duration,
+    pub last_render_current_duration: Duration,
+    pub last_render_test_duration: Duration,
+}
+
 pub struct PresenterRuntime {
     player: Player,
     renderer: Box<dyn RendererBackend>,
     video_frames: Receiver<PlayerVideoFrame>,
     audio_frames: Receiver<PlayerAudioFrame>,
     subtitle_frames: Receiver<PlayerSubtitleFrame>,
-    audio_output: CoreAudioOutput,
+    audio_output: Box<dyn AudioOutputBackend>,
     audio_configured: bool,
     audio_started: bool,
     last_audio_clock_sync: Option<AudioClockSyncState>,
@@ -91,6 +163,16 @@ pub struct PresenterRuntime {
     danmaku_generation: u64,
     danmaku_trace: DanmakuTimeTrace,
     stats: PresenterStats,
+    last_tick_duration: Duration,
+    last_pump_duration: Duration,
+    last_audio_pump_duration: Duration,
+    last_subtitle_pump_duration: Duration,
+    last_video_pump_duration: Duration,
+    last_clock_sync_duration: Duration,
+    last_danmaku_plan_duration: Duration,
+    last_render_duration: Duration,
+    last_render_current_duration: Duration,
+    last_render_test_duration: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,7 +255,7 @@ impl PresenterRuntime {
             video_frames,
             audio_frames,
             subtitle_frames,
-            audio_output: CoreAudioOutput::new(config.audio),
+            audio_output: build_audio_output(config.audio),
             audio_configured: false,
             audio_started: false,
             last_audio_clock_sync: None,
@@ -190,6 +272,16 @@ impl PresenterRuntime {
             danmaku_generation: 1,
             danmaku_trace: DanmakuTimeTrace::from_env(),
             stats: PresenterStats::default(),
+            last_tick_duration: Duration::ZERO,
+            last_pump_duration: Duration::ZERO,
+            last_audio_pump_duration: Duration::ZERO,
+            last_subtitle_pump_duration: Duration::ZERO,
+            last_video_pump_duration: Duration::ZERO,
+            last_clock_sync_duration: Duration::ZERO,
+            last_danmaku_plan_duration: Duration::ZERO,
+            last_render_duration: Duration::ZERO,
+            last_render_current_duration: Duration::ZERO,
+            last_render_test_duration: Duration::ZERO,
         })
     }
 
@@ -241,7 +333,7 @@ impl PresenterRuntime {
         let result = self.player.pause();
         if let Err(error) = self.audio_output.pause() {
             self.stats.audio_failures += 1;
-            eprintln!("Kuroko presenter CoreAudio pause failed: {error}");
+            eprintln!("Kuroko presenter audio pause failed: {error}");
         }
         self.audio_started = false;
         self.last_audio_clock_sync = None;
@@ -299,6 +391,14 @@ impl PresenterRuntime {
 
     pub fn set_playback_rate(&self, rate: f64) -> Result<()> {
         self.player.set_playback_rate(rate)
+    }
+
+    pub fn set_volume(&mut self, volume: f64) {
+        self.audio_output.set_volume(volume as f32);
+    }
+
+    pub fn volume(&self) -> f64 {
+        self.audio_output.volume() as f64
     }
 
     pub fn set_danmaku_timeline(&mut self, timeline: DanmakuTimeline) {
@@ -387,7 +487,9 @@ impl PresenterRuntime {
     }
 
     pub fn set_danmaku_config(&mut self, config: DanmakuLayoutConfig) {
-        self.danmaku.set_config(config);
+        if !self.danmaku.set_config(config) {
+            return;
+        }
         self.current_danmaku = None;
         self.current_danmaku_viewport = None;
         self.bump_danmaku_generation();
@@ -425,11 +527,29 @@ impl PresenterRuntime {
     }
 
     pub fn render_tick(&mut self, time_seconds: f64) -> Result<PresenterStats> {
+        let tick_started = Instant::now();
+        let pump_started = Instant::now();
+
+        let audio_started = Instant::now();
         self.pump_audio();
+        self.last_audio_pump_duration = audio_started.elapsed();
+
+        let subtitle_started = Instant::now();
         self.pump_subtitles();
+        self.last_subtitle_pump_duration = subtitle_started.elapsed();
+
+        let video_started = Instant::now();
         self.pump_video();
+        self.last_video_pump_duration = video_started.elapsed();
+
+        let sync_started = Instant::now();
         self.sync_media_time_from_player();
+        self.last_clock_sync_duration = sync_started.elapsed();
+
+        let plan_started = Instant::now();
         self.refresh_stale_danmaku_plan();
+        self.last_danmaku_plan_duration = plan_started.elapsed();
+        self.last_pump_duration = pump_started.elapsed();
         let plan_time = self.current_danmaku.as_ref().map(|plan| plan.media_time);
         let plan_generation = self.current_danmaku.as_ref().map(|plan| plan.generation);
         let plan_items = self
@@ -456,10 +576,18 @@ impl PresenterRuntime {
                 self.current_output_viewport
                     .map_or(0, |viewport| viewport.height),
             );
-        match self.renderer.render_current_frame(context) {
+        let render_started = Instant::now();
+        let render_result = self.renderer.render_current_frame(context);
+        self.last_render_current_duration = render_started.elapsed();
+        self.last_render_duration = self.last_render_current_duration;
+        self.last_render_test_duration = Duration::ZERO;
+        match render_result {
             Ok(true) => self.stats.rendered_video_frames += 1,
             Ok(false) => {
+                let render_started = Instant::now();
                 self.renderer.render_test_frame(time_seconds)?;
+                self.last_render_test_duration = render_started.elapsed();
+                self.last_render_duration = self.last_render_test_duration;
                 self.stats.rendered_test_frames += 1;
             }
             Err(error) => {
@@ -468,11 +596,67 @@ impl PresenterRuntime {
             }
         }
 
+        self.last_tick_duration = tick_started.elapsed();
         Ok(self.stats)
     }
 
     pub fn stats(&self) -> PresenterStats {
         self.stats
+    }
+
+    pub fn runtime_snapshot(&self) -> PresenterRuntimeSnapshot {
+        let renderer = self.renderer.runtime_stats();
+        let (current_danmaku_items, current_danmaku_atlas_version, current_danmaku_atlas_bytes) =
+            self.current_danmaku.as_ref().map_or((0, 0, 0), |plan| {
+                let atlas = plan.atlas.as_ref();
+                (
+                    plan.items.len(),
+                    atlas.map_or(0, |atlas| atlas.version),
+                    atlas.map_or(0, |atlas| atlas.required_len().saturating_mul(2)),
+                )
+            });
+        let frame_stats = self
+            .current_danmaku
+            .as_ref()
+            .map_or(Default::default(), |plan| plan.frame_stats);
+        PresenterRuntimeSnapshot {
+            stats: self.stats,
+            renderer,
+            media_time: self.current_media_time,
+            generation: self.current_generation,
+            playing: self.is_playing(),
+            current_danmaku_items,
+            current_danmaku_atlas_version,
+            current_danmaku_atlas_bytes,
+            current_danmaku_viewport_width: self
+                .current_danmaku_viewport
+                .map_or(0, |viewport| viewport.width),
+            current_danmaku_viewport_height: self
+                .current_danmaku_viewport
+                .map_or(0, |viewport| viewport.height),
+            current_danmaku_placed_items: frame_stats.placed_items,
+            current_danmaku_scroll_items: frame_stats.scroll_items,
+            current_danmaku_top_items: frame_stats.top_items,
+            current_danmaku_bottom_items: frame_stats.bottom_items,
+            current_danmaku_scroll_rows: frame_stats.scroll_rows,
+            current_danmaku_scroll_track_min: frame_stats.scroll_track_min,
+            current_danmaku_scroll_track_max: frame_stats.scroll_track_max,
+            current_danmaku_scroll_min_y: frame_stats.scroll_min_y,
+            current_danmaku_scroll_max_y: frame_stats.scroll_max_y,
+            current_danmaku_scroll_bucket_count: frame_stats.scroll_bucket_count,
+            current_danmaku_scroll_buckets: frame_stats.scroll_buckets,
+            current_danmaku_prepared: frame_stats.prepared,
+            last_tick_duration: self.last_tick_duration,
+            last_pump_duration: self.last_pump_duration,
+            last_audio_pump_duration: self.last_audio_pump_duration,
+            last_subtitle_pump_duration: self.last_subtitle_pump_duration,
+            last_video_pump_duration: self.last_video_pump_duration,
+            last_clock_sync_duration: self.last_clock_sync_duration,
+            last_danmaku_plan_duration: self.last_danmaku_plan_duration,
+            last_render_duration: self.last_render_duration,
+            last_render_current_duration: self.last_render_current_duration,
+            last_render_test_duration: self.last_render_test_duration,
+        }
     }
 
     fn pump_video(&mut self) {
@@ -766,7 +950,7 @@ impl PresenterRuntime {
     }
 
     fn sync_player_to_audio_output(&mut self) {
-        let Ok(snapshot) = self.audio_output.clock_snapshot() else {
+        let Some(snapshot) = self.audio_output.clock_snapshot() else {
             return;
         };
         if !self.should_sync_audio_clock(snapshot) {
@@ -808,7 +992,7 @@ impl PresenterRuntime {
         if !self.audio_configured {
             if let Err(error) = self.audio_output.configure(frame.frame.format) {
                 self.stats.audio_failures += 1;
-                eprintln!("Kuroko presenter CoreAudio configure failed: {error}");
+                eprintln!("Kuroko presenter audio configure failed: {error}");
                 return;
             }
             self.audio_configured = true;
@@ -818,7 +1002,7 @@ impl PresenterRuntime {
             Ok(_) => self.stats.pushed_audio_frames += 1,
             Err(error) => {
                 self.stats.audio_failures += 1;
-                eprintln!("Kuroko presenter CoreAudio push failed: {error}");
+                eprintln!("Kuroko presenter audio push failed: {error}");
                 return;
             }
         }
@@ -826,7 +1010,7 @@ impl PresenterRuntime {
         if !self.audio_started && self.audio_output_ready_to_start() {
             if let Err(error) = self.audio_output.start() {
                 self.stats.audio_failures += 1;
-                eprintln!("Kuroko presenter CoreAudio start failed: {error}");
+                eprintln!("Kuroko presenter audio start failed: {error}");
                 return;
             }
             self.audio_started = true;
@@ -837,7 +1021,6 @@ impl PresenterRuntime {
     fn audio_output_ready_to_start(&self) -> bool {
         self.audio_output
             .clock_snapshot()
-            .ok()
             .and_then(|snapshot| snapshot.queued_duration)
             .is_some_and(|queued| queued >= AUDIO_START_BUFFER)
     }
@@ -845,7 +1028,7 @@ impl PresenterRuntime {
     fn reset_audio_output(&mut self) {
         if let Err(error) = self.audio_output.stop() {
             self.stats.audio_failures += 1;
-            eprintln!("Kuroko presenter CoreAudio reset failed: {error}");
+            eprintln!("Kuroko presenter audio reset failed: {error}");
         }
         self.audio_configured = false;
         self.audio_started = false;
@@ -943,6 +1126,19 @@ fn build_renderer(
         RendererBackendPreference::FlutterTexture => Err(PlayerError::Renderer(
             "Flutter texture backend is not supported by the presenter runtime".to_string(),
         )),
+    }
+}
+
+fn build_audio_output(config: PresenterAudioConfig) -> Box<dyn AudioOutputBackend> {
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(CoreAudioOutput::new(CoreAudioOutputConfig {
+            ring_buffer: config.ring_buffer,
+        }))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Box::new(BufferedAudioOutput::new(config.ring_buffer))
     }
 }
 
@@ -1299,6 +1495,26 @@ mod tests {
     }
 
     #[test]
+    fn repeated_danmaku_config_does_not_bump_generation() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        let original_generation = presenter.current_generation;
+
+        presenter.set_danmaku_config(DanmakuLayoutConfig::default());
+
+        assert_eq!(presenter.current_generation, original_generation);
+
+        let mut config = DanmakuLayoutConfig::default();
+        config.font_size += 1.0;
+        presenter.set_danmaku_config(config.clone());
+        let changed_generation = presenter.current_generation;
+
+        assert!(changed_generation > original_generation);
+        presenter.set_danmaku_config(config);
+
+        assert_eq!(presenter.current_generation, changed_generation);
+    }
+
+    #[test]
     fn audio_clock_sync_ignores_unread_and_regressing_snapshots() {
         let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
 
@@ -1326,6 +1542,19 @@ mod tests {
             written_frames: 24_000,
             underflow_frames: 0,
         }));
+    }
+
+    #[test]
+    fn presenter_volume_is_clamped() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+
+        assert_eq!(presenter.volume(), 1.0);
+        presenter.set_volume(0.4);
+        assert!((presenter.volume() - 0.4).abs() < 0.000_001);
+        presenter.set_volume(-1.0);
+        assert_eq!(presenter.volume(), 0.0);
+        presenter.set_volume(f64::NAN);
+        assert_eq!(presenter.volume(), 1.0);
     }
 
     #[test]

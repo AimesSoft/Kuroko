@@ -123,25 +123,34 @@ impl DanmakuRetainer {
         display_area: f32,
         is_me: bool,
     ) -> (bool, DisplacedIndices) {
-        // Scroll danmaku is capped at 75% of the display area to prevent
-        // blocking subtitles at the bottom of the screen.
-        // Fixed danmaku can use the full display area.
+        self.fix_with_options(
+            item,
+            view_width,
+            view_height,
+            flags,
+            display_area,
+            is_me,
+            false,
+            true,
+        )
+    }
+
+    pub fn fix_with_options(
+        &mut self,
+        item: &mut DanmakuItem,
+        view_width: f32,
+        view_height: f32,
+        flags: &GlobalFlags,
+        display_area: f32,
+        is_me: bool,
+        allow_stacking: bool,
+        allow_scroll_overwrite: bool,
+    ) -> (bool, DisplacedIndices) {
         // Each type has independent track systems (r2l_tracks, top_tracks, etc.).
-        let capped_display = if item.danmaku_type.is_scroll() {
-            display_area.min(0.75)
-        } else {
-            display_area
-        };
-        let effective_height = view_height * capped_display;
+        // Respect display_area exactly; display_area=1.0 means full-screen danmaku.
+        let effective_height = view_height * display_area;
         let track_height = item.paint_height + item.paint_height * self.track_gap_ratio;
-        let mut track_count = (effective_height / track_height).floor().max(1.0) as usize;
-        // Reserve one track at the bottom for screen-edge padding when using full display area.
-        // Check against the original display_area so scroll danmaku also benefits when
-        // the user sets display_area to 1.0 (capped_display would be 0.75 which would
-        // skip this check).
-        if (display_area - 1.0).abs() < 0.001 && track_count > 1 {
-            track_count -= 1;
-        }
+        let track_count = (effective_height / track_height).floor().max(1.0) as usize;
         let danmaku_index = item.index as usize;
 
         let entry = TrackEntry::from_item(item, danmaku_index);
@@ -155,6 +164,8 @@ impl DanmakuRetainer {
                     track_count,
                     view_width,
                     is_me,
+                    allow_stacking,
+                    allow_scroll_overwrite,
                 ) {
                     Some((row, displaced)) => {
                         item.y = self.margin + row as f32 * track_height;
@@ -173,6 +184,8 @@ impl DanmakuRetainer {
                     track_count,
                     view_width,
                     is_me,
+                    allow_stacking,
+                    allow_scroll_overwrite,
                 ) {
                     Some((row, displaced)) => {
                         item.y = self.margin + row as f32 * track_height;
@@ -233,8 +246,16 @@ fn select_scroll_track(
     track_count: usize,
     view_width: f32,
     is_me: bool,
+    allow_stacking: bool,
+    allow_scroll_overwrite: bool,
 ) -> Option<(usize, DisplacedIndices)> {
     track_data.compact(new_entry.time_ms, new_entry.duration_ms);
+
+    if allow_stacking && track_count > 0 {
+        let row = stack_track_for(new_entry, track_count);
+        track_data.tracks[row].push(new_entry.clone());
+        return Some((row, SmallVec::new()));
+    }
 
     let overwrite_count = ((track_count as f32 * 0.6).ceil() as usize)
         .max(1)
@@ -280,6 +301,10 @@ fn select_scroll_track(
         return Some((0, displaced));
     }
 
+    if !allow_scroll_overwrite {
+        return None;
+    }
+
     if min_right_edge < f32::MAX {
         let displaced: DisplacedIndices = track_data.tracks[best_track]
             .iter()
@@ -291,6 +316,13 @@ fn select_scroll_track(
     }
 
     None
+}
+
+fn stack_track_for(entry: &TrackEntry, track_count: usize) -> usize {
+    let mut value = entry.danmaku_index.wrapping_mul(1_103_515_245usize);
+    value ^= (entry.time_ms.max(0) as usize).rotate_left(11);
+    value ^= (entry.paint_width.to_bits() as usize).rotate_left(5);
+    value % track_count.max(1)
 }
 
 fn entry_right_edge_at(entry: &TrackEntry, time_ms: i64, view_width: f32) -> f32 {

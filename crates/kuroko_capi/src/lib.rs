@@ -6,9 +6,9 @@ use crossbeam_channel::Receiver;
 use kuroko::danmaku::{
     DanmakuLayoutConfig, DanmakuShadowStyle, DanmakuTimeline, DanmakuTrackInfo, DanmakuTrackSource,
 };
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use kuroko::presenter::{PresenterConfig, PresenterRuntime, PresenterStats};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use kuroko::renderer::metal::{MetalOutputMode, MetalRendererConfig};
 use kuroko::{
     FlutterTextureHandle, FlutterTextureKind, MediaRequest, MetalSurfaceHandle, PlatformSurface,
@@ -290,7 +290,7 @@ pub struct KurokoHandle {
     events: Receiver<PlayerEvent>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub struct KurokoPresenterHandle {
     presenter: PresenterRuntime,
     events: Receiver<PlayerEvent>,
@@ -596,19 +596,19 @@ pub unsafe extern "C" fn kuroko_poll_event(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn kuroko_presenter_create() -> *mut KurokoPresenterHandle {
     create_presenter_handle(PresenterConfig::default())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub extern "C" fn kuroko_presenter_create() -> *mut std::ffi::c_void {
     std::ptr::null_mut()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn kuroko_presenter_create_with_config(
     config: KurokoPresenterConfig,
@@ -616,7 +616,7 @@ pub extern "C" fn kuroko_presenter_create_with_config(
     create_presenter_handle(presenter_config_from_c(config))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn kuroko_presenter_create_with_output_mode(
     output_mode: i32,
@@ -628,7 +628,7 @@ pub extern "C" fn kuroko_presenter_create_with_output_mode(
     }))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub extern "C" fn kuroko_presenter_create_with_config(
     _config: KurokoPresenterConfig,
@@ -636,7 +636,7 @@ pub extern "C" fn kuroko_presenter_create_with_config(
     std::ptr::null_mut()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub extern "C" fn kuroko_presenter_create_with_output_mode(
     _output_mode: i32,
@@ -645,7 +645,7 @@ pub extern "C" fn kuroko_presenter_create_with_output_mode(
     std::ptr::null_mut()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn create_presenter_handle(config: PresenterConfig) -> *mut KurokoPresenterHandle {
     match PresenterRuntime::new(config) {
         Ok(presenter) => {
@@ -656,7 +656,7 @@ fn create_presenter_handle(config: PresenterConfig) -> *mut KurokoPresenterHandl
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn presenter_config_from_c(config: KurokoPresenterConfig) -> PresenterConfig {
     let output_mode = match KurokoPresenterOutputMode::from_raw(config.output_mode) {
         KurokoPresenterOutputMode::AppleEdr => {
@@ -705,6 +705,30 @@ fn danmaku_config_from_c(
     }
 }
 
+fn danmaku_config_to_c(config: &DanmakuLayoutConfig) -> KurokoDanmakuConfig {
+    KurokoDanmakuConfig {
+        enabled: config.enabled,
+        font_size: config.font_size,
+        opacity: config.opacity,
+        display_area: config.display_area,
+        scroll_duration_seconds: config.scroll_duration_seconds,
+        scroll_speed_factor: config.scroll_speed_factor,
+        track_gap_ratio: config.track_gap_ratio,
+        outline_width: config.outline_width,
+        shadow_offset_x: config.shadow_offset[0],
+        shadow_offset_y: config.shadow_offset[1],
+        merge_duplicates: config.merge_duplicates,
+        allow_stacking: config.allow_stacking,
+        allow_scroll_overwrite: config.allow_scroll_overwrite,
+        max_quantity: config.max_quantity.unwrap_or(0),
+        max_lines_per_mode: config.max_lines_per_mode.unwrap_or(0),
+        block_top: config.block_top,
+        block_bottom: config.block_bottom,
+        block_scroll: config.block_scroll,
+        shadow_style: config.shadow_style.code(),
+    }
+}
+
 fn danmaku_block_words_from_json(json: &str) -> Result<Vec<String>, KurokoStatus> {
     let value: serde_json::Value =
         serde_json::from_str(json).map_err(|_| KurokoStatus::PlayerError)?;
@@ -721,12 +745,12 @@ fn danmaku_block_words_from_json(json: &str) -> Result<Vec<String>, KurokoStatus
     }
 }
 
-#[cfg(all(target_os = "macos", test))]
+#[cfg(all(any(target_os = "macos", target_os = "ios"), test))]
 fn metal_output_mode_from_c(config: KurokoPresenterConfig) -> MetalOutputMode {
     presenter_config_from_c(config).renderer.output_mode
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_destroy(handle: *mut KurokoPresenterHandle) {
     if !handle.is_null() {
@@ -734,11 +758,11 @@ pub unsafe extern "C" fn kuroko_presenter_destroy(handle: *mut KurokoPresenterHa
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_destroy(_handle: *mut std::ffi::c_void) {}
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_open(
     handle: *mut KurokoPresenterHandle,
@@ -753,7 +777,7 @@ pub unsafe extern "C" fn kuroko_presenter_open(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_play(handle: *mut KurokoPresenterHandle) -> KurokoStatus {
     with_presenter_mut(handle, |handle| {
@@ -761,7 +785,7 @@ pub unsafe extern "C" fn kuroko_presenter_play(handle: *mut KurokoPresenterHandl
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_pause(
     handle: *mut KurokoPresenterHandle,
@@ -771,7 +795,7 @@ pub unsafe extern "C" fn kuroko_presenter_pause(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_stop(handle: *mut KurokoPresenterHandle) -> KurokoStatus {
     with_presenter_mut(handle, |handle| {
@@ -779,7 +803,7 @@ pub unsafe extern "C" fn kuroko_presenter_stop(handle: *mut KurokoPresenterHandl
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_close(
     handle: *mut KurokoPresenterHandle,
@@ -789,7 +813,7 @@ pub unsafe extern "C" fn kuroko_presenter_close(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_seek(
     handle: *mut KurokoPresenterHandle,
@@ -804,7 +828,7 @@ pub unsafe extern "C" fn kuroko_presenter_seek(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_set_playback_rate(
     handle: *mut KurokoPresenterHandle,
@@ -815,7 +839,19 @@ pub unsafe extern "C" fn kuroko_presenter_set_playback_rate(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_set_volume(
+    handle: *mut KurokoPresenterHandle,
+    volume: f64,
+) -> KurokoStatus {
+    with_presenter_mut(handle, |handle| {
+        handle.presenter.set_volume(volume);
+        KurokoStatus::Ok
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_add_external_subtitle(
     handle: *mut KurokoPresenterHandle,
@@ -840,7 +876,7 @@ pub unsafe extern "C" fn kuroko_presenter_add_external_subtitle(
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_add_external_subtitle(
     _handle: *mut std::ffi::c_void,
@@ -850,7 +886,7 @@ pub unsafe extern "C" fn kuroko_presenter_add_external_subtitle(
     KurokoStatus::PlayerError
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_remove_subtitle_track(
     handle: *mut KurokoPresenterHandle,
@@ -861,7 +897,7 @@ pub unsafe extern "C" fn kuroko_presenter_remove_subtitle_track(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_select_audio_track(
     handle: *mut KurokoPresenterHandle,
@@ -876,7 +912,7 @@ pub unsafe extern "C" fn kuroko_presenter_select_audio_track(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_select_subtitle_track(
     handle: *mut KurokoPresenterHandle,
@@ -891,7 +927,7 @@ pub unsafe extern "C" fn kuroko_presenter_select_subtitle_track(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_load_danmaku_file(
     handle: *mut KurokoPresenterHandle,
@@ -912,7 +948,7 @@ pub unsafe extern "C" fn kuroko_presenter_load_danmaku_file(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_load_danmaku_json(
     handle: *mut KurokoPresenterHandle,
@@ -933,7 +969,7 @@ pub unsafe extern "C" fn kuroko_presenter_load_danmaku_json(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_add_danmaku_track_file(
     handle: *mut KurokoPresenterHandle,
@@ -967,7 +1003,7 @@ pub unsafe extern "C" fn kuroko_presenter_add_danmaku_track_file(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_add_danmaku_track_json(
     handle: *mut KurokoPresenterHandle,
@@ -1001,7 +1037,7 @@ pub unsafe extern "C" fn kuroko_presenter_add_danmaku_track_json(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_remove_danmaku_track(
     handle: *mut KurokoPresenterHandle,
@@ -1016,7 +1052,7 @@ pub unsafe extern "C" fn kuroko_presenter_remove_danmaku_track(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_set_danmaku_track_enabled(
     handle: *mut KurokoPresenterHandle,
@@ -1035,7 +1071,7 @@ pub unsafe extern "C" fn kuroko_presenter_set_danmaku_track_enabled(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_set_danmaku_track_offset(
     handle: *mut KurokoPresenterHandle,
@@ -1054,7 +1090,7 @@ pub unsafe extern "C" fn kuroko_presenter_set_danmaku_track_offset(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_set_danmaku_global_offset(
     handle: *mut KurokoPresenterHandle,
@@ -1066,7 +1102,7 @@ pub unsafe extern "C" fn kuroko_presenter_set_danmaku_global_offset(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_danmaku_tracks(
     handle: *mut KurokoPresenterHandle,
@@ -1087,7 +1123,7 @@ pub unsafe extern "C" fn kuroko_presenter_danmaku_tracks(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_clear_danmaku(
     handle: *mut KurokoPresenterHandle,
@@ -1098,7 +1134,7 @@ pub unsafe extern "C" fn kuroko_presenter_clear_danmaku(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_set_danmaku_enabled(
     handle: *mut KurokoPresenterHandle,
@@ -1110,7 +1146,7 @@ pub unsafe extern "C" fn kuroko_presenter_set_danmaku_enabled(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_set_danmaku_config(
     handle: *mut KurokoPresenterHandle,
@@ -1129,7 +1165,7 @@ pub unsafe extern "C" fn kuroko_presenter_set_danmaku_config(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_set_danmaku_config_ptr(
     handle: *mut KurokoPresenterHandle,
@@ -1139,6 +1175,28 @@ pub unsafe extern "C" fn kuroko_presenter_set_danmaku_config_ptr(
         return KurokoStatus::NullPointer;
     }
     unsafe { kuroko_presenter_set_danmaku_config(handle, *config) }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_get_danmaku_config(
+    handle: *mut KurokoPresenterHandle,
+    out_config: *mut KurokoDanmakuConfig,
+) -> KurokoStatus {
+    if out_config.is_null() {
+        return KurokoStatus::NullPointer;
+    }
+    with_presenter_mut(handle, |handle| {
+        let config = handle
+            .presenter
+            .danmaku_config()
+            .map(danmaku_config_to_c)
+            .unwrap_or_default();
+        unsafe {
+            *out_config = config;
+        }
+        KurokoStatus::Ok
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -1156,7 +1214,7 @@ pub unsafe extern "C" fn kuroko_presenter_set_danmaku_font(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_set_danmaku_block_words_json(
     handle: *mut KurokoPresenterHandle,
@@ -1182,7 +1240,7 @@ pub unsafe extern "C" fn kuroko_presenter_set_danmaku_block_words_json(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_track_selection(
     handle: *mut KurokoPresenterHandle,
@@ -1197,7 +1255,7 @@ pub unsafe extern "C" fn kuroko_presenter_track_selection(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_tracks(
     handle: *mut KurokoPresenterHandle,
@@ -1213,7 +1271,7 @@ pub unsafe extern "C" fn kuroko_presenter_tracks(
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_remove_subtitle_track(
     _handle: *mut std::ffi::c_void,
@@ -1222,7 +1280,7 @@ pub unsafe extern "C" fn kuroko_presenter_remove_subtitle_track(
     KurokoStatus::PlayerError
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_select_audio_track(
     _handle: *mut std::ffi::c_void,
@@ -1231,7 +1289,7 @@ pub unsafe extern "C" fn kuroko_presenter_select_audio_track(
     KurokoStatus::PlayerError
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_select_subtitle_track(
     _handle: *mut std::ffi::c_void,
@@ -1240,7 +1298,7 @@ pub unsafe extern "C" fn kuroko_presenter_select_subtitle_track(
     KurokoStatus::PlayerError
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_track_selection(
     _handle: *mut std::ffi::c_void,
@@ -1249,7 +1307,7 @@ pub unsafe extern "C" fn kuroko_presenter_track_selection(
     KurokoStatus::PlayerError
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_tracks(
     _handle: *mut std::ffi::c_void,
@@ -1260,7 +1318,7 @@ pub unsafe extern "C" fn kuroko_presenter_tracks(
     KurokoStatus::PlayerError
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_set_playback_rate(
     _handle: *mut std::ffi::c_void,
@@ -1269,7 +1327,16 @@ pub unsafe extern "C" fn kuroko_presenter_set_playback_rate(
     KurokoStatus::PlayerError
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_set_volume(
+    _handle: *mut std::ffi::c_void,
+    _volume: f64,
+) -> KurokoStatus {
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_load_danmaku_file(
     _handle: *mut std::ffi::c_void,
@@ -1278,7 +1345,7 @@ pub unsafe extern "C" fn kuroko_presenter_load_danmaku_file(
     KurokoStatus::PlayerError
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_load_danmaku_json(
     _handle: *mut std::ffi::c_void,
@@ -1287,7 +1354,7 @@ pub unsafe extern "C" fn kuroko_presenter_load_danmaku_json(
     KurokoStatus::PlayerError
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_add_danmaku_track_file(
     _handle: *mut std::ffi::c_void,
@@ -1302,7 +1369,7 @@ pub unsafe extern "C" fn kuroko_presenter_add_danmaku_track_file(
     KurokoStatus::PlayerError
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_add_danmaku_track_json(
     _handle: *mut std::ffi::c_void,
@@ -1317,7 +1384,7 @@ pub unsafe extern "C" fn kuroko_presenter_add_danmaku_track_json(
     KurokoStatus::PlayerError
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_remove_danmaku_track(
     _handle: *mut std::ffi::c_void,
@@ -1326,7 +1393,7 @@ pub unsafe extern "C" fn kuroko_presenter_remove_danmaku_track(
     KurokoStatus::PlayerError
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_set_danmaku_track_enabled(
     _handle: *mut std::ffi::c_void,
@@ -1336,7 +1403,7 @@ pub unsafe extern "C" fn kuroko_presenter_set_danmaku_track_enabled(
     KurokoStatus::PlayerError
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_set_danmaku_track_offset(
     _handle: *mut std::ffi::c_void,
@@ -1346,7 +1413,7 @@ pub unsafe extern "C" fn kuroko_presenter_set_danmaku_track_offset(
     KurokoStatus::PlayerError
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_set_danmaku_global_offset(
     _handle: *mut std::ffi::c_void,
@@ -1355,7 +1422,7 @@ pub unsafe extern "C" fn kuroko_presenter_set_danmaku_global_offset(
     KurokoStatus::PlayerError
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_danmaku_tracks(
     _handle: *mut std::ffi::c_void,
@@ -1369,7 +1436,7 @@ pub unsafe extern "C" fn kuroko_presenter_danmaku_tracks(
     KurokoStatus::PlayerError
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_clear_danmaku(
     _handle: *mut std::ffi::c_void,
@@ -1377,7 +1444,7 @@ pub unsafe extern "C" fn kuroko_presenter_clear_danmaku(
     KurokoStatus::PlayerError
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_set_danmaku_enabled(
     _handle: *mut std::ffi::c_void,
@@ -1386,7 +1453,7 @@ pub unsafe extern "C" fn kuroko_presenter_set_danmaku_enabled(
     KurokoStatus::PlayerError
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_set_danmaku_config(
     _handle: *mut std::ffi::c_void,
@@ -1395,13 +1462,25 @@ pub unsafe extern "C" fn kuroko_presenter_set_danmaku_config(
     KurokoStatus::PlayerError
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_set_danmaku_config_ptr(
     _handle: *mut std::ffi::c_void,
     config: *const KurokoDanmakuConfig,
 ) -> KurokoStatus {
     if config.is_null() {
+        return KurokoStatus::NullPointer;
+    }
+    KurokoStatus::PlayerError
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn kuroko_presenter_get_danmaku_config(
+    _handle: *mut std::ffi::c_void,
+    out_config: *mut KurokoDanmakuConfig,
+) -> KurokoStatus {
+    if out_config.is_null() {
         return KurokoStatus::NullPointer;
     }
     KurokoStatus::PlayerError
@@ -1417,7 +1496,7 @@ pub unsafe extern "C" fn kuroko_presenter_set_danmaku_font(
     KurokoStatus::PlayerError
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_set_danmaku_block_words_json(
     _handle: *mut std::ffi::c_void,
@@ -1429,7 +1508,7 @@ pub unsafe extern "C" fn kuroko_presenter_set_danmaku_block_words_json(
     KurokoStatus::PlayerError
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_attach_metal_layer(
     handle: *mut KurokoPresenterHandle,
@@ -1448,7 +1527,7 @@ pub unsafe extern "C" fn kuroko_presenter_attach_metal_layer(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_resize_surface(
     handle: *mut KurokoPresenterHandle,
@@ -1461,7 +1540,7 @@ pub unsafe extern "C" fn kuroko_presenter_resize_surface(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_detach_surface(
     handle: *mut KurokoPresenterHandle,
@@ -1471,7 +1550,7 @@ pub unsafe extern "C" fn kuroko_presenter_detach_surface(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_render_tick(
     handle: *mut KurokoPresenterHandle,
@@ -1491,7 +1570,7 @@ pub unsafe extern "C" fn kuroko_presenter_render_tick(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_poll_event(
     handle: *mut KurokoPresenterHandle,
@@ -1523,7 +1602,7 @@ fn with_handle_mut(
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn with_presenter_mut(
     handle: *mut KurokoPresenterHandle,
     f: impl FnOnce(&mut KurokoPresenterHandle) -> KurokoStatus,
@@ -1809,7 +1888,7 @@ fn duration_micros_u64(duration: Duration) -> u64 {
     duration.as_micros().min(u64::MAX as u128) as u64
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn presenter_stats_to_c(stats: PresenterStats) -> KurokoPresenterStats {
     KurokoPresenterStats {
         decoded_video_frames: stats.decoded_video_frames,
@@ -2004,7 +2083,7 @@ mod tests {
         unsafe { kuroko_destroy(handle) };
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[test]
     fn c_presenter_lifecycle_rejects_null_and_can_be_destroyed() {
         assert_eq!(
@@ -2016,7 +2095,28 @@ mod tests {
         unsafe { kuroko_presenter_destroy(handle) };
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn c_presenter_set_volume_accepts_valid_handle() {
+        assert_eq!(
+            unsafe { kuroko_presenter_set_volume(std::ptr::null_mut(), 0.5) },
+            KurokoStatus::NullPointer
+        );
+
+        let handle = kuroko_presenter_create();
+        assert!(!handle.is_null());
+        assert_eq!(
+            unsafe { kuroko_presenter_set_volume(handle, 0.5) },
+            KurokoStatus::Ok
+        );
+        assert_eq!(
+            unsafe { kuroko_presenter_set_volume(handle, f64::NAN) },
+            KurokoStatus::Ok
+        );
+        unsafe { kuroko_presenter_destroy(handle) };
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[test]
     fn c_presenter_can_be_created_with_edr_config() {
         let handle = kuroko_presenter_create_with_config(KurokoPresenterConfig {
@@ -2027,7 +2127,7 @@ mod tests {
         unsafe { kuroko_presenter_destroy(handle) };
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[test]
     fn c_presenter_danmaku_api_loads_configures_and_clears() {
         let handle = kuroko_presenter_create();
@@ -2057,7 +2157,7 @@ mod tests {
         unsafe { kuroko_presenter_destroy(handle) };
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[test]
     fn c_presenter_config_maps_output_modes() {
         assert_eq!(

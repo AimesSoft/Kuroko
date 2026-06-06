@@ -45,6 +45,213 @@ class KurokoDanmakuTrackInfo {
   }
 }
 
+class _KurokoDanmakuConfigPatch {
+  _KurokoDanmakuConfigPatch({
+    this.enabled,
+    this.fontSize,
+    this.opacity,
+    this.displayArea,
+    this.scrollDurationSeconds,
+    this.scrollSpeedFactor,
+    this.trackGapRatio,
+    this.outlineWidth,
+    this.shadowOffsetX,
+    this.shadowOffsetY,
+    this.shadowStyle,
+    this.customFontFamily,
+    this.customFontFilePath,
+    this.mergeDuplicates,
+    this.allowStacking,
+    this.allowScrollOverwrite,
+    this.maxQuantity,
+    this.maxLinesPerMode,
+    this.blockTop,
+    this.blockBottom,
+    this.blockScroll,
+    List<String>? blockWords,
+  }) : blockWords =
+            blockWords == null ? null : List<String>.unmodifiable(blockWords);
+
+  final bool? enabled;
+  final double? fontSize;
+  final double? opacity;
+  final double? displayArea;
+  final double? scrollDurationSeconds;
+  final double? scrollSpeedFactor;
+  final double? trackGapRatio;
+  final double? outlineWidth;
+  final double? shadowOffsetX;
+  final double? shadowOffsetY;
+  final int? shadowStyle;
+  final String? customFontFamily;
+  final String? customFontFilePath;
+  final bool? mergeDuplicates;
+  final bool? allowStacking;
+  final bool? allowScrollOverwrite;
+  final int? maxQuantity;
+  final int? maxLinesPerMode;
+  final bool? blockTop;
+  final bool? blockBottom;
+  final bool? blockScroll;
+  final List<String>? blockWords;
+
+  bool get isEmpty =>
+      enabled == null &&
+      fontSize == null &&
+      opacity == null &&
+      displayArea == null &&
+      scrollDurationSeconds == null &&
+      scrollSpeedFactor == null &&
+      trackGapRatio == null &&
+      outlineWidth == null &&
+      shadowOffsetX == null &&
+      shadowOffsetY == null &&
+      shadowStyle == null &&
+      customFontFamily == null &&
+      customFontFilePath == null &&
+      mergeDuplicates == null &&
+      allowStacking == null &&
+      allowScrollOverwrite == null &&
+      maxQuantity == null &&
+      maxLinesPerMode == null &&
+      blockTop == null &&
+      blockBottom == null &&
+      blockScroll == null &&
+      blockWords == null;
+
+  _KurokoDanmakuConfigPatch merge(_KurokoDanmakuConfigPatch other) {
+    return _KurokoDanmakuConfigPatch(
+      enabled: other.enabled ?? enabled,
+      fontSize: other.fontSize ?? fontSize,
+      opacity: other.opacity ?? opacity,
+      displayArea: other.displayArea ?? displayArea,
+      scrollDurationSeconds:
+          other.scrollDurationSeconds ?? scrollDurationSeconds,
+      scrollSpeedFactor: other.scrollSpeedFactor ?? scrollSpeedFactor,
+      trackGapRatio: other.trackGapRatio ?? trackGapRatio,
+      outlineWidth: other.outlineWidth ?? outlineWidth,
+      shadowOffsetX: other.shadowOffsetX ?? shadowOffsetX,
+      shadowOffsetY: other.shadowOffsetY ?? shadowOffsetY,
+      shadowStyle: other.shadowStyle ?? shadowStyle,
+      customFontFamily: other.customFontFamily ?? customFontFamily,
+      customFontFilePath: other.customFontFilePath ?? customFontFilePath,
+      mergeDuplicates: other.mergeDuplicates ?? mergeDuplicates,
+      allowStacking: other.allowStacking ?? allowStacking,
+      allowScrollOverwrite: other.allowScrollOverwrite ?? allowScrollOverwrite,
+      maxQuantity: other.maxQuantity ?? maxQuantity,
+      maxLinesPerMode: other.maxLinesPerMode ?? maxLinesPerMode,
+      blockTop: other.blockTop ?? blockTop,
+      blockBottom: other.blockBottom ?? blockBottom,
+      blockScroll: other.blockScroll ?? blockScroll,
+      blockWords: other.blockWords ?? blockWords,
+    );
+  }
+
+  _KurokoDanmakuConfigPatch differenceFrom(
+    _KurokoDanmakuConfigPatch? previous,
+  ) {
+    return _KurokoDanmakuConfigPatch(
+      enabled: _changed(enabled, previous?.enabled) ? enabled : null,
+      fontSize: _changed(fontSize, previous?.fontSize) ? fontSize : null,
+      opacity: _changed(opacity, previous?.opacity) ? opacity : null,
+      displayArea:
+          _changed(displayArea, previous?.displayArea) ? displayArea : null,
+      scrollDurationSeconds: _changed(
+        scrollDurationSeconds,
+        previous?.scrollDurationSeconds,
+      )
+          ? scrollDurationSeconds
+          : null,
+      scrollSpeedFactor: _changed(
+        scrollSpeedFactor,
+        previous?.scrollSpeedFactor,
+      )
+          ? scrollSpeedFactor
+          : null,
+      trackGapRatio: _changed(trackGapRatio, previous?.trackGapRatio)
+          ? trackGapRatio
+          : null,
+      outlineWidth:
+          _changed(outlineWidth, previous?.outlineWidth) ? outlineWidth : null,
+      shadowOffsetX: _changed(shadowOffsetX, previous?.shadowOffsetX)
+          ? shadowOffsetX
+          : null,
+      shadowOffsetY: _changed(shadowOffsetY, previous?.shadowOffsetY)
+          ? shadowOffsetY
+          : null,
+      shadowStyle:
+          _changed(shadowStyle, previous?.shadowStyle) ? shadowStyle : null,
+      customFontFamily: _changed(customFontFamily, previous?.customFontFamily)
+          ? customFontFamily
+          : null,
+      customFontFilePath:
+          _changed(customFontFilePath, previous?.customFontFilePath)
+              ? customFontFilePath
+              : null,
+      mergeDuplicates: _changed(mergeDuplicates, previous?.mergeDuplicates)
+          ? mergeDuplicates
+          : null,
+      allowStacking: _changed(allowStacking, previous?.allowStacking)
+          ? allowStacking
+          : null,
+      allowScrollOverwrite: _changed(
+        allowScrollOverwrite,
+        previous?.allowScrollOverwrite,
+      )
+          ? allowScrollOverwrite
+          : null,
+      maxQuantity:
+          _changed(maxQuantity, previous?.maxQuantity) ? maxQuantity : null,
+      maxLinesPerMode: _changed(maxLinesPerMode, previous?.maxLinesPerMode)
+          ? maxLinesPerMode
+          : null,
+      blockTop: _changed(blockTop, previous?.blockTop) ? blockTop : null,
+      blockBottom:
+          _changed(blockBottom, previous?.blockBottom) ? blockBottom : null,
+      blockScroll:
+          _changed(blockScroll, previous?.blockScroll) ? blockScroll : null,
+      blockWords:
+          _changedList(blockWords, previous?.blockWords) ? blockWords : null,
+    );
+  }
+
+  Map<String, Object?> toArguments(int playerId) {
+    return <String, Object?>{
+      'playerId': playerId,
+      if (enabled != null) 'enabled': enabled,
+      if (fontSize != null) 'fontSize': fontSize,
+      if (opacity != null) 'opacity': opacity,
+      if (displayArea != null) 'displayArea': displayArea,
+      if (scrollDurationSeconds != null)
+        'scrollDurationSeconds': scrollDurationSeconds,
+      if (scrollSpeedFactor != null) 'scrollSpeedFactor': scrollSpeedFactor,
+      if (trackGapRatio != null) 'trackGapRatio': trackGapRatio,
+      if (outlineWidth != null) 'outlineWidth': outlineWidth,
+      if (shadowOffsetX != null) 'shadowOffsetX': shadowOffsetX,
+      if (shadowOffsetY != null) 'shadowOffsetY': shadowOffsetY,
+      if (shadowStyle != null) 'shadowStyle': shadowStyle,
+      if (customFontFamily != null) 'customFontFamily': customFontFamily,
+      if (customFontFilePath != null) 'customFontFilePath': customFontFilePath,
+      if (mergeDuplicates != null) 'mergeDuplicates': mergeDuplicates,
+      if (allowStacking != null) 'allowStacking': allowStacking,
+      if (allowScrollOverwrite != null)
+        'allowScrollOverwrite': allowScrollOverwrite,
+      if (maxQuantity != null) 'maxQuantity': maxQuantity,
+      if (maxLinesPerMode != null) 'maxLinesPerMode': maxLinesPerMode,
+      if (blockTop != null) 'blockTop': blockTop,
+      if (blockBottom != null) 'blockBottom': blockBottom,
+      if (blockScroll != null) 'blockScroll': blockScroll,
+      if (blockWords != null) 'blockWordsJson': jsonEncode(blockWords),
+    };
+  }
+
+  static bool _changed<T>(T? value, T? previous) =>
+      value != null && value != previous;
+
+  static bool _changedList(List<String>? value, List<String>? previous) =>
+      value != null && !listEquals(value, previous);
+}
+
 class KurokoPlayer {
   KurokoPlayer({
     this.outputMode,
@@ -68,6 +275,14 @@ class KurokoPlayer {
   int? _id;
   Future<int>? _createFuture;
   bool _disposed = false;
+  static const Duration _danmakuConfigCoalesceDelay =
+      Duration(milliseconds: 50);
+  Timer? _danmakuConfigTimer;
+  bool _danmakuConfigInFlight = false;
+  _KurokoDanmakuConfigPatch? _pendingDanmakuConfig;
+  _KurokoDanmakuConfigPatch? _lastAppliedDanmakuConfig;
+  final List<Completer<void>> _pendingDanmakuConfigCompleters =
+      <Completer<void>>[];
 
   final KurokoOutputMode? outputMode;
   final double? edrHeadroom;
@@ -124,6 +339,14 @@ class KurokoPlayer {
     await _invoke('setPlaybackRate', <String, Object?>{
       'playerId': playerId,
       'rate': rate,
+    });
+  }
+
+  Future<void> setVolume(double volume) async {
+    final playerId = await ensureCreated();
+    await _invoke('setVolume', <String, Object?>{
+      'playerId': playerId,
+      'volume': volume.clamp(0.0, 1.0),
     });
   }
 
@@ -292,34 +515,107 @@ class KurokoPlayer {
     bool? blockScroll,
     List<String>? blockWords,
   }) async {
+    if (_disposed) {
+      return;
+    }
     final playerId = await ensureCreated();
-    await _invoke('setDanmakuConfig', <String, Object?>{
-      'playerId': playerId,
-      if (enabled != null) 'enabled': enabled,
-      if (fontSize != null) 'fontSize': fontSize,
-      if (opacity != null) 'opacity': opacity,
-      if (displayArea != null) 'displayArea': displayArea,
-      if (scrollDurationSeconds != null)
-        'scrollDurationSeconds': scrollDurationSeconds,
-      if (scrollSpeedFactor != null) 'scrollSpeedFactor': scrollSpeedFactor,
-      if (trackGapRatio != null) 'trackGapRatio': trackGapRatio,
-      if (outlineWidth != null) 'outlineWidth': outlineWidth,
-      if (shadowOffsetX != null) 'shadowOffsetX': shadowOffsetX,
-      if (shadowOffsetY != null) 'shadowOffsetY': shadowOffsetY,
-      if (shadowStyle != null) 'shadowStyle': shadowStyle,
-      if (customFontFamily != null) 'customFontFamily': customFontFamily,
-      if (customFontFilePath != null) 'customFontFilePath': customFontFilePath,
-      if (mergeDuplicates != null) 'mergeDuplicates': mergeDuplicates,
-      if (allowStacking != null) 'allowStacking': allowStacking,
-      if (allowScrollOverwrite != null)
-        'allowScrollOverwrite': allowScrollOverwrite,
-      if (maxQuantity != null) 'maxQuantity': maxQuantity,
-      if (maxLinesPerMode != null) 'maxLinesPerMode': maxLinesPerMode,
-      if (blockTop != null) 'blockTop': blockTop,
-      if (blockBottom != null) 'blockBottom': blockBottom,
-      if (blockScroll != null) 'blockScroll': blockScroll,
-      if (blockWords != null) 'blockWordsJson': jsonEncode(blockWords),
+    final patch = _KurokoDanmakuConfigPatch(
+      enabled: enabled,
+      fontSize: fontSize,
+      opacity: opacity,
+      displayArea: displayArea,
+      scrollDurationSeconds: scrollDurationSeconds,
+      scrollSpeedFactor: scrollSpeedFactor,
+      trackGapRatio: trackGapRatio,
+      outlineWidth: outlineWidth,
+      shadowOffsetX: shadowOffsetX,
+      shadowOffsetY: shadowOffsetY,
+      shadowStyle: shadowStyle,
+      customFontFamily: customFontFamily,
+      customFontFilePath: customFontFilePath,
+      mergeDuplicates: mergeDuplicates,
+      allowStacking: allowStacking,
+      allowScrollOverwrite: allowScrollOverwrite,
+      maxQuantity: maxQuantity,
+      maxLinesPerMode: maxLinesPerMode,
+      blockTop: blockTop,
+      blockBottom: blockBottom,
+      blockScroll: blockScroll,
+      blockWords: blockWords,
+    );
+    if (patch.isEmpty) {
+      return;
+    }
+
+    final completer = Completer<void>();
+    _pendingDanmakuConfig = _pendingDanmakuConfig?.merge(patch) ?? patch;
+    _pendingDanmakuConfigCompleters.add(completer);
+    _scheduleDanmakuConfigFlush(playerId);
+    return completer.future;
+  }
+
+  void _scheduleDanmakuConfigFlush(int playerId) {
+    if (_disposed || _danmakuConfigInFlight || _danmakuConfigTimer != null) {
+      return;
+    }
+    _danmakuConfigTimer = Timer(_danmakuConfigCoalesceDelay, () {
+      _danmakuConfigTimer = null;
+      unawaited(_flushDanmakuConfig(playerId));
     });
+  }
+
+  Future<void> _flushDanmakuConfig(int playerId) async {
+    if (_disposed || _danmakuConfigInFlight) {
+      return;
+    }
+
+    final requestedPatch = _pendingDanmakuConfig;
+    if (requestedPatch == null) {
+      return;
+    }
+    final completers = List<Completer<void>>.of(
+      _pendingDanmakuConfigCompleters,
+    );
+    _pendingDanmakuConfigCompleters.clear();
+    _pendingDanmakuConfig = null;
+
+    final outgoingPatch = requestedPatch.differenceFrom(
+      _lastAppliedDanmakuConfig,
+    );
+    if (outgoingPatch.isEmpty) {
+      for (final completer in completers) {
+        if (!completer.isCompleted) {
+          completer.complete();
+        }
+      }
+      if (_pendingDanmakuConfig != null) {
+        _scheduleDanmakuConfigFlush(playerId);
+      }
+      return;
+    }
+
+    _danmakuConfigInFlight = true;
+    try {
+      await _invoke('setDanmakuConfig', outgoingPatch.toArguments(playerId));
+      _lastAppliedDanmakuConfig =
+          _lastAppliedDanmakuConfig?.merge(requestedPatch) ?? requestedPatch;
+      for (final completer in completers) {
+        if (!completer.isCompleted) {
+          completer.complete();
+        }
+      }
+    } catch (error, stackTrace) {
+      for (final completer in completers) {
+        if (!completer.isCompleted) {
+          completer.completeError(error, stackTrace);
+        }
+      }
+    } finally {
+      _danmakuConfigInFlight = false;
+      if (_pendingDanmakuConfig != null) {
+        _scheduleDanmakuConfigFlush(playerId);
+      }
+    }
   }
 
   Future<void> selectAudioTrack(int? trackId) async {
@@ -415,6 +711,15 @@ class KurokoPlayer {
       return;
     }
     _disposed = true;
+    _danmakuConfigTimer?.cancel();
+    _danmakuConfigTimer = null;
+    for (final completer in _pendingDanmakuConfigCompleters) {
+      if (!completer.isCompleted) {
+        completer.complete();
+      }
+    }
+    _pendingDanmakuConfigCompleters.clear();
+    _pendingDanmakuConfig = null;
     final playerId = _id;
     _id = null;
     _createFuture = null;

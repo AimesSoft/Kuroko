@@ -7,7 +7,7 @@
 mod dfm;
 pub mod dfm_core;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -31,6 +31,7 @@ const GLYPH_ATLAS_INITIAL_HEIGHT: u32 = 256;
 const DEFAULT_DANMAKU_TRACK_ID: u64 = 1;
 const TRACK_ID_SHIFT: u64 = 48;
 const ITEM_ID_MASK: u64 = (1u64 << TRACK_ID_SHIFT) - 1;
+pub const DANMAKU_DEBUG_BUCKETS: usize = 16;
 
 #[derive(Debug, Error)]
 pub enum DanmakuError {
@@ -710,6 +711,7 @@ pub struct DfmPreparedLayout {
     viewport: DanmakuViewport,
     config: DanmakuLayoutConfig,
     dfm_layout: dfm::PreparedLayout,
+    stats: DanmakuPreparedStats,
     scroll_duration: Duration,
     static_duration: Duration,
     item_times: Vec<f64>,
@@ -719,6 +721,10 @@ pub struct DfmPreparedLayout {
 impl DfmPreparedLayout {
     pub fn items(&self) -> &[PreparedDanmakuItem] {
         &self.items
+    }
+
+    pub fn stats(&self) -> DanmakuPreparedStats {
+        self.stats
     }
 
     pub fn frame_layout(&self, media_time: Duration, generation: u64) -> DanmakuFrameLayout {
@@ -739,6 +745,7 @@ impl DfmPreparedLayout {
                 item_id: item.id,
                 text: Arc::clone(&item.text),
                 mode: item.mode,
+                track_index: frame_item.track_index.max(0) as usize,
                 x: frame_item.x as f32,
                 y: frame_item.y as f32,
                 width: item.width,
@@ -757,6 +764,7 @@ impl DfmPreparedLayout {
             media_time,
             generation,
             viewport: self.viewport,
+            prepared_stats: self.stats,
             items,
         }
     }
@@ -767,6 +775,7 @@ pub struct DanmakuFrameLayout {
     pub media_time: Duration,
     pub generation: u64,
     pub viewport: DanmakuViewport,
+    pub prepared_stats: DanmakuPreparedStats,
     pub items: Vec<DanmakuPlacedItem>,
 }
 
@@ -776,6 +785,7 @@ impl DanmakuFrameLayout {
             media_time,
             generation,
             viewport,
+            prepared_stats: DanmakuPreparedStats::default(),
             items: Vec::new(),
         }
     }
@@ -786,6 +796,7 @@ pub struct DanmakuPlacedItem {
     pub item_id: u64,
     pub text: Arc<str>,
     pub mode: DanmakuMode,
+    pub track_index: usize,
     pub x: f32,
     pub y: f32,
     pub width: f32,
@@ -807,6 +818,7 @@ pub struct DanmakuRenderPlan {
     pub viewport: DanmakuViewport,
     pub atlas: Option<Arc<DanmakuGlyphAtlas>>,
     pub items: Vec<DanmakuGlyphInstance>,
+    pub frame_stats: DanmakuFrameStats,
 }
 
 impl DanmakuRenderPlan {
@@ -817,12 +829,166 @@ impl DanmakuRenderPlan {
             viewport,
             atlas: None,
             items: Vec::new(),
+            frame_stats: DanmakuFrameStats::default(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct DanmakuFrameStats {
+    pub prepared: DanmakuPreparedStats,
+    pub placed_items: usize,
+    pub scroll_items: usize,
+    pub top_items: usize,
+    pub bottom_items: usize,
+    pub scroll_rows: usize,
+    pub scroll_track_min: usize,
+    pub scroll_track_max: usize,
+    pub scroll_min_y: f32,
+    pub scroll_max_y: f32,
+    pub scroll_bucket_count: usize,
+    pub scroll_buckets: [DanmakuDebugBucket; DANMAKU_DEBUG_BUCKETS],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DanmakuDebugBucket {
+    pub key: i32,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct DanmakuPreparedStats {
+    pub source_items: usize,
+    pub supported_items: usize,
+    pub prepared_items: usize,
+    pub filtered_items: usize,
+    pub prepared_scroll_items: usize,
+    pub prepared_top_items: usize,
+    pub prepared_bottom_items: usize,
+    pub prepared_scroll_rows: usize,
+    pub prepared_scroll_min_y: f32,
+    pub prepared_scroll_max_y: f32,
+    pub expected_scroll_tracks: usize,
+    pub dfm_track_count: usize,
+    pub display_area_height: f32,
+    pub scroll_area_height: f32,
+    pub track_height: f32,
+    pub scroll_bucket_count: usize,
+    pub scroll_buckets: [DanmakuDebugBucket; DANMAKU_DEBUG_BUCKETS],
+}
+
+impl DanmakuFrameStats {
+    fn from_layout(layout: &DanmakuFrameLayout) -> Self {
+        let mut stats = Self::default();
+        stats.prepared = layout.prepared_stats;
+        let mut scroll_rows = BTreeSet::new();
+        let mut scroll_track_min = usize::MAX;
+        let mut scroll_track_max = 0usize;
+        let mut bucket_counts = BTreeMap::<i32, u32>::new();
+        let mut scroll_min_y = f32::MAX;
+        let mut scroll_max_y = f32::MIN;
+        for item in &layout.items {
+            stats.placed_items += 1;
+            match item.mode {
+                DanmakuMode::Scroll | DanmakuMode::ScrollReverse => {
+                    stats.scroll_items += 1;
+                    let row_key = item.y.round() as i32;
+                    scroll_rows.insert(row_key);
+                    *bucket_counts.entry(row_key).or_default() += 1;
+                    scroll_track_min = scroll_track_min.min(item.track_index);
+                    scroll_track_max = scroll_track_max.max(item.track_index);
+                    scroll_min_y = scroll_min_y.min(item.y);
+                    scroll_max_y = scroll_max_y.max(item.y + item.height);
+                }
+                DanmakuMode::Top => stats.top_items += 1,
+                DanmakuMode::Bottom => stats.bottom_items += 1,
+                DanmakuMode::Special => {}
+            }
+        }
+        stats.scroll_rows = scroll_rows.len();
+        if stats.scroll_items > 0 {
+            stats.scroll_track_min = scroll_track_min;
+            stats.scroll_track_max = scroll_track_max;
+            stats.scroll_min_y = scroll_min_y;
+            stats.scroll_max_y = scroll_max_y;
+        }
+        stats.scroll_bucket_count = fill_debug_buckets(&bucket_counts, &mut stats.scroll_buckets);
+        stats
+    }
+}
+
+impl DanmakuPreparedStats {
+    fn from_items(
+        source_items: usize,
+        supported_items: usize,
+        prepared: &[PreparedDanmakuItem],
+        viewport: DanmakuViewport,
+        config: &DanmakuLayoutConfig,
+        dfm_track_count: usize,
+    ) -> Self {
+        let mut stats = Self {
+            source_items,
+            supported_items,
+            prepared_items: prepared.len(),
+            filtered_items: supported_items.saturating_sub(prepared.len()),
+            dfm_track_count,
+            display_area_height: viewport.height as f32 * config.display_area.clamp(0.1, 1.0),
+            scroll_area_height: viewport.height as f32 * config.display_area.clamp(0.1, 1.0),
+            ..Self::default()
+        };
+        let mut scroll_rows = BTreeSet::new();
+        let mut bucket_counts = BTreeMap::<i32, u32>::new();
+        let mut scroll_min_y = f32::MAX;
+        let mut scroll_max_y = f32::MIN;
+        let mut first_scroll_height = 0.0f32;
+        for item in prepared {
+            match item.mode {
+                DanmakuMode::Scroll | DanmakuMode::ScrollReverse => {
+                    stats.prepared_scroll_items += 1;
+                    let row_key = item.y.round() as i32;
+                    scroll_rows.insert(row_key);
+                    *bucket_counts.entry(row_key).or_default() += 1;
+                    scroll_min_y = scroll_min_y.min(item.y);
+                    scroll_max_y = scroll_max_y.max(item.y + item.height);
+                    if first_scroll_height <= 0.0 {
+                        first_scroll_height = item.height;
+                    }
+                }
+                DanmakuMode::Top => stats.prepared_top_items += 1,
+                DanmakuMode::Bottom => stats.prepared_bottom_items += 1,
+                DanmakuMode::Special => {}
+            }
+        }
+        stats.prepared_scroll_rows = scroll_rows.len();
+        if stats.prepared_scroll_items > 0 {
+            stats.prepared_scroll_min_y = scroll_min_y;
+            stats.prepared_scroll_max_y = scroll_max_y;
+        }
+        let track_height =
+            (first_scroll_height + first_scroll_height * config.track_gap_ratio).max(1.0);
+        stats.track_height = track_height;
+        stats.expected_scroll_tracks =
+            (stats.scroll_area_height / track_height).floor().max(1.0) as usize;
+        stats.scroll_bucket_count = fill_debug_buckets(&bucket_counts, &mut stats.scroll_buckets);
+        stats
+    }
+}
+
+fn fill_debug_buckets(
+    source: &BTreeMap<i32, u32>,
+    target: &mut [DanmakuDebugBucket; DANMAKU_DEBUG_BUCKETS],
+) -> usize {
+    for bucket in target.iter_mut() {
+        *bucket = DanmakuDebugBucket::default();
+    }
+    for (slot, (&key, &count)) in target.iter_mut().zip(source.iter()) {
+        *slot = DanmakuDebugBucket { key, count };
+    }
+    source.len()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -869,6 +1035,7 @@ struct PreparedTextLayout {
 #[derive(Debug, Clone, PartialEq)]
 struct PreparedGlyphPlacement {
     glyph: Arc<RasterizedGlyph>,
+    packed: PackedGlyph,
     pen_x: f32,
 }
 
@@ -1194,14 +1361,30 @@ impl DanmakuTextRasterizer {
                 outline_width,
             );
             let glyph = self.cached_glyph_by_key(glyph_key);
+            let packed = if glyph.has_bitmap() {
+                self.pack_glyph(&glyph)
+            } else {
+                PackedGlyph::default()
+            };
             let advance = glyph.advance;
-            glyphs.push(PreparedGlyphPlacement { glyph, pen_x });
+            glyphs.push(PreparedGlyphPlacement {
+                glyph,
+                packed,
+                pen_x,
+            });
             pen_x += advance;
             previous = face
                 .as_ref()
                 .and_then(|face| glyph_id.map(|glyph_id| (face.id, glyph_id)));
         }
         PreparedTextLayout { metrics, glyphs }
+    }
+
+    fn pack_glyph(&self, glyph: &RasterizedGlyph) -> PackedGlyph {
+        self.glyph_atlas
+            .lock()
+            .expect("danmaku glyph atlas lock")
+            .pack(glyph)
     }
 
     fn resolve_font(&self, ch: char) -> Option<DanmakuFontFace> {
@@ -1217,46 +1400,40 @@ impl DanmakuTextRasterizer {
     }
 
     pub fn render_plan(&self, layout: &DanmakuFrameLayout) -> DanmakuRenderPlan {
+        let frame_stats = DanmakuFrameStats::from_layout(layout);
         if layout.items.is_empty() {
             return DanmakuRenderPlan::empty(layout.media_time, layout.generation, layout.viewport);
         }
-        let mut atlas = self.glyph_atlas.lock().expect("danmaku glyph atlas lock");
-        let mut pending = Vec::new();
+        let Some(atlas_snapshot) = self
+            .glyph_atlas
+            .lock()
+            .expect("danmaku glyph atlas lock")
+            .snapshot()
+        else {
+            return DanmakuRenderPlan::empty(layout.media_time, layout.generation, layout.viewport);
+        };
+        let atlas_w = atlas_snapshot.width.max(1) as f32;
+        let atlas_h = atlas_snapshot.height.max(1) as f32;
+        let capacity = layout
+            .items
+            .iter()
+            .map(|item| item.text_layout.glyphs.len())
+            .sum();
+        let mut items = Vec::with_capacity(capacity);
         for item in &layout.items {
             let color = item.color.rgba(item.opacity);
             if color[3] <= 0.0 {
                 continue;
             }
-            self.append_item_glyphs(item, color, &mut atlas, &mut pending);
+            self.append_item_glyphs(item, color, atlas_w, atlas_h, &mut items);
         }
-        let Some(atlas_snapshot) = atlas.snapshot() else {
-            return DanmakuRenderPlan::empty(layout.media_time, layout.generation, layout.viewport);
-        };
-        let atlas_w = atlas_snapshot.width.max(1) as f32;
-        let atlas_h = atlas_snapshot.height.max(1) as f32;
-        let items = pending
-            .into_iter()
-            .map(|item| DanmakuGlyphInstance {
-                item_id: item.item_id,
-                rect: item.rect,
-                tex_rect: [
-                    item.tex_rect[0] as f32 / atlas_w,
-                    item.tex_rect[1] as f32 / atlas_h,
-                    item.tex_rect[2] as f32 / atlas_w,
-                    item.tex_rect[3] as f32 / atlas_h,
-                ],
-                color_rgba: item.color_rgba,
-                outline_rgba: item.outline_rgba,
-                shadow_rgba: item.shadow_rgba,
-                shadow_offset: item.shadow_offset,
-            })
-            .collect();
         DanmakuRenderPlan {
             media_time: layout.media_time,
             generation: layout.generation,
             viewport: layout.viewport,
             atlas: Some(atlas_snapshot),
             items,
+            frame_stats,
         }
     }
 
@@ -1264,15 +1441,16 @@ impl DanmakuTextRasterizer {
         &self,
         item: &DanmakuPlacedItem,
         color: [f32; 4],
-        atlas: &mut PersistentGlyphAtlas,
-        pending: &mut Vec<PendingGlyphInstance>,
+        atlas_w: f32,
+        atlas_h: f32,
+        items: &mut Vec<DanmakuGlyphInstance>,
     ) {
         let baseline = item.y + item.text_layout.metrics.ascent;
         for placement in &item.text_layout.glyphs {
             let glyph = &placement.glyph;
             if glyph.has_bitmap() {
-                let packed = atlas.pack(&glyph);
-                pending.push(PendingGlyphInstance {
+                let packed = placement.packed;
+                items.push(DanmakuGlyphInstance {
                     item_id: item.item_id,
                     rect: [
                         item.x + placement.pen_x + glyph.offset_x,
@@ -1280,7 +1458,12 @@ impl DanmakuTextRasterizer {
                         glyph.width as f32,
                         glyph.height as f32,
                     ],
-                    tex_rect: [packed.x, packed.y, packed.width, packed.height],
+                    tex_rect: [
+                        packed.x as f32 / atlas_w,
+                        packed.y as f32 / atlas_h,
+                        packed.width as f32 / atlas_w,
+                        packed.height as f32 / atlas_h,
+                    ],
                     color_rgba: color,
                     outline_rgba: [0.0, 0.0, 0.0, color[3].min(0.75)],
                     shadow_rgba: [0.0, 0.0, 0.0, (color[3] * item.shadow_alpha).min(1.0)],
@@ -1343,17 +1526,6 @@ impl DanmakuTextRasterizer {
         }
         rasterize_fallback_glyph(&self.shaper, key)
     }
-}
-
-#[derive(Debug, Clone)]
-struct PendingGlyphInstance {
-    item_id: u64,
-    rect: [f32; 4],
-    tex_rect: [u32; 4],
-    color_rgba: [f32; 4],
-    outline_rgba: [f32; 4],
-    shadow_rgba: [f32; 4],
-    shadow_offset: [f32; 2],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1425,7 +1597,7 @@ impl RasterizedGlyph {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct PackedGlyph {
     x: u32,
     y: u32,
@@ -1581,8 +1753,11 @@ impl DfmLayoutEngine {
         self.prepared = None;
     }
 
-    pub fn set_config(&mut self, config: DanmakuLayoutConfig) {
+    pub fn set_config(&mut self, config: DanmakuLayoutConfig) -> bool {
         let config = config.sanitized();
+        if self.config == config {
+            return false;
+        }
         let font_changed = self.config.custom_font_family != config.custom_font_family
             || self.config.custom_font_file_path != config.custom_font_file_path;
         self.config = config;
@@ -1590,6 +1765,7 @@ impl DfmLayoutEngine {
             self.rasterizer = DanmakuTextRasterizer::for_config(&self.config);
         }
         self.prepared = None;
+        true
     }
 
     pub fn config(&self) -> &DanmakuLayoutConfig {
@@ -1653,6 +1829,7 @@ fn prepare_layout(
             viewport,
             config: config.clone(),
             dfm_layout,
+            stats: DanmakuPreparedStats::default(),
             scroll_duration: DEFAULT_SCROLL_DURATION,
             static_duration: DEFAULT_STATIC_DURATION,
             item_times: Vec::new(),
@@ -1661,6 +1838,7 @@ fn prepare_layout(
     }
     let scroll_duration = compute_scroll_duration(config);
     let base_font_size = effective_config_font_size(config.font_size, viewport.scale_factor);
+    let source_count = timeline.items().len();
     let mut source_items = Vec::new();
     for source in timeline.items() {
         if source.mode == DanmakuMode::Special {
@@ -1682,6 +1860,7 @@ fn prepare_layout(
             paint_height: measure.height.max(font_size * 1.2) as f64,
         });
     }
+    let supported_count = source_items.len();
 
     let dfm_layout = dfm::prepare_layout(dfm::PrepareRequest {
         items: source_items,
@@ -1691,6 +1870,7 @@ fn prepare_layout(
         display_area: config.display_area as f64,
         scroll_duration_seconds: scroll_duration.as_secs_f64(),
         allow_stacking: config.allow_stacking,
+        allow_scroll_overwrite: config.allow_scroll_overwrite,
         merge_danmaku: config.merge_duplicates,
         max_quantity: config.max_quantity,
         max_lines_per_type: config.max_lines_per_mode,
@@ -1749,10 +1929,19 @@ fn prepare_layout(
         .iter()
         .map(|item| item.time.as_secs_f64())
         .collect();
+    let stats = DanmakuPreparedStats::from_items(
+        source_count,
+        supported_count,
+        &prepared,
+        viewport,
+        config,
+        dfm_layout.track_count.max(0) as usize,
+    );
     DfmPreparedLayout {
         viewport,
         config: config.clone(),
         dfm_layout,
+        stats,
         scroll_duration,
         static_duration: DEFAULT_STATIC_DURATION,
         item_times,
@@ -2345,7 +2534,7 @@ mod tests {
     }
 
     #[test]
-    fn default_scroll_layout_matches_nipaplay_scroll_display_cap() {
+    fn default_scroll_layout_uses_full_display_area_when_configured() {
         let timeline = DanmakuTimeline::new(
             (0..18)
                 .map(|index| item(1.0, &format!("line {index}"), DanmakuMode::Scroll))
@@ -2367,8 +2556,12 @@ mod tests {
             .fold(0.0, f32::max);
 
         assert!(
-            max_y < 270.0,
-            "NipaPlay DFM+ caps scroll rows away from the lower viewport, got max y {max_y}"
+            max_y > 270.0,
+            "display_area=1.0 should allow scroll rows into the lower viewport, got max y {max_y}"
+        );
+        assert!(
+            max_y < 360.0,
+            "scroll rows should still stay inside the viewport, got max y {max_y}"
         );
     }
 
