@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{env, fs::OpenOptions, io::Write, path::PathBuf, time::Duration};
 
 use crossbeam_channel::Receiver;
 
@@ -25,7 +25,10 @@ use crate::subtitle::{
 use crate::subtitle::{
     LibassRenderConfig, LibassSubtitleRenderer, SubtitleRenderRequest, SubtitleRenderer,
 };
+use crate::trace;
 use crate::{PlayerError, Result};
+
+const AUDIO_START_BUFFER: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone)]
 pub struct PresenterConfig {
@@ -72,6 +75,7 @@ pub struct PresenterRuntime {
     audio_frames: Receiver<PlayerAudioFrame>,
     subtitle_frames: Receiver<PlayerSubtitleFrame>,
     audio_output: CoreAudioOutput,
+    audio_configured: bool,
     audio_started: bool,
     last_audio_clock_sync: Option<AudioClockSyncState>,
     current_overlay: Option<OverlayFrame>,
@@ -85,6 +89,7 @@ pub struct PresenterRuntime {
     danmaku_session: DanmakuSession,
     danmaku: DfmLayoutEngine,
     danmaku_generation: u64,
+    danmaku_trace: DanmakuTimeTrace,
     stats: PresenterStats,
 }
 
@@ -92,6 +97,62 @@ pub struct PresenterRuntime {
 struct AudioClockSyncState {
     media_time: Duration,
     read_frames: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DanmakuTimeTrace {
+    enabled: bool,
+    log_path: Option<PathBuf>,
+    samples: u64,
+    last_event_time: Option<Duration>,
+    last_event_generation: u64,
+    last_player_time: Option<Duration>,
+    last_player_generation: u64,
+    last_video_time: Option<Duration>,
+    last_video_generation: u64,
+    last_plan_time: Option<Duration>,
+    last_plan_generation: u64,
+}
+
+impl DanmakuTimeTrace {
+    fn from_env() -> Self {
+        let env_value = env::var("KUROKO_DANMAKU_TRACE").ok();
+        let enabled = trace::env_flag("KUROKO_DANMAKU_TRACE");
+        let log_path = enabled.then(|| {
+            env::var_os("KUROKO_DANMAKU_TRACE_FILE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/tmp/kuroko_danmaku_trace.log"))
+        });
+        if let Some(path) = &log_path {
+            let _ = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(path)
+                .and_then(|mut file| {
+                    writeln!(
+                        file,
+                        "kuroko danmaku trace start pid={} debug_assertions={} env={}",
+                        std::process::id(),
+                        cfg!(debug_assertions),
+                        env_value.as_deref().unwrap_or("<unset>"),
+                    )
+                });
+        }
+        Self {
+            enabled,
+            log_path,
+            samples: 0,
+            last_event_time: None,
+            last_event_generation: 0,
+            last_player_time: None,
+            last_player_generation: 0,
+            last_video_time: None,
+            last_video_generation: 0,
+            last_plan_time: None,
+            last_plan_generation: 0,
+        }
+    }
 }
 
 impl PresenterRuntime {
@@ -113,6 +174,7 @@ impl PresenterRuntime {
             audio_frames,
             subtitle_frames,
             audio_output: CoreAudioOutput::new(config.audio),
+            audio_configured: false,
             audio_started: false,
             last_audio_clock_sync: None,
             current_overlay: None,
@@ -126,6 +188,7 @@ impl PresenterRuntime {
             danmaku_session,
             danmaku: DfmLayoutEngine::new(danmaku_timeline, config.danmaku_config),
             danmaku_generation: 1,
+            danmaku_trace: DanmakuTimeTrace::from_env(),
             stats: PresenterStats::default(),
         })
     }
@@ -159,6 +222,8 @@ impl PresenterRuntime {
     }
 
     pub fn open(&mut self, media: MediaRequest) -> Result<()> {
+        self.reset_audio_output();
+        self.drain_pending_player_frames();
         self.current_overlay = None;
         self.current_danmaku = None;
         self.current_danmaku_viewport = None;
@@ -172,8 +237,15 @@ impl PresenterRuntime {
         self.player.play()
     }
 
-    pub fn pause(&self) -> Result<()> {
-        self.player.pause()
+    pub fn pause(&mut self) -> Result<()> {
+        let result = self.player.pause();
+        if let Err(error) = self.audio_output.pause() {
+            self.stats.audio_failures += 1;
+            eprintln!("Kuroko presenter CoreAudio pause failed: {error}");
+        }
+        self.audio_started = false;
+        self.last_audio_clock_sync = None;
+        result
     }
 
     pub fn is_playing(&self) -> bool {
@@ -190,6 +262,8 @@ impl PresenterRuntime {
 
     pub fn stop(&mut self) -> Result<()> {
         let result = self.player.stop();
+        self.reset_audio_output();
+        self.drain_pending_player_frames();
         self.current_overlay = None;
         self.current_danmaku = None;
         self.current_danmaku_viewport = None;
@@ -200,6 +274,8 @@ impl PresenterRuntime {
 
     pub fn close(&mut self) -> Result<()> {
         let result = self.player.close();
+        self.reset_audio_output();
+        self.drain_pending_player_frames();
         self.current_overlay = None;
         self.current_danmaku = None;
         self.current_danmaku_viewport = None;
@@ -210,6 +286,8 @@ impl PresenterRuntime {
 
     pub fn seek(&mut self, position: Duration) -> Result<()> {
         let result = self.player.seek(position);
+        self.reset_audio_output();
+        self.drain_pending_player_frames();
         self.current_overlay = None;
         self.current_danmaku = None;
         self.current_danmaku_viewport = None;
@@ -327,8 +405,11 @@ impl PresenterRuntime {
         self.player.remove_subtitle_track(track_id)
     }
 
-    pub fn select_audio_track(&self, track_id: Option<i64>) -> Result<()> {
-        self.player.select_audio_track(track_id)
+    pub fn select_audio_track(&mut self, track_id: Option<i64>) -> Result<()> {
+        let result = self.player.select_audio_track(track_id);
+        self.reset_audio_output();
+        self.drain_pending_player_frames();
+        result
     }
 
     pub fn select_subtitle_track(&self, track_id: Option<i64>) -> Result<()> {
@@ -349,6 +430,22 @@ impl PresenterRuntime {
         self.pump_video();
         self.sync_media_time_from_player();
         self.refresh_stale_danmaku_plan();
+        let plan_time = self.current_danmaku.as_ref().map(|plan| plan.media_time);
+        let plan_generation = self.current_danmaku.as_ref().map(|plan| plan.generation);
+        let plan_items = self
+            .current_danmaku
+            .as_ref()
+            .map_or(0, |plan| plan.items.len());
+        self.trace_danmaku_time(
+            "render_context",
+            self.current_media_time,
+            self.current_generation,
+            Some(self.player.current_media_time()),
+            None,
+            plan_time,
+            plan_generation,
+            plan_items,
+        );
 
         let context = RenderFrameContext::new(self.current_media_time, self.current_generation)
             .overlay(self.current_overlay.as_ref())
@@ -382,6 +479,9 @@ impl PresenterRuntime {
         loop {
             match self.video_frames.try_recv() {
                 Ok(frame) => {
+                    if frame.generation < self.player.playback_generation() {
+                        continue;
+                    }
                     self.stats.decoded_video_frames += 1;
                     match self.renderer.upload_player_frame(&frame) {
                         Ok(()) => {
@@ -394,6 +494,24 @@ impl PresenterRuntime {
                                 frame.generation,
                                 frame.frame.width() as usize,
                                 frame.frame.height() as usize,
+                            );
+                            let plan_time =
+                                self.current_danmaku.as_ref().map(|plan| plan.media_time);
+                            let plan_generation =
+                                self.current_danmaku.as_ref().map(|plan| plan.generation);
+                            let plan_items = self
+                                .current_danmaku
+                                .as_ref()
+                                .map_or(0, |plan| plan.items.len());
+                            self.trace_danmaku_time(
+                                "video_frame",
+                                pts,
+                                self.current_generation,
+                                None,
+                                Some(pts),
+                                plan_time,
+                                plan_generation,
+                                plan_items,
                             );
                         }
                         Err(error) => {
@@ -455,6 +573,22 @@ impl PresenterRuntime {
             self.current_generation,
         );
         self.record_current_danmaku_stats();
+        let plan_time = self.current_danmaku.as_ref().map(|plan| plan.media_time);
+        let plan_generation = self.current_danmaku.as_ref().map(|plan| plan.generation);
+        let plan_items = self
+            .current_danmaku
+            .as_ref()
+            .map_or(0, |plan| plan.items.len());
+        self.trace_danmaku_time(
+            "plan_refresh",
+            self.current_media_time,
+            self.current_generation,
+            None,
+            None,
+            plan_time,
+            plan_generation,
+            plan_items,
+        );
     }
 
     fn sync_media_time_from_player(&mut self) {
@@ -476,6 +610,114 @@ impl PresenterRuntime {
                 self.current_overlay = Some(overlay);
             }
         }
+        self.trace_danmaku_time(
+            "player_clock",
+            player_time,
+            self.current_generation,
+            Some(player_time),
+            None,
+            None,
+            None,
+            0,
+        );
+    }
+
+    fn trace_danmaku_time(
+        &mut self,
+        stage: &'static str,
+        media_time: Duration,
+        generation: u64,
+        player_time: Option<Duration>,
+        video_time: Option<Duration>,
+        plan_time: Option<Duration>,
+        plan_generation: Option<u64>,
+        plan_items: usize,
+    ) {
+        if !self.danmaku_trace.enabled {
+            return;
+        }
+        let trace = &mut self.danmaku_trace;
+        let event_rollback = trace.last_event_time.is_some_and(|last| {
+            trace.last_event_generation == generation && duration_regressed(media_time, last)
+        });
+        let player_rollback = player_time.is_some_and(|time| {
+            trace.last_player_generation == generation
+                && trace
+                    .last_player_time
+                    .is_some_and(|last| duration_regressed(time, last))
+        });
+        let video_rollback = video_time.is_some_and(|time| {
+            trace.last_video_generation == generation
+                && trace
+                    .last_video_time
+                    .is_some_and(|last| duration_regressed(time, last))
+        });
+        let resolved_plan_generation = plan_generation.unwrap_or(generation);
+        let plan_rollback = plan_time.is_some_and(|time| {
+            trace.last_plan_generation == resolved_plan_generation
+                && trace
+                    .last_plan_time
+                    .is_some_and(|last| duration_regressed(time, last))
+        });
+        let generation_changed =
+            trace.last_event_generation != 0 && trace.last_event_generation != generation;
+        let plan_mismatch = plan_time.is_some_and(|time| {
+            time != media_time || plan_generation.is_some_and(|plan_gen| plan_gen != generation)
+        });
+
+        if trace.samples < 16
+            || event_rollback
+            || player_rollback
+            || video_rollback
+            || plan_rollback
+            || generation_changed
+            || plan_mismatch
+        {
+            let line = format!(
+                "[kuroko-danmaku-trace] stage={stage} media={} gen={} player={} video={} plan={} plan_gen={} items={} last_event={} last_event_gen={} flags=event_back:{} player_back:{} video_back:{} plan_back:{} gen_change:{} plan_mismatch:{}",
+                duration_label(Some(media_time)),
+                generation,
+                duration_label(player_time),
+                duration_label(video_time),
+                duration_label(plan_time),
+                plan_generation
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                plan_items,
+                duration_label(trace.last_event_time),
+                trace.last_event_generation,
+                event_rollback,
+                player_rollback,
+                video_rollback,
+                plan_rollback,
+                generation_changed,
+                plan_mismatch,
+            );
+            eprintln!("{line}");
+            if let Some(path) = &trace.log_path {
+                let _ = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .and_then(|mut file| writeln!(file, "{line}"));
+            }
+            trace.samples = trace.samples.saturating_add(1);
+        }
+
+        trace.last_event_time = Some(media_time);
+        trace.last_event_generation = generation;
+        if let Some(time) = player_time {
+            trace.last_player_time = Some(time);
+            trace.last_player_generation = generation;
+        }
+        if let Some(time) = video_time {
+            trace.last_video_time = Some(time);
+            trace.last_video_generation = generation;
+        }
+        if let Some(time) = plan_time {
+            trace.last_plan_time = Some(time);
+            trace.last_plan_generation = resolved_plan_generation;
+        }
     }
 
     fn bump_danmaku_generation(&mut self) {
@@ -493,6 +735,9 @@ impl PresenterRuntime {
         loop {
             match self.subtitle_frames.try_recv() {
                 Ok(frame) => {
+                    if frame.generation < self.player.playback_generation() {
+                        continue;
+                    }
                     self.stats.decoded_subtitle_frames += 1;
                     self.subtitles.push(frame);
                 }
@@ -506,6 +751,9 @@ impl PresenterRuntime {
         loop {
             match self.audio_frames.try_recv() {
                 Ok(frame) => {
+                    if frame.generation < self.player.playback_generation() {
+                        continue;
+                    }
                     self.push_audio(frame);
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -524,6 +772,15 @@ impl PresenterRuntime {
         if !self.should_sync_audio_clock(snapshot) {
             return;
         }
+        trace::log(format!(
+            "[kuroko-clock-trace] stage=presenter_audio_snapshot media={} queued={} queued_frames={} read={} written={} underflow={}",
+            trace::duration_label(snapshot.media_time),
+            trace::duration_label(snapshot.queued_duration),
+            snapshot.queued_frames,
+            snapshot.read_frames,
+            snapshot.written_frames,
+            snapshot.underflow_frames,
+        ));
         let _ = self.player.update_audio_clock(snapshot);
     }
 
@@ -548,12 +805,25 @@ impl PresenterRuntime {
     }
 
     fn push_audio(&mut self, frame: PlayerAudioFrame) {
-        if !self.audio_started {
+        if !self.audio_configured {
             if let Err(error) = self.audio_output.configure(frame.frame.format) {
                 self.stats.audio_failures += 1;
                 eprintln!("Kuroko presenter CoreAudio configure failed: {error}");
                 return;
             }
+            self.audio_configured = true;
+            self.last_audio_clock_sync = None;
+        }
+        match self.audio_output.push(frame.frame) {
+            Ok(_) => self.stats.pushed_audio_frames += 1,
+            Err(error) => {
+                self.stats.audio_failures += 1;
+                eprintln!("Kuroko presenter CoreAudio push failed: {error}");
+                return;
+            }
+        }
+
+        if !self.audio_started && self.audio_output_ready_to_start() {
             if let Err(error) = self.audio_output.start() {
                 self.stats.audio_failures += 1;
                 eprintln!("Kuroko presenter CoreAudio start failed: {error}");
@@ -562,13 +832,30 @@ impl PresenterRuntime {
             self.audio_started = true;
             self.last_audio_clock_sync = None;
         }
-        match self.audio_output.push(frame.frame) {
-            Ok(_) => self.stats.pushed_audio_frames += 1,
-            Err(error) => {
-                self.stats.audio_failures += 1;
-                eprintln!("Kuroko presenter CoreAudio push failed: {error}");
-            }
+    }
+
+    fn audio_output_ready_to_start(&self) -> bool {
+        self.audio_output
+            .clock_snapshot()
+            .ok()
+            .and_then(|snapshot| snapshot.queued_duration)
+            .is_some_and(|queued| queued >= AUDIO_START_BUFFER)
+    }
+
+    fn reset_audio_output(&mut self) {
+        if let Err(error) = self.audio_output.stop() {
+            self.stats.audio_failures += 1;
+            eprintln!("Kuroko presenter CoreAudio reset failed: {error}");
         }
+        self.audio_configured = false;
+        self.audio_started = false;
+        self.last_audio_clock_sync = None;
+    }
+
+    fn drain_pending_player_frames(&mut self) {
+        while self.video_frames.try_recv().is_ok() {}
+        while self.audio_frames.try_recv().is_ok() {}
+        while self.subtitle_frames.try_recv().is_ok() {}
     }
 }
 
@@ -623,6 +910,18 @@ fn bump_generation(current_generation: &mut u64, danmaku_generation: &mut u64) {
     *current_generation = current_generation
         .saturating_add(1)
         .max(*danmaku_generation);
+}
+
+fn duration_regressed(next: Duration, previous: Duration) -> bool {
+    previous
+        .checked_sub(next)
+        .is_some_and(|delta| delta > Duration::from_millis(5))
+}
+
+fn duration_label(value: Option<Duration>) -> String {
+    value
+        .map(|duration| format!("{:.3}", duration.as_secs_f64()))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 impl Drop for PresenterRuntime {

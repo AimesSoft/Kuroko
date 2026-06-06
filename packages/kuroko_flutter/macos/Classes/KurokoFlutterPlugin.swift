@@ -301,7 +301,9 @@ private final class KurokoNativeLibrary {
       let executableDirectory = URL(fileURLWithPath: executablePath).deletingLastPathComponent().path
       candidates.append(URL(fileURLWithPath: executableDirectory).appendingPathComponent("libkuroko_capi.dylib").path)
     }
-    candidates.append("/Users/sakiko/Desktop/Kuroko/target/debug/libkuroko_capi.dylib")
+    if let sourceTreePath = Self.sourceTreeDebugLibraryPath() {
+      candidates.append(sourceTreePath)
+    }
     candidates.append("libkuroko_capi.dylib")
 
     var failures: [KurokoPluginError] = []
@@ -314,6 +316,21 @@ private final class KurokoNativeLibrary {
       failures.append(.libraryLoadFailed(path, detail))
     }
     throw KurokoPluginError.libraryNotFound(failures.map(String.init(describing:)))
+  }
+
+  fileprivate static func sourceTreeDebugLibraryPath() -> String? {
+    let sourceFile = URL(fileURLWithPath: #filePath)
+    let kurokoRoot = sourceFile
+      .deletingLastPathComponent() // Classes
+      .deletingLastPathComponent() // macos
+      .deletingLastPathComponent() // kuroko_flutter
+      .deletingLastPathComponent() // packages
+      .deletingLastPathComponent() // Kuroko repo root
+    return kurokoRoot
+      .appendingPathComponent("target")
+      .appendingPathComponent("debug")
+      .appendingPathComponent("libkuroko_capi.dylib")
+      .path
   }
 
   private static func load<T>(_ symbol: String, from handle: UnsafeMutableRawPointer, as type: T.Type) throws -> T {
@@ -1426,7 +1443,7 @@ public final class KurokoFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHa
     guard let library = KurokoNativeLibrary.shared else {
       throw KurokoPluginError.libraryNotFound([
         ProcessInfo.processInfo.environment["KUROKO_CAPI_DYLIB"] ?? "",
-        "/Users/sakiko/Desktop/Kuroko/target/debug/libkuroko_capi.dylib",
+        KurokoNativeLibrary.sourceTreeDebugLibraryPath() ?? "",
         "libkuroko_capi.dylib",
       ].filter { !$0.isEmpty })
     }

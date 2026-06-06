@@ -11,4 +11,6 @@ pub mod source;
 pub mod subtitle;
 pub mod text;
 
+mod trace;
+
 pub use core::*;

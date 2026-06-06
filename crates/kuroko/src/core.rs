@@ -13,6 +13,7 @@ use crate::ffmpeg::{Frame, PcmAudioFrame};
 use crate::overlay::OverlayFrame;
 use crate::playback::{PlaybackRunState, PlaybackSessionConfig, VideoPlaybackEngine};
 use crate::subtitle::{DecodedSubtitleFrame, SubtitleTrackConfig};
+use crate::trace;
 
 static NEXT_PLAYER_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_EXTERNAL_SUBTITLE_TRACK_ID: AtomicU64 = AtomicU64::new(1);
@@ -53,7 +54,7 @@ impl Default for PlayerConfig {
             playback: PlaybackSessionConfig::default(),
             renderer: RendererBackendPreference::default(),
             video_frame_queue_capacity: 3,
-            audio_frame_queue_capacity: 8,
+            audio_frame_queue_capacity: 64,
             subtitle_frame_queue_capacity: 16,
         }
     }
@@ -239,6 +240,7 @@ pub struct PlayerVideoFrame {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayerAudioFrame {
     pub frame: PcmAudioFrame,
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -838,6 +840,7 @@ fn run_playback_worker(
 ) {
     let mut last_position_event = None;
     let mut playback_generation = 1u64;
+    let mut last_worker_clock = None;
     loop {
         match commands.recv_timeout(playback_poll_interval(engine.state())) {
             Ok(command) => {
@@ -855,7 +858,13 @@ fn run_playback_worker(
             }
         }
 
-        sync_playback_clock_from_worker(engine, &inner, playback_generation);
+        sync_playback_clock_from_worker(
+            engine,
+            &inner,
+            playback_generation,
+            "before_video_tick",
+            &mut last_worker_clock,
+        );
 
         match engine.tick() {
             Ok(Some(frame)) => {
@@ -882,13 +891,23 @@ fn run_playback_worker(
             }
         }
 
-        sync_playback_clock_from_worker(engine, &inner, playback_generation);
+        sync_playback_clock_from_worker(
+            engine,
+            &inner,
+            playback_generation,
+            "after_video_tick",
+            &mut last_worker_clock,
+        );
 
         if engine.state() == PlaybackRunState::Playing {
             match engine.tick_audio() {
-                Ok(Some(frame)) => {
-                    emit_audio_frame_from_worker(&inner, PlayerAudioFrame { frame: frame.frame })
-                }
+                Ok(Some(frame)) => emit_audio_frame_from_worker(
+                    &inner,
+                    PlayerAudioFrame {
+                        frame: frame.frame,
+                        generation: playback_generation,
+                    },
+                ),
                 Ok(None) => {}
                 Err(error) => {
                     emit_from_worker(
@@ -921,7 +940,13 @@ fn run_playback_worker(
             }
         }
 
-        sync_playback_clock_from_worker(engine, &inner, playback_generation);
+        sync_playback_clock_from_worker(
+            engine,
+            &inner,
+            playback_generation,
+            "after_av_tick",
+            &mut last_worker_clock,
+        );
 
         if engine.state() == PlaybackRunState::Ended {
             set_state_from_worker(&inner, PlayerState::Stopped);
@@ -943,6 +968,11 @@ fn handle_playback_command(
         PlaybackCommand::Play => engine.play(),
         PlaybackCommand::Pause => engine.pause(),
         PlaybackCommand::Seek(position) => {
+            trace::log(format!(
+                "[kuroko-clock-trace] stage=worker_command_seek target={} gen_before={}",
+                trace::duration_label(Some(position)),
+                *playback_generation,
+            ));
             if let Err(error) = engine.seek(position) {
                 emit_from_worker(
                     inner,
@@ -951,6 +981,11 @@ fn handle_playback_command(
                 set_state_from_worker(inner, PlayerState::Error);
             } else {
                 *playback_generation = playback_generation.saturating_add(1).max(1);
+                trace::log(format!(
+                    "[kuroko-clock-trace] stage=worker_command_seek_done target={} gen_after={}",
+                    trace::duration_label(Some(position)),
+                    *playback_generation,
+                ));
             }
         }
         PlaybackCommand::SetPlaybackRate(rate) => {
@@ -961,6 +996,16 @@ fn handle_playback_command(
             *playback_generation = playback_generation.saturating_add(1).max(1);
         }
         PlaybackCommand::AudioClock(snapshot) => {
+            trace::log(format!(
+                "[kuroko-clock-trace] stage=worker_command_audio_clock media={} queued={} queued_frames={} read={} written={} underflow={} gen={}",
+                trace::duration_label(snapshot.media_time),
+                trace::duration_label(snapshot.queued_duration),
+                snapshot.queued_frames,
+                snapshot.read_frames,
+                snapshot.written_frames,
+                snapshot.underflow_frames,
+                *playback_generation,
+            ));
             let _ = engine.sync_to_audio_clock(snapshot);
         }
         PlaybackCommand::AddExternalSubtitle(config) => {
@@ -1075,11 +1120,37 @@ fn sync_playback_clock_from_worker(
     engine: &VideoPlaybackEngine,
     inner: &Arc<Mutex<PlayerInner>>,
     playback_generation: u64,
+    stage: &'static str,
+    last_worker_clock: &mut Option<(Duration, u64)>,
 ) {
     let media_time = engine.media_time();
     let mut inner = inner.lock().expect("player mutex poisoned");
+    let shared_before = inner.current_media_time;
+    let generation = playback_generation.max(1);
+    let worker_back = last_worker_clock.is_some_and(|(last_time, last_generation)| {
+        last_generation == generation && trace::duration_regressed(media_time, last_time)
+    });
+    let shared_back = trace::duration_regressed(media_time, shared_before);
+    let generation_changed =
+        last_worker_clock.is_some_and(|(_, last_generation)| last_generation != generation);
+    if worker_back || shared_back || generation_changed {
+        trace::log(format!(
+            "[kuroko-clock-trace] stage=worker_sync:{stage} media={} shared_before={} gen={} last_worker={} last_worker_gen={} flags=worker_back:{} shared_back:{} gen_change:{}",
+            trace::duration_label(Some(media_time)),
+            trace::duration_label(Some(shared_before)),
+            generation,
+            trace::duration_label(last_worker_clock.map(|(time, _)| time)),
+            last_worker_clock
+                .map(|(_, generation)| generation)
+                .unwrap_or(0),
+            worker_back,
+            shared_back,
+            generation_changed,
+        ));
+    }
     inner.current_media_time = media_time;
-    inner.playback_generation = playback_generation.max(1);
+    inner.playback_generation = generation;
+    *last_worker_clock = Some((media_time, generation));
 }
 
 fn playback_poll_interval(state: PlaybackRunState) -> Duration {
@@ -1122,13 +1193,17 @@ fn emit_video_frame_from_worker(inner: &Arc<Mutex<PlayerInner>>, frame: PlayerVi
 }
 
 fn emit_audio_frame_from_worker(inner: &Arc<Mutex<PlayerInner>>, frame: PlayerAudioFrame) {
-    let mut inner = inner.lock().expect("player mutex poisoned");
-    let Some(sender) = inner.audio_frame_sender.as_ref() else {
-        return;
+    let sender = {
+        let inner = inner.lock().expect("player mutex poisoned");
+        let Some(sender) = inner.audio_frame_sender.as_ref() else {
+            return;
+        };
+        sender.clone()
     };
-    match sender.try_send(frame) {
-        Ok(()) | Err(crossbeam_channel::TrySendError::Full(_)) => {}
-        Err(crossbeam_channel::TrySendError::Disconnected(_)) => inner.audio_frame_sender = None,
+    if sender.send(frame).is_err() {
+        let mut inner = inner.lock().expect("player mutex poisoned");
+        inner.audio_frame_sender = None;
+        return;
     }
 }
 
