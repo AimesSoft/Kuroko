@@ -1581,10 +1581,10 @@ impl DfmLayoutEngine {
         self.prepared = None;
     }
 
-    pub fn set_config(&mut self, config: DanmakuLayoutConfig) {
+    pub fn set_config(&mut self, config: DanmakuLayoutConfig) -> bool {
         let config = config.sanitized();
         if self.config == config {
-            return;
+            return false;
         }
         let font_changed = self.config.custom_font_family != config.custom_font_family
             || self.config.custom_font_file_path != config.custom_font_file_path;
@@ -1593,6 +1593,7 @@ impl DfmLayoutEngine {
             self.rasterizer = DanmakuTextRasterizer::for_config(&self.config);
         }
         self.prepared = None;
+        true
     }
 
     pub fn config(&self) -> &DanmakuLayoutConfig {
