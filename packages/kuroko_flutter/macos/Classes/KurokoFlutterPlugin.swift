@@ -152,6 +152,7 @@ private final class KurokoNativeLibrary {
   typealias CommandFn = @convention(c) (UnsafeMutableRawPointer?) -> Int32
   typealias SeekFn = @convention(c) (UnsafeMutableRawPointer?, UInt64) -> Int32
   typealias SetPlaybackRateFn = @convention(c) (UnsafeMutableRawPointer?, Double) -> Int32
+  typealias SetVolumeFn = @convention(c) (UnsafeMutableRawPointer?, Double) -> Int32
   typealias SelectTrackFn = @convention(c) (UnsafeMutableRawPointer?, Int64) -> Int32
   typealias AddExternalSubtitleFn = @convention(c) (
     UnsafeMutableRawPointer?,
@@ -170,6 +171,7 @@ private final class KurokoNativeLibrary {
   typealias ClearDanmakuFn = @convention(c) (UnsafeMutableRawPointer?) -> Int32
   typealias SetDanmakuEnabledFn = @convention(c) (UnsafeMutableRawPointer?, Bool) -> Int32
   typealias SetDanmakuConfigFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeRawPointer?) -> Int32
+  typealias GetDanmakuConfigFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Int32
   typealias SetDanmakuFontFn = @convention(c) (
     UnsafeMutableRawPointer?,
     UnsafePointer<CChar>?,
@@ -206,6 +208,7 @@ private final class KurokoNativeLibrary {
   let close: CommandFn
   let seek: SeekFn
   let setPlaybackRate: SetPlaybackRateFn?
+  let setVolume: SetVolumeFn?
   let selectAudioTrack: SelectTrackFn
   let selectSubtitleTrack: SelectTrackFn
   let addExternalSubtitle: AddExternalSubtitleFn
@@ -222,6 +225,7 @@ private final class KurokoNativeLibrary {
   let clearDanmaku: ClearDanmakuFn?
   let setDanmakuEnabled: SetDanmakuEnabledFn?
   let setDanmakuConfig: SetDanmakuConfigFn?
+  let getDanmakuConfig: GetDanmakuConfigFn?
   let setDanmakuFont: SetDanmakuFontFn?
   let setDanmakuBlockWords: SetDanmakuBlockWordsFn?
   let trackSelection: TrackSelectionFn
@@ -250,6 +254,7 @@ private final class KurokoNativeLibrary {
     close = try Self.load("kuroko_presenter_close", from: libraryHandle, as: CommandFn.self)
     seek = try Self.load("kuroko_presenter_seek", from: libraryHandle, as: SeekFn.self)
     setPlaybackRate = Self.loadOptional("kuroko_presenter_set_playback_rate", from: libraryHandle, as: SetPlaybackRateFn.self)
+    setVolume = Self.loadOptional("kuroko_presenter_set_volume", from: libraryHandle, as: SetVolumeFn.self)
     selectAudioTrack = try Self.load("kuroko_presenter_select_audio_track", from: libraryHandle, as: SelectTrackFn.self)
     selectSubtitleTrack = try Self.load("kuroko_presenter_select_subtitle_track", from: libraryHandle, as: SelectTrackFn.self)
     addExternalSubtitle = try Self.load("kuroko_presenter_add_external_subtitle", from: libraryHandle, as: AddExternalSubtitleFn.self)
@@ -266,6 +271,7 @@ private final class KurokoNativeLibrary {
     clearDanmaku = Self.loadOptional("kuroko_presenter_clear_danmaku", from: libraryHandle, as: ClearDanmakuFn.self)
     setDanmakuEnabled = Self.loadOptional("kuroko_presenter_set_danmaku_enabled", from: libraryHandle, as: SetDanmakuEnabledFn.self)
     setDanmakuConfig = Self.loadOptional("kuroko_presenter_set_danmaku_config_ptr", from: libraryHandle, as: SetDanmakuConfigFn.self)
+    getDanmakuConfig = Self.loadOptional("kuroko_presenter_get_danmaku_config", from: libraryHandle, as: GetDanmakuConfigFn.self)
     setDanmakuFont = Self.loadOptional("kuroko_presenter_set_danmaku_font", from: libraryHandle, as: SetDanmakuFontFn.self)
     setDanmakuBlockWords = Self.loadOptional("kuroko_presenter_set_danmaku_block_words_json", from: libraryHandle, as: SetDanmakuBlockWordsFn.self)
     trackSelection = try Self.load("kuroko_presenter_track_selection", from: libraryHandle, as: TrackSelectionFn.self)
@@ -363,6 +369,7 @@ private final class KurokoPlayerHost {
   private weak var attachedView: KurokoMetalSurfaceView?
   private var displayTimer: Timer?
   private var startTimeSeconds: CFTimeInterval = CACurrentMediaTime()
+  private var currentDanmakuConfig = KurokoDanmakuConfigC()
 
   init(id: Int64, library: KurokoNativeLibrary, config: KurokoPresenterConfigC) throws {
     self.id = id
@@ -371,6 +378,7 @@ private final class KurokoPlayerHost {
       throw KurokoPluginError.presenterCreateFailed
     }
     self.handle = handle
+    refreshDanmakuConfigSnapshot()
   }
 
   deinit {
@@ -410,6 +418,14 @@ private final class KurokoPlayerHost {
       throw KurokoPluginError.symbolMissing("kuroko_presenter_set_playback_rate")
     }
     try check(setRate(handle, rate), operation: "set_playback_rate")
+  }
+
+  func setVolume(_ volume: Double) throws {
+    guard let setVolume = library.setVolume else {
+      throw KurokoPluginError.symbolMissing("kuroko_presenter_set_volume")
+    }
+    let clampedVolume = volume.isFinite ? min(max(volume, 0.0), 1.0) : 1.0
+    try check(setVolume(handle, clampedVolume), operation: "set_volume")
   }
 
   func addExternalSubtitle(uri: String) throws -> Int64 {
@@ -542,6 +558,24 @@ private final class KurokoPlayerHost {
       throw KurokoPluginError.symbolMissing("kuroko_presenter_set_danmaku_enabled")
     }
     try check(setEnabled(handle, enabled), operation: "set_danmaku_enabled")
+    currentDanmakuConfig.enabled = enabled ? 1 : 0
+  }
+
+  func danmakuConfigSnapshot() -> KurokoDanmakuConfigC {
+    currentDanmakuConfig
+  }
+
+  private func refreshDanmakuConfigSnapshot() {
+    guard let getConfig = library.getDanmakuConfig else {
+      return
+    }
+    var config = KurokoDanmakuConfigC()
+    let status = withUnsafeMutablePointer(to: &config) { pointer in
+      getConfig(handle, UnsafeMutableRawPointer(pointer))
+    }
+    if status == 0 {
+      currentDanmakuConfig = config
+    }
   }
 
   func setDanmakuConfig(_ config: KurokoDanmakuConfigC) throws {
@@ -553,6 +587,7 @@ private final class KurokoPlayerHost {
       setConfig(handle, UnsafeRawPointer(pointer))
     }
     try check(status, operation: "set_danmaku_config")
+    currentDanmakuConfig = config
   }
 
   func setDanmakuFont(family: String?, filePath: String?) throws {
@@ -567,6 +602,7 @@ private final class KurokoPlayerHost {
       }
     }
     try check(status, operation: "set_danmaku_font")
+    refreshDanmakuConfigSnapshot()
   }
 
   func setDanmakuBlockWordsJson(_ json: String) throws {
@@ -576,6 +612,7 @@ private final class KurokoPlayerHost {
     try json.withCString { cString in
       try check(setBlockWords(handle, cString), operation: "set_danmaku_block_words")
     }
+    refreshDanmakuConfigSnapshot()
   }
 
   func selectAudioTrack(trackId: Int64?) throws {
@@ -1135,6 +1172,14 @@ public final class KurokoFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHa
         }
         try host.setPlaybackRate(rate)
         result(nil)
+      case "setVolume":
+        let args = try dictionaryArgs(call.arguments)
+        let host = try playerHost(from: args)
+        guard let volume = doubleValue(args["volume"]) else {
+          throw KurokoPluginError.invalidArguments("volume is required.")
+        }
+        try host.setVolume(volume)
+        result(nil)
       case "addExternalSubtitle":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
@@ -1229,7 +1274,9 @@ public final class KurokoFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHa
       case "setDanmakuConfig":
         let args = try dictionaryArgs(call.arguments)
         let host = try playerHost(from: args)
-        try host.setDanmakuConfig(danmakuConfig(from: args))
+        try host.setDanmakuConfig(
+          danmakuConfig(from: args, base: host.danmakuConfigSnapshot())
+        )
         if args.keys.contains("customFontFamily") || args.keys.contains("customFontFilePath") {
           try host.setDanmakuFont(
             family: args["customFontFamily"] as? String,
@@ -1591,8 +1638,11 @@ public final class KurokoFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHa
     return trackId >= 0 ? trackId : nil
   }
 
-  private func danmakuConfig(from args: [String: Any]) -> KurokoDanmakuConfigC {
-    var config = KurokoDanmakuConfigC()
+  private func danmakuConfig(
+    from args: [String: Any],
+    base: KurokoDanmakuConfigC
+  ) -> KurokoDanmakuConfigC {
+    var config = base
     if let value = boolValue(args["enabled"]) {
       config.enabled = value ? 1 : 0
     }

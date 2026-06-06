@@ -301,6 +301,14 @@ impl PresenterRuntime {
         self.player.set_playback_rate(rate)
     }
 
+    pub fn set_volume(&mut self, volume: f64) {
+        self.audio_output.set_volume(volume as f32);
+    }
+
+    pub fn volume(&self) -> f64 {
+        self.audio_output.volume() as f64
+    }
+
     pub fn set_danmaku_timeline(&mut self, timeline: DanmakuTimeline) {
         self.danmaku_session.replace_default_track(
             timeline,
@@ -387,6 +395,9 @@ impl PresenterRuntime {
     }
 
     pub fn set_danmaku_config(&mut self, config: DanmakuLayoutConfig) {
+        if self.danmaku.config() == &config {
+            return;
+        }
         self.danmaku.set_config(config);
         self.current_danmaku = None;
         self.current_danmaku_viewport = None;
@@ -1326,6 +1337,19 @@ mod tests {
             written_frames: 24_000,
             underflow_frames: 0,
         }));
+    }
+
+    #[test]
+    fn presenter_volume_is_clamped() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+
+        assert_eq!(presenter.volume(), 1.0);
+        presenter.set_volume(0.4);
+        assert!((presenter.volume() - 0.4).abs() < 0.000_001);
+        presenter.set_volume(-1.0);
+        assert_eq!(presenter.volume(), 0.0);
+        presenter.set_volume(f64::NAN);
+        assert_eq!(presenter.volume(), 1.0);
     }
 
     #[test]

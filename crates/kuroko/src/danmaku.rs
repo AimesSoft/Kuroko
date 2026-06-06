@@ -1583,6 +1583,9 @@ impl DfmLayoutEngine {
 
     pub fn set_config(&mut self, config: DanmakuLayoutConfig) {
         let config = config.sanitized();
+        if self.config == config {
+            return;
+        }
         let font_changed = self.config.custom_font_family != config.custom_font_family
             || self.config.custom_font_file_path != config.custom_font_file_path;
         self.config = config;

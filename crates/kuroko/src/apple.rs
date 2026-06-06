@@ -21,7 +21,10 @@ pub enum AppleDecodeBackend {
 
 #[cfg(target_os = "macos")]
 pub mod coreaudio {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+    };
 
     use coreaudio::audio_unit::audio_format::LinearPcmFlags;
     use coreaudio::audio_unit::render_callback::{self, data};
@@ -68,6 +71,7 @@ pub mod coreaudio {
         state: AudioOutputState,
         audio_unit: Option<AudioUnit>,
         buffer: Arc<Mutex<AudioRingBuffer>>,
+        volume: Arc<AtomicU32>,
     }
 
     impl CoreAudioOutput {
@@ -76,6 +80,7 @@ pub mod coreaudio {
                 state: AudioOutputState::Stopped,
                 audio_unit: None,
                 buffer: Arc::new(Mutex::new(AudioRingBuffer::new(config.ring_buffer))),
+                volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             }
         }
 
@@ -87,10 +92,23 @@ pub mod coreaudio {
                 Scope::Input,
                 Element::Output,
             )?;
-            install_render_callback(&mut audio_unit, Arc::clone(&self.buffer))?;
+            install_render_callback(
+                &mut audio_unit,
+                Arc::clone(&self.buffer),
+                Arc::clone(&self.volume),
+            )?;
             audio_unit.initialize()?;
             self.audio_unit = Some(audio_unit);
             Ok(())
+        }
+
+        pub fn set_volume(&mut self, volume: f32) {
+            self.volume
+                .store(normalize_volume(volume).to_bits(), Ordering::Relaxed);
+        }
+
+        pub fn volume(&self) -> f32 {
+            f32::from_bits(self.volume.load(Ordering::Relaxed))
         }
 
         pub fn start(&mut self) -> Result<()> {
@@ -215,6 +233,7 @@ pub mod coreaudio {
     fn install_render_callback(
         audio_unit: &mut AudioUnit,
         buffer: Arc<Mutex<AudioRingBuffer>>,
+        volume: Arc<AtomicU32>,
     ) -> Result<()> {
         type Args = render_callback::Args<data::Interleaved<f32>>;
         audio_unit.set_render_callback(move |mut args: Args| {
@@ -222,6 +241,10 @@ pub mod coreaudio {
                 .lock()
                 .map_err(|_| ())
                 .and_then(|mut buffer| buffer.read_interleaved(args.data.buffer).map_err(|_| ()))?;
+            apply_volume(
+                args.data.buffer,
+                f32::from_bits(volume.load(Ordering::Relaxed)),
+            );
             if read_result.underflow_frames > 0 {
                 args.flags
                     .insert(render_callback::ActionFlags::OUTPUT_IS_SILENCE);
@@ -229,6 +252,24 @@ pub mod coreaudio {
             Ok(())
         })?;
         Ok(())
+    }
+
+    fn normalize_volume(volume: f32) -> f32 {
+        if volume.is_finite() {
+            volume.clamp(0.0, 1.0)
+        } else {
+            1.0
+        }
+    }
+
+    fn apply_volume(samples: &mut [f32], volume: f32) {
+        let volume = normalize_volume(volume);
+        if (volume - 1.0).abs() <= f32::EPSILON {
+            return;
+        }
+        for sample in samples {
+            *sample *= volume;
+        }
     }
 
     fn configure_buffer(buffer: &Arc<Mutex<AudioRingBuffer>>, format: PcmFormat) -> Result<()> {
@@ -244,5 +285,27 @@ pub mod coreaudio {
             .map_err(|_| CoreAudioOutputError::LockPoisoned)?;
         buffer.clear();
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn volume_is_clamped_and_applied_to_pcm_samples() {
+            let mut output = CoreAudioOutput::default();
+
+            assert_eq!(output.volume(), 1.0);
+            output.set_volume(0.25);
+            assert_eq!(output.volume(), 0.25);
+            output.set_volume(-1.0);
+            assert_eq!(output.volume(), 0.0);
+            output.set_volume(f32::NAN);
+            assert_eq!(output.volume(), 1.0);
+
+            let mut samples = [1.0, -0.5, 0.25, 0.0];
+            apply_volume(&mut samples, 0.5);
+            assert_eq!(samples, [0.5, -0.25, 0.125, 0.0]);
+        }
     }
 }
