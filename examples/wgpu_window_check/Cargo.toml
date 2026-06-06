@@ -7,7 +7,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-kuroko = { path = "../../crates/kuroko", features = ["wgpu"] }
+erika = { path = "../../crates/erika", features = ["wgpu"] }
 
 [build-dependencies]
 cc = "1.2.47"

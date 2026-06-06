@@ -5,12 +5,12 @@ use std::process;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use kuroko::danmaku::{DanmakuItem, DanmakuMode, DanmakuTimeline};
-use kuroko::overlay::OverlayTimeline;
-use kuroko::presenter::{PresenterConfig, PresenterRuntime};
-use kuroko::renderer::metal::{MetalOutputMode, MetalRendererConfig};
-use kuroko::subtitle::{SubtitleCue, SubtitleTimeline};
-use kuroko::{MediaRequest, MetalSurfaceHandle, PlatformSurface};
+use erika::danmaku::{DanmakuItem, DanmakuMode, DanmakuTimeline};
+use erika::overlay::OverlayTimeline;
+use erika::presenter::{PresenterConfig, PresenterRuntime};
+use erika::renderer::metal::{MetalOutputMode, MetalRendererConfig};
+use erika::subtitle::{SubtitleCue, SubtitleTimeline};
+use erika::{MediaRequest, MetalSurfaceHandle, PlatformSurface};
 
 static MEDIA_URI: OnceLock<String> = OnceLock::new();
 static SUBTITLE_PATH: OnceLock<String> = OnceLock::new();
@@ -19,7 +19,7 @@ static SMOKE_SECONDS: OnceLock<f64> = OnceLock::new();
 static EDR_HEADROOM: OnceLock<f32> = OnceLock::new();
 
 unsafe extern "C" {
-    fn kuroko_demo_run_app();
+    fn erika_demo_run_app();
 }
 
 thread_local! {
@@ -33,7 +33,7 @@ struct DemoState {
 }
 
 impl DemoState {
-    fn new() -> kuroko::Result<Self> {
+    fn new() -> erika::Result<Self> {
         Ok(Self {
             presenter: PresenterRuntime::new(PresenterConfig {
                 renderer: demo_renderer_config(),
@@ -55,22 +55,22 @@ impl DemoState {
                         if let Some(path) = SUBTITLE_PATH.get() {
                             match self.presenter.add_external_subtitle(path) {
                                 Ok(track) => eprintln!(
-                                    "Kuroko demo added external subtitle track #{}: {path}",
+                                    "Erika demo added external subtitle track #{}: {path}",
                                     track.id
                                 ),
                                 Err(error) => {
-                                    eprintln!("Kuroko demo external subtitle add failed: {error}")
+                                    eprintln!("Erika demo external subtitle add failed: {error}")
                                 }
                             }
                         }
                         match self.presenter.play() {
                             Ok(()) => {
-                                eprintln!("Kuroko demo opened media through presenter runtime")
+                                eprintln!("Erika demo opened media through presenter runtime")
                             }
-                            Err(error) => eprintln!("Kuroko demo play failed: {error}"),
+                            Err(error) => eprintln!("Erika demo play failed: {error}"),
                         }
                     }
-                    Err(error) => eprintln!("Kuroko demo video load failed: {error}"),
+                    Err(error) => eprintln!("Erika demo video load failed: {error}"),
                 }
             }
         }
@@ -78,11 +78,11 @@ impl DemoState {
         match self.presenter.render_tick(time_seconds) {
             Ok(stats) => {
                 if !self.overlay_logged && stats.overlay_frames > 0 {
-                    eprintln!("Kuroko demo overlay active through presenter runtime");
+                    eprintln!("Erika demo overlay active through presenter runtime");
                     self.overlay_logged = true;
                 }
             }
-            Err(error) => eprintln!("Kuroko demo render failed: {error}"),
+            Err(error) => eprintln!("Erika demo render failed: {error}"),
         }
     }
 
@@ -93,7 +93,7 @@ impl DemoState {
             self.presenter.play()
         };
         if let Err(error) = result {
-            eprintln!("Kuroko demo play/pause failed: {error}");
+            eprintln!("Erika demo play/pause failed: {error}");
         }
     }
 
@@ -102,7 +102,7 @@ impl DemoState {
             return;
         }
         if let Err(error) = self.presenter.seek(Duration::from_secs_f64(seconds)) {
-            eprintln!("Kuroko demo seek failed: {error}");
+            eprintln!("Erika demo seek failed: {error}");
         }
     }
 }
@@ -120,7 +120,7 @@ fn demo_overlay_timeline() -> OverlayTimeline {
     let subtitles = SubtitleTimeline::new(vec![SubtitleCue {
         start: Duration::from_millis(500),
         end: Duration::from_secs(4),
-        text: "Kuroko native overlay".to_string(),
+        text: "Erika native overlay".to_string(),
     }]);
     OverlayTimeline::default().with_subtitles(subtitles)
 }
@@ -129,10 +129,10 @@ fn demo_danmaku_timeline() -> DanmakuTimeline {
     if let Some(path) = DANMAKU_PATH.get() {
         match DanmakuTimeline::from_file(path) {
             Ok(timeline) => {
-                eprintln!("Kuroko demo loaded danmaku file: {path}");
+                eprintln!("Erika demo loaded danmaku file: {path}");
                 return timeline;
             }
-            Err(error) => eprintln!("Kuroko demo danmaku load failed: {error}"),
+            Err(error) => eprintln!("Erika demo danmaku load failed: {error}"),
         }
     }
     let mut danmaku = DanmakuTimeline::default();
@@ -143,7 +143,7 @@ fn demo_danmaku_timeline() -> DanmakuTimeline {
             text: "Rust danmaku timeline".to_string(),
             mode: DanmakuMode::Scroll,
             font_size: 32.0,
-            color: kuroko::danmaku::DanmakuColor::WHITE,
+            color: erika::danmaku::DanmakuColor::WHITE,
             opacity: 1.0,
             is_self: false,
         })
@@ -152,56 +152,51 @@ fn demo_danmaku_timeline() -> DanmakuTimeline {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_demo_attach_layer(
-    layer: *mut c_void,
-    width: u32,
-    height: u32,
-    scale: f64,
-) {
+pub extern "C" fn erika_demo_attach_layer(layer: *mut c_void, width: u32, height: u32, scale: f64) {
     let surface =
         PlatformSurface::Metal(MetalSurfaceHandle::new(layer as u64, width, height, scale));
     DEMO.with(|demo| {
         if let Err(error) = demo.borrow_mut().presenter.attach_surface(surface) {
-            eprintln!("Kuroko demo attach failed: {error}");
+            eprintln!("Erika demo attach failed: {error}");
         }
     });
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_demo_resize_layer(width: u32, height: u32, scale: f64) {
+pub extern "C" fn erika_demo_resize_layer(width: u32, height: u32, scale: f64) {
     DEMO.with(|demo| {
         if let Err(error) = demo
             .borrow_mut()
             .presenter
             .resize_surface(width, height, scale)
         {
-            eprintln!("Kuroko demo resize failed: {error}");
+            eprintln!("Erika demo resize failed: {error}");
         }
     });
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_demo_render_frame(time_seconds: f64) {
+pub extern "C" fn erika_demo_render_frame(time_seconds: f64) {
     DEMO.with(|demo| demo.borrow_mut().render(time_seconds));
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_demo_toggle_play_pause() {
+pub extern "C" fn erika_demo_toggle_play_pause() {
     DEMO.with(|demo| demo.borrow_mut().toggle_play_pause());
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_demo_seek_seconds(seconds: f64) {
+pub extern "C" fn erika_demo_seek_seconds(seconds: f64) {
     DEMO.with(|demo| demo.borrow_mut().seek_seconds(seconds));
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_demo_position_seconds() -> f64 {
+pub extern "C" fn erika_demo_position_seconds() -> f64 {
     DEMO.with(|demo| demo.borrow().presenter.media_time().as_secs_f64())
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_demo_duration_seconds() -> f64 {
+pub extern "C" fn erika_demo_duration_seconds() -> f64 {
     DEMO.with(|demo| {
         demo.borrow()
             .presenter
@@ -212,12 +207,12 @@ pub extern "C" fn kuroko_demo_duration_seconds() -> f64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_demo_is_playing() -> bool {
+pub extern "C" fn erika_demo_is_playing() -> bool {
     DEMO.with(|demo| demo.borrow().presenter.is_playing())
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_demo_smoke_seconds() -> f64 {
+pub extern "C" fn erika_demo_smoke_seconds() -> f64 {
     SMOKE_SECONDS.get().copied().unwrap_or(0.0)
 }
 
@@ -241,18 +236,18 @@ fn main() {
         EDR_HEADROOM
             .set(headroom)
             .expect("EDR headroom is set once");
-        eprintln!("Kuroko demo EDR mode: RGBA16Float headroom {headroom:.2}x");
+        eprintln!("Erika demo EDR mode: RGBA16Float headroom {headroom:.2}x");
     }
     if let Some(seconds) = options.smoke_seconds {
         SMOKE_SECONDS
             .set(seconds)
             .expect("smoke seconds is set once");
-        eprintln!("Kuroko demo smoke mode: exit after {seconds:.2}s");
+        eprintln!("Erika demo smoke mode: exit after {seconds:.2}s");
     }
     if let Some(uri) = options.media_uri {
         MEDIA_URI.set(uri).expect("media URI is set once");
     }
-    unsafe { kuroko_demo_run_app() };
+    unsafe { erika_demo_run_app() };
 }
 
 #[derive(Debug, Clone, PartialEq)]

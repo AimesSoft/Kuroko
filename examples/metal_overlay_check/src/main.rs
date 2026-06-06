@@ -2,25 +2,25 @@ use std::ffi::c_void;
 use std::process;
 use std::time::Duration;
 
-use kuroko::overlay::{OverlayFrame, OverlayViewport};
-use kuroko::renderer::metal::{MetalRenderer, OverlayRenderFrame};
-use kuroko::subtitle::SubtitleBitmapPlane;
-use kuroko::{MetalSurfaceHandle, PlatformSurface, RendererBackend};
+use erika::overlay::{OverlayFrame, OverlayViewport};
+use erika::renderer::metal::{MetalRenderer, OverlayRenderFrame};
+use erika::subtitle::SubtitleBitmapPlane;
+use erika::{MetalSurfaceHandle, PlatformSurface, RendererBackend};
 
 unsafe extern "C" {
-    fn kuroko_presenter_check_create_layer(width: f64, height: f64, scale: f64) -> *mut c_void;
-    fn kuroko_presenter_check_release_layer(layer: *mut c_void);
+    fn erika_presenter_check_create_layer(width: f64, height: f64, scale: f64) -> *mut c_void;
+    fn erika_presenter_check_release_layer(layer: *mut c_void);
 }
 
 fn main() {
-    let layer = unsafe { kuroko_presenter_check_create_layer(640.0, 360.0, 2.0) };
+    let layer = unsafe { erika_presenter_check_create_layer(640.0, 360.0, 2.0) };
     if layer.is_null() {
         eprintln!("failed to create CAMetalLayer");
         process::exit(1);
     }
 
     let result = run_check(layer);
-    unsafe { kuroko_presenter_check_release_layer(layer) };
+    unsafe { erika_presenter_check_release_layer(layer) };
     if let Err(error) = result {
         eprintln!("metal overlay check failed: {error}");
         process::exit(1);

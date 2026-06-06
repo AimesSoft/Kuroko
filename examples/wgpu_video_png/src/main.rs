@@ -2,7 +2,7 @@
 //! pipeline and writes the result to a PNG. A visual smoke test for the wgpu
 //! YCbCr->RGB path: the output PNG should show clean SMPTE-style color bars.
 
-use kuroko::renderer::wgpu::{VideoUniforms, WgpuRenderer};
+use erika::renderer::wgpu::{VideoUniforms, WgpuRenderer};
 
 const WIDTH: u32 = 256;
 const HEIGHT: u32 = 144;
@@ -93,7 +93,7 @@ fn main() {
 
     let path = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "/tmp/kuroko_wgpu_bars.png".to_string());
+        .unwrap_or_else(|| "/tmp/erika_wgpu_bars.png".to_string());
     let file = std::fs::File::create(&path).expect("create png file");
     let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), WIDTH, HEIGHT);
     encoder.set_color(png::ColorType::Rgba);

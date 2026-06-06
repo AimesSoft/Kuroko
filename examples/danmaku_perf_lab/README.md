@@ -1,6 +1,6 @@
-# Kuroko Danmaku Perf Lab
+# Erika Danmaku Perf Lab
 
-Controlled danmaku performance harness for Kuroko. This is intentionally outside
+Controlled danmaku performance harness for Erika. This is intentionally outside
 NipaPlay so danmaku density, viewport size, media time, video decode, and trace
 output can be varied without Flutter/UI noise.
 
@@ -49,7 +49,7 @@ cargo run --release -p danmaku_perf_lab -- \
   --window-size 1600x900 \
   --hide-panel \
   --surface-scale 1.0 \
-  --metrics-log /tmp/kuroko_lab_stress.jsonl \
+  --metrics-log /tmp/erika_lab_stress.jsonl \
   --auto-exit 18
 ```
 

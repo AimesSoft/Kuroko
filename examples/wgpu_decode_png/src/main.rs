@@ -1,4 +1,4 @@
-//! Decodes a video frame with Kuroko (software path) and renders it through the
+//! Decodes a video frame with Erika (software path) and renders it through the
 //! wgpu backend's `upload_player_frame` -> `render_current_offscreen` path, writing
 //! the result to a PNG. End-to-end proof that wgpu renders real decoded frames.
 //!
@@ -8,9 +8,9 @@ use std::env;
 use std::process;
 use std::time::Duration;
 
-use kuroko::ffmpeg::{DecoderOutputFrame, Demuxer, Frame, StreamSelection};
-use kuroko::renderer::wgpu::WgpuRenderer;
-use kuroko::{PlayerVideoFrame, RendererBackend, TrackKind};
+use erika::ffmpeg::{DecoderOutputFrame, Demuxer, Frame, StreamSelection};
+use erika::renderer::wgpu::WgpuRenderer;
+use erika::{PlayerVideoFrame, RendererBackend, TrackKind};
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -20,7 +20,7 @@ fn main() {
     });
     let out = args
         .next()
-        .unwrap_or_else(|| "/tmp/kuroko_wgpu_decode.png".to_string());
+        .unwrap_or_else(|| "/tmp/erika_wgpu_decode.png".to_string());
     let target_index: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(8);
 
     let mut demuxer = Demuxer::open_uri(&uri).unwrap_or_else(|error| {

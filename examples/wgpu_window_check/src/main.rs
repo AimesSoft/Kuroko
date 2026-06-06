@@ -8,15 +8,15 @@ use std::ffi::c_void;
 use std::process;
 use std::time::Duration;
 
-use kuroko::renderer::wgpu::{VideoUniforms, WgpuRenderer};
-use kuroko::{
+use erika::renderer::wgpu::{VideoUniforms, WgpuRenderer};
+use erika::{
     PlatformSurface, RenderFrameContext, RendererBackend, WgpuSurfaceHandle, WgpuSurfaceKind,
 };
 
 unsafe extern "C" {
-    fn kuroko_wgpu_window_create(width: f64, height: f64, scale: f64) -> *mut c_void;
-    fn kuroko_wgpu_window_pump();
-    fn kuroko_wgpu_window_release(layer: *mut c_void);
+    fn erika_wgpu_window_create(width: f64, height: f64, scale: f64) -> *mut c_void;
+    fn erika_wgpu_window_pump();
+    fn erika_wgpu_window_release(layer: *mut c_void);
 }
 
 const WIDTH: u32 = 320;
@@ -40,13 +40,13 @@ fn main() {
         .unwrap_or(3.0);
     let scale = 2.0;
 
-    let layer = unsafe { kuroko_wgpu_window_create(f64::from(WIDTH), f64::from(HEIGHT), scale) };
+    let layer = unsafe { erika_wgpu_window_create(f64::from(WIDTH), f64::from(HEIGHT), scale) };
     if layer.is_null() {
         eprintln!("failed to create window/layer");
         process::exit(1);
     }
     let result = run(layer, scale, seconds);
-    unsafe { kuroko_wgpu_window_release(layer) };
+    unsafe { erika_wgpu_window_release(layer) };
     match result {
         Ok(()) => println!("wgpu window check OK"),
         Err(error) => {
@@ -85,7 +85,7 @@ fn run(layer: *mut c_void, scale: f64, seconds: f64) -> Result<(), String> {
         {
             return Err("render_current_frame returned false (no surface/frame)".to_string());
         }
-        unsafe { kuroko_wgpu_window_pump() };
+        unsafe { erika_wgpu_window_pump() };
         std::thread::sleep(Duration::from_millis(16));
     }
     println!(

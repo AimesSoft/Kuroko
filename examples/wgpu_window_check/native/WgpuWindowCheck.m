@@ -3,7 +3,7 @@
 
 // Creates a visible titled window hosting a CAMetalLayer and returns the layer.
 // The wgpu renderer attaches to this layer as a CoreAnimationLayer surface.
-void *kuroko_wgpu_window_create(double width, double height, double scale) {
+void *erika_wgpu_window_create(double width, double height, double scale) {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 
@@ -13,7 +13,7 @@ void *kuroko_wgpu_window_create(double width, double height, double scale) {
                   styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
                     backing:NSBackingStoreBuffered
                       defer:NO];
-    [window setTitle:@"Kuroko wgpu"];
+    [window setTitle:@"Erika wgpu"];
     [window setReleasedWhenClosed:NO];
 
     NSView *view = [window contentView];
@@ -44,7 +44,7 @@ void *kuroko_wgpu_window_create(double width, double height, double scale) {
 }
 
 // Drains pending AppKit events so the window stays responsive between frames.
-void kuroko_wgpu_window_pump(void) {
+void erika_wgpu_window_pump(void) {
     NSEvent *event;
     while ((event = [NSApp nextEventMatchingMask:NSEventMaskAny
                                        untilDate:[NSDate dateWithTimeIntervalSinceNow:0.001]
@@ -54,7 +54,7 @@ void kuroko_wgpu_window_pump(void) {
     }
 }
 
-void kuroko_wgpu_window_release(void *rawLayer) {
+void erika_wgpu_window_release(void *rawLayer) {
     if (rawLayer != NULL) {
         CFRelease(rawLayer);
     }

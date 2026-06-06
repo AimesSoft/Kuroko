@@ -1,0 +1,15 @@
+[package]
+name = "erika_capi"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+crossbeam-channel.workspace = true
+erika = { path = "../erika" }
+serde_json.workspace = true

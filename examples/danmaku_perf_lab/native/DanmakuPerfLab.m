@@ -1,34 +1,34 @@
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
 
-extern void kuroko_perf_lab_attach_layer(void *layer, unsigned int width, unsigned int height, double scale);
-extern void kuroko_perf_lab_resize_layer(unsigned int width, unsigned int height, double scale);
-extern void kuroko_perf_lab_render_frame(double host_time_seconds);
-extern bool kuroko_perf_lab_should_auto_exit(void);
-extern void kuroko_perf_lab_toggle_play_pause(void);
-extern void kuroko_perf_lab_seek_seconds(double seconds);
-extern double kuroko_perf_lab_position_seconds(void);
-extern double kuroko_perf_lab_duration_seconds(void);
-extern bool kuroko_perf_lab_is_playing(void);
-extern const char *kuroko_perf_lab_metrics_text(void);
-extern void kuroko_perf_lab_set_density(double comments_per_second);
-extern void kuroko_perf_lab_set_font_size(double font_size);
-extern void kuroko_perf_lab_set_display_area(double display_area);
-extern void kuroko_perf_lab_set_outline(double outline_width);
-extern double kuroko_perf_lab_density(void);
-extern double kuroko_perf_lab_font_size(void);
-extern double kuroko_perf_lab_display_area(void);
-extern double kuroko_perf_lab_outline(void);
-extern double kuroko_perf_lab_window_width(void);
-extern double kuroko_perf_lab_window_height(void);
-extern bool kuroko_perf_lab_fullscreen(void);
-extern bool kuroko_perf_lab_uncapped(void);
-extern double kuroko_perf_lab_target_fps(void);
-extern bool kuroko_perf_lab_hide_panel(void);
-extern double kuroko_perf_lab_surface_scale_override(void);
-extern void kuroko_perf_lab_run_app(void);
+extern void erika_perf_lab_attach_layer(void *layer, unsigned int width, unsigned int height, double scale);
+extern void erika_perf_lab_resize_layer(unsigned int width, unsigned int height, double scale);
+extern void erika_perf_lab_render_frame(double host_time_seconds);
+extern bool erika_perf_lab_should_auto_exit(void);
+extern void erika_perf_lab_toggle_play_pause(void);
+extern void erika_perf_lab_seek_seconds(double seconds);
+extern double erika_perf_lab_position_seconds(void);
+extern double erika_perf_lab_duration_seconds(void);
+extern bool erika_perf_lab_is_playing(void);
+extern const char *erika_perf_lab_metrics_text(void);
+extern void erika_perf_lab_set_density(double comments_per_second);
+extern void erika_perf_lab_set_font_size(double font_size);
+extern void erika_perf_lab_set_display_area(double display_area);
+extern void erika_perf_lab_set_outline(double outline_width);
+extern double erika_perf_lab_density(void);
+extern double erika_perf_lab_font_size(void);
+extern double erika_perf_lab_display_area(void);
+extern double erika_perf_lab_outline(void);
+extern double erika_perf_lab_window_width(void);
+extern double erika_perf_lab_window_height(void);
+extern bool erika_perf_lab_fullscreen(void);
+extern bool erika_perf_lab_uncapped(void);
+extern double erika_perf_lab_target_fps(void);
+extern bool erika_perf_lab_hide_panel(void);
+extern double erika_perf_lab_surface_scale_override(void);
+extern void erika_perf_lab_run_app(void);
 
-static NSString *KurokoLabFormatTime(double seconds) {
+static NSString *ErikaLabFormatTime(double seconds) {
   if (!isfinite(seconds) || seconds < 0.0) {
     seconds = 0.0;
   }
@@ -42,14 +42,14 @@ static NSString *KurokoLabFormatTime(double seconds) {
   return [NSString stringWithFormat:@"%ld:%02ld", (long)minutes, (long)secs];
 }
 
-@interface KurokoPerfLabVideoView : NSView
+@interface ErikaPerfLabVideoView : NSView
 @property(nonatomic, strong) CAMetalLayer *metalLayer;
 @property(nonatomic, strong) NSTimer *timer;
 @property(nonatomic, assign) CFTimeInterval startTime;
 @property(nonatomic, assign) BOOL uncappedPumpActive;
 @end
 
-@implementation KurokoPerfLabVideoView
+@implementation ErikaPerfLabVideoView
 
 - (instancetype)initWithFrame:(NSRect)frameRect {
   self = [super initWithFrame:frameRect];
@@ -60,7 +60,7 @@ static NSString *KurokoLabFormatTime(double seconds) {
     self.metalLayer.framebufferOnly = YES;
     self.metalLayer.opaque = YES;
     if ([self.metalLayer respondsToSelector:@selector(setDisplaySyncEnabled:)]) {
-      self.metalLayer.displaySyncEnabled = !kuroko_perf_lab_uncapped();
+      self.metalLayer.displaySyncEnabled = !erika_perf_lab_uncapped();
     }
     self.layer = self.metalLayer;
     self.startTime = CACurrentMediaTime();
@@ -76,11 +76,11 @@ static NSString *KurokoLabFormatTime(double seconds) {
   [super viewDidMoveToWindow];
   [self updateDrawableSizeAndAttach:YES];
   if (self.window != nil && self.timer == nil) {
-    if (kuroko_perf_lab_uncapped()) {
+    if (erika_perf_lab_uncapped()) {
       self.uncappedPumpActive = YES;
       [self scheduleUncappedRenderTick];
     } else {
-      double targetFps = kuroko_perf_lab_target_fps();
+      double targetFps = erika_perf_lab_target_fps();
       if (!isfinite(targetFps) || targetFps <= 0.0) {
         targetFps = 60.0;
       }
@@ -115,7 +115,7 @@ static NSString *KurokoLabFormatTime(double seconds) {
 
 - (void)updateDrawableSizeAndAttach:(BOOL)attach {
   CGFloat scale = self.window.backingScaleFactor > 0 ? self.window.backingScaleFactor : NSScreen.mainScreen.backingScaleFactor;
-  double scaleOverride = kuroko_perf_lab_surface_scale_override();
+  double scaleOverride = erika_perf_lab_surface_scale_override();
   if (isfinite(scaleOverride) && scaleOverride > 0.0) {
     scale = (CGFloat)scaleOverride;
   }
@@ -123,29 +123,29 @@ static NSString *KurokoLabFormatTime(double seconds) {
   self.metalLayer.drawableSize = drawableSize;
   self.metalLayer.frame = self.bounds;
   if (attach) {
-    kuroko_perf_lab_attach_layer((__bridge void *)self.metalLayer, (unsigned int)self.bounds.size.width, (unsigned int)self.bounds.size.height, scale);
+    erika_perf_lab_attach_layer((__bridge void *)self.metalLayer, (unsigned int)self.bounds.size.width, (unsigned int)self.bounds.size.height, scale);
   } else {
-    kuroko_perf_lab_resize_layer((unsigned int)self.bounds.size.width, (unsigned int)self.bounds.size.height, scale);
+    erika_perf_lab_resize_layer((unsigned int)self.bounds.size.width, (unsigned int)self.bounds.size.height, scale);
   }
 }
 
 - (void)renderTick:(NSTimer *)timer {
   (void)timer;
-  kuroko_perf_lab_render_frame(CACurrentMediaTime() - self.startTime);
-  if (kuroko_perf_lab_should_auto_exit()) {
+  erika_perf_lab_render_frame(CACurrentMediaTime() - self.startTime);
+  if (erika_perf_lab_should_auto_exit()) {
     [NSApp terminate:nil];
   }
 }
 
 - (void)scheduleUncappedRenderTick {
-  __weak KurokoPerfLabVideoView *weakSelf = self;
+  __weak ErikaPerfLabVideoView *weakSelf = self;
   dispatch_async(dispatch_get_main_queue(), ^{
-    KurokoPerfLabVideoView *strongSelf = weakSelf;
+    ErikaPerfLabVideoView *strongSelf = weakSelf;
     if (strongSelf == nil || !strongSelf.uncappedPumpActive || strongSelf.window == nil) {
       return;
     }
-    kuroko_perf_lab_render_frame(CACurrentMediaTime() - strongSelf.startTime);
-    if (kuroko_perf_lab_should_auto_exit()) {
+    erika_perf_lab_render_frame(CACurrentMediaTime() - strongSelf.startTime);
+    if (erika_perf_lab_should_auto_exit()) {
       [NSApp terminate:nil];
       return;
     }
@@ -155,13 +155,13 @@ static NSString *KurokoLabFormatTime(double seconds) {
 
 @end
 
-@interface KurokoPerfLabSliderRow : NSView
+@interface ErikaPerfLabSliderRow : NSView
 @property(nonatomic, strong) NSTextField *titleLabel;
 @property(nonatomic, strong) NSSlider *slider;
 @property(nonatomic, strong) NSTextField *valueLabel;
 @end
 
-@implementation KurokoPerfLabSliderRow
+@implementation ErikaPerfLabSliderRow
 
 - (instancetype)initWithTitle:(NSString *)title min:(double)min max:(double)max value:(double)value target:(id)target action:(SEL)action {
   self = [super initWithFrame:NSZeroRect];
@@ -208,17 +208,17 @@ static NSString *KurokoLabFormatTime(double seconds) {
 
 @end
 
-@interface KurokoPerfLabPanel : NSView
+@interface ErikaPerfLabPanel : NSView
 @property(nonatomic, strong) NSScrollView *metricsScrollView;
 @property(nonatomic, strong) NSTextView *metricsTextView;
-@property(nonatomic, strong) KurokoPerfLabSliderRow *densityRow;
-@property(nonatomic, strong) KurokoPerfLabSliderRow *fontRow;
-@property(nonatomic, strong) KurokoPerfLabSliderRow *areaRow;
-@property(nonatomic, strong) KurokoPerfLabSliderRow *outlineRow;
+@property(nonatomic, strong) ErikaPerfLabSliderRow *densityRow;
+@property(nonatomic, strong) ErikaPerfLabSliderRow *fontRow;
+@property(nonatomic, strong) ErikaPerfLabSliderRow *areaRow;
+@property(nonatomic, strong) ErikaPerfLabSliderRow *outlineRow;
 @property(nonatomic, strong) NSTimer *timer;
 @end
 
-@implementation KurokoPerfLabPanel
+@implementation ErikaPerfLabPanel
 
 - (instancetype)initWithFrame:(NSRect)frameRect {
   self = [super initWithFrame:frameRect];
@@ -232,10 +232,10 @@ static NSString *KurokoLabFormatTime(double seconds) {
     title.translatesAutoresizingMaskIntoConstraints = NO;
     [self addSubview:title];
 
-    self.densityRow = [[KurokoPerfLabSliderRow alloc] initWithTitle:@"Density / s" min:1.0 max:600.0 value:kuroko_perf_lab_density() target:self action:@selector(densityChanged:)];
-    self.fontRow = [[KurokoPerfLabSliderRow alloc] initWithTitle:@"Font size" min:12.0 max:72.0 value:kuroko_perf_lab_font_size() target:self action:@selector(fontChanged:)];
-    self.areaRow = [[KurokoPerfLabSliderRow alloc] initWithTitle:@"Display area" min:0.25 max:1.0 value:kuroko_perf_lab_display_area() target:self action:@selector(areaChanged:)];
-    self.outlineRow = [[KurokoPerfLabSliderRow alloc] initWithTitle:@"Outline" min:0.0 max:5.0 value:kuroko_perf_lab_outline() target:self action:@selector(outlineChanged:)];
+    self.densityRow = [[ErikaPerfLabSliderRow alloc] initWithTitle:@"Density / s" min:1.0 max:600.0 value:erika_perf_lab_density() target:self action:@selector(densityChanged:)];
+    self.fontRow = [[ErikaPerfLabSliderRow alloc] initWithTitle:@"Font size" min:12.0 max:72.0 value:erika_perf_lab_font_size() target:self action:@selector(fontChanged:)];
+    self.areaRow = [[ErikaPerfLabSliderRow alloc] initWithTitle:@"Display area" min:0.25 max:1.0 value:erika_perf_lab_display_area() target:self action:@selector(areaChanged:)];
+    self.outlineRow = [[ErikaPerfLabSliderRow alloc] initWithTitle:@"Outline" min:0.0 max:5.0 value:erika_perf_lab_outline() target:self action:@selector(outlineChanged:)];
     [self addSubview:self.densityRow];
     [self addSubview:self.fontRow];
     [self addSubview:self.areaRow];
@@ -310,38 +310,38 @@ static NSString *KurokoLabFormatTime(double seconds) {
 }
 
 - (void)densityChanged:(NSSlider *)sender {
-  kuroko_perf_lab_set_density(sender.doubleValue);
+  erika_perf_lab_set_density(sender.doubleValue);
   [self refreshPanel:nil];
 }
 
 - (void)fontChanged:(NSSlider *)sender {
-  kuroko_perf_lab_set_font_size(sender.doubleValue);
+  erika_perf_lab_set_font_size(sender.doubleValue);
   [self refreshPanel:nil];
 }
 
 - (void)areaChanged:(NSSlider *)sender {
-  kuroko_perf_lab_set_display_area(sender.doubleValue);
+  erika_perf_lab_set_display_area(sender.doubleValue);
   [self refreshPanel:nil];
 }
 
 - (void)outlineChanged:(NSSlider *)sender {
-  kuroko_perf_lab_set_outline(sender.doubleValue);
+  erika_perf_lab_set_outline(sender.doubleValue);
   [self refreshPanel:nil];
 }
 
 - (void)refreshPanel:(NSTimer *)timer {
   (void)timer;
-  self.densityRow.valueLabel.stringValue = [NSString stringWithFormat:@"%.0f", kuroko_perf_lab_density()];
-  self.fontRow.valueLabel.stringValue = [NSString stringWithFormat:@"%.1f", kuroko_perf_lab_font_size()];
-  self.areaRow.valueLabel.stringValue = [NSString stringWithFormat:@"%.2f", kuroko_perf_lab_display_area()];
-  self.outlineRow.valueLabel.stringValue = [NSString stringWithFormat:@"%.1f", kuroko_perf_lab_outline()];
-  const char *metrics = kuroko_perf_lab_metrics_text();
+  self.densityRow.valueLabel.stringValue = [NSString stringWithFormat:@"%.0f", erika_perf_lab_density()];
+  self.fontRow.valueLabel.stringValue = [NSString stringWithFormat:@"%.1f", erika_perf_lab_font_size()];
+  self.areaRow.valueLabel.stringValue = [NSString stringWithFormat:@"%.2f", erika_perf_lab_display_area()];
+  self.outlineRow.valueLabel.stringValue = [NSString stringWithFormat:@"%.1f", erika_perf_lab_outline()];
+  const char *metrics = erika_perf_lab_metrics_text();
   self.metricsTextView.string = metrics != NULL ? [NSString stringWithUTF8String:metrics] : @"";
 }
 
 @end
 
-@interface KurokoPerfLabControls : NSView
+@interface ErikaPerfLabControls : NSView
 @property(nonatomic, strong) NSButton *playPauseButton;
 @property(nonatomic, strong) NSSlider *progressSlider;
 @property(nonatomic, strong) NSTextField *timeLabel;
@@ -349,7 +349,7 @@ static NSString *KurokoLabFormatTime(double seconds) {
 @property(nonatomic, assign) BOOL scrubbing;
 @end
 
-@implementation KurokoPerfLabControls
+@implementation ErikaPerfLabControls
 
 - (instancetype)initWithFrame:(NSRect)frameRect {
   self = [super initWithFrame:frameRect];
@@ -418,44 +418,44 @@ static NSString *KurokoLabFormatTime(double seconds) {
 
 - (void)togglePlayPause:(id)sender {
   (void)sender;
-  kuroko_perf_lab_toggle_play_pause();
+  erika_perf_lab_toggle_play_pause();
   [self refreshControls:nil];
 }
 
 - (void)sliderChanged:(NSSlider *)sender {
-  double duration = kuroko_perf_lab_duration_seconds();
+  double duration = erika_perf_lab_duration_seconds();
   if (duration <= 0.0 || !isfinite(duration)) {
     return;
   }
   self.scrubbing = YES;
-  kuroko_perf_lab_seek_seconds(sender.doubleValue);
+  erika_perf_lab_seek_seconds(sender.doubleValue);
   [self refreshControls:nil];
   self.scrubbing = NO;
 }
 
 - (void)refreshControls:(NSTimer *)timer {
   (void)timer;
-  double duration = kuroko_perf_lab_duration_seconds();
-  double position = kuroko_perf_lab_position_seconds();
+  double duration = erika_perf_lab_duration_seconds();
+  double position = erika_perf_lab_position_seconds();
   BOOL hasDuration = duration > 0.0 && isfinite(duration);
   self.progressSlider.enabled = hasDuration;
   self.progressSlider.maxValue = hasDuration ? duration : 1.0;
   if (!self.scrubbing) {
     self.progressSlider.doubleValue = hasDuration ? MIN(MAX(position, 0.0), duration) : 0.0;
   }
-  self.playPauseButton.title = kuroko_perf_lab_is_playing() ? @"Pause" : @"Play";
-  self.timeLabel.stringValue = [NSString stringWithFormat:@"%@ / %@", KurokoLabFormatTime(position), KurokoLabFormatTime(duration)];
+  self.playPauseButton.title = erika_perf_lab_is_playing() ? @"Pause" : @"Play";
+  self.timeLabel.stringValue = [NSString stringWithFormat:@"%@ / %@", ErikaLabFormatTime(position), ErikaLabFormatTime(duration)];
 }
 
 @end
 
-@interface KurokoPerfLabRootView : NSView
-@property(nonatomic, strong) KurokoPerfLabVideoView *videoView;
-@property(nonatomic, strong) KurokoPerfLabPanel *panelView;
-@property(nonatomic, strong) KurokoPerfLabControls *controlsView;
+@interface ErikaPerfLabRootView : NSView
+@property(nonatomic, strong) ErikaPerfLabVideoView *videoView;
+@property(nonatomic, strong) ErikaPerfLabPanel *panelView;
+@property(nonatomic, strong) ErikaPerfLabControls *controlsView;
 @end
 
-@implementation KurokoPerfLabRootView
+@implementation ErikaPerfLabRootView
 
 - (instancetype)initWithFrame:(NSRect)frameRect {
   self = [super initWithFrame:frameRect];
@@ -463,19 +463,19 @@ static NSString *KurokoLabFormatTime(double seconds) {
     self.wantsLayer = YES;
     self.layer.backgroundColor = NSColor.blackColor.CGColor;
 
-    self.videoView = [[KurokoPerfLabVideoView alloc] initWithFrame:NSZeroRect];
+    self.videoView = [[ErikaPerfLabVideoView alloc] initWithFrame:NSZeroRect];
     self.videoView.translatesAutoresizingMaskIntoConstraints = NO;
     [self addSubview:self.videoView];
 
-    self.panelView = [[KurokoPerfLabPanel alloc] initWithFrame:NSZeroRect];
+    self.panelView = [[ErikaPerfLabPanel alloc] initWithFrame:NSZeroRect];
     self.panelView.translatesAutoresizingMaskIntoConstraints = NO;
     [self addSubview:self.panelView];
 
-    self.controlsView = [[KurokoPerfLabControls alloc] initWithFrame:NSZeroRect];
+    self.controlsView = [[ErikaPerfLabControls alloc] initWithFrame:NSZeroRect];
     self.controlsView.translatesAutoresizingMaskIntoConstraints = NO;
     [self addSubview:self.controlsView];
 
-    BOOL hidePanel = kuroko_perf_lab_hide_panel();
+    BOOL hidePanel = erika_perf_lab_hide_panel();
     [NSLayoutConstraint activateConstraints:@[
       [self.videoView.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
       [self.videoView.topAnchor constraintEqualToAnchor:self.topAnchor],
@@ -497,18 +497,18 @@ static NSString *KurokoLabFormatTime(double seconds) {
 
 @end
 
-@interface KurokoPerfLabDelegate : NSObject <NSApplicationDelegate>
+@interface ErikaPerfLabDelegate : NSObject <NSApplicationDelegate>
 @property(nonatomic, strong) NSWindow *window;
 @end
 
-@implementation KurokoPerfLabDelegate
+@implementation ErikaPerfLabDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
   (void)notification;
   NSRect visibleFrame = NSScreen.mainScreen.visibleFrame;
-  BOOL fullscreen = kuroko_perf_lab_fullscreen();
-  double requestedWidth = kuroko_perf_lab_window_width();
-  double requestedHeight = kuroko_perf_lab_window_height();
+  BOOL fullscreen = erika_perf_lab_fullscreen();
+  double requestedWidth = erika_perf_lab_window_width();
+  double requestedHeight = erika_perf_lab_window_height();
   CGFloat width = fullscreen ? visibleFrame.size.width : (requestedWidth > 0.0 ? MIN((CGFloat)requestedWidth, visibleFrame.size.width * 0.96) : MIN(1280.0, visibleFrame.size.width * 0.90));
   CGFloat height = fullscreen ? visibleFrame.size.height : (requestedHeight > 0.0 ? MIN((CGFloat)requestedHeight, visibleFrame.size.height * 0.90) : MIN(720.0, visibleFrame.size.height * 0.78));
   NSRect frame = fullscreen ? visibleFrame : NSMakeRect(NSMidX(visibleFrame) - width * 0.5,
@@ -522,8 +522,8 @@ static NSString *KurokoLabFormatTime(double seconds) {
                                                        NSWindowStyleMaskResizable)
                                               backing:NSBackingStoreBuffered
                                                 defer:NO];
-  self.window.title = @"Kuroko Danmaku Perf Lab";
-  self.window.contentView = [[KurokoPerfLabRootView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
+  self.window.title = @"Erika Danmaku Perf Lab";
+  self.window.contentView = [[ErikaPerfLabRootView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
   [self.window makeKeyAndOrderFront:nil];
   [NSApp activateIgnoringOtherApps:YES];
 }
@@ -535,11 +535,11 @@ static NSString *KurokoLabFormatTime(double seconds) {
 
 @end
 
-void kuroko_perf_lab_run_app(void) {
+void erika_perf_lab_run_app(void) {
   @autoreleasepool {
     NSApplication *app = [NSApplication sharedApplication];
     app.activationPolicy = NSApplicationActivationPolicyRegular;
-    KurokoPerfLabDelegate *delegate = [[KurokoPerfLabDelegate alloc] init];
+    ErikaPerfLabDelegate *delegate = [[ErikaPerfLabDelegate alloc] init];
     app.delegate = delegate;
     [app run];
   }

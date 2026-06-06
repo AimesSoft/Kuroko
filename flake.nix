@@ -1,5 +1,5 @@
 {
-  description = "Kuroko Rust-first media player development shell";
+  description = "Erika Rust-first media player development shell";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -54,8 +54,8 @@
             shellHook = ''
               export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
               export BINDGEN_EXTRA_CLANG_ARGS="-I${pkgs.llvmPackages.libclang.lib}/lib/clang/${pkgs.llvmPackages.libclang.version}/include $BINDGEN_EXTRA_CLANG_ARGS"
-              export KUROKO_NATIVE_PROFILE="''${KUROKO_NATIVE_PROFILE:-lgpl}"
-              echo "Kuroko dev shell ready ($KUROKO_NATIVE_PROFILE)"
+              export ERIKA_NATIVE_PROFILE="''${ERIKA_NATIVE_PROFILE:-lgpl}"
+              echo "Erika dev shell ready ($ERIKA_NATIVE_PROFILE)"
             '';
           };
         });

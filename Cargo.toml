@@ -1,8 +1,8 @@
 [workspace]
 members = [
-  "crates/kuroko",
-  "crates/kuroko_capi",
-  "crates/kuroko_ffmpeg_sys",
+  "crates/erika",
+  "crates/erika_capi",
+  "crates/erika_ffmpeg_sys",
   "examples/capi_smoke",
   "examples/ffmpeg_audio_decode",
   "examples/ffmpeg_decode",
@@ -32,7 +32,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MPL-2.0"
-repository = "https://github.com/AimesSoft/Kuroko"
+repository = "https://github.com/AimesSoft/Erika"
 rust-version = "1.92"
 version = "0.0.1"
 

@@ -7,4 +7,4 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-kuroko_capi = { path = "../../crates/kuroko_capi" }
+erika_capi = { path = "../../crates/erika_capi" }
