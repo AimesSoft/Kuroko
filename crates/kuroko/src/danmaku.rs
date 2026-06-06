@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ab_glyph::{Font, FontArc, Glyph, PxScale, ScaleFont};
+use ab_glyph::{Font, FontArc, FontVec, Glyph, GlyphId, PxScale, ScaleFont};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -872,6 +872,150 @@ struct PreparedGlyphPlacement {
     pen_x: f32,
 }
 
+#[derive(Debug, Clone)]
+struct DanmakuFontFace {
+    id: u32,
+    font: Arc<FontArc>,
+}
+
+impl DanmakuFontFace {
+    fn new(id: u32, font: FontArc) -> Self {
+        Self {
+            id,
+            font: Arc::new(font),
+        }
+    }
+
+    fn glyph_id(&self, ch: char) -> GlyphId {
+        self.font.glyph_id(ch)
+    }
+
+    fn has_glyph(&self, ch: char) -> bool {
+        ch.is_whitespace() || self.glyph_id(ch).0 != 0
+    }
+}
+
+#[derive(Debug)]
+struct SystemFontFallback {
+    db: fontdb::Database,
+    faces: Vec<fontdb::ID>,
+    loaded: HashMap<fontdb::ID, Option<DanmakuFontFace>>,
+    char_cache: HashMap<char, Option<u32>>,
+    next_font_id: u32,
+}
+
+impl SystemFontFallback {
+    fn new(next_font_id: u32) -> Self {
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        let preferred = [
+            "PingFang SC",
+            "Hiragino Sans GB",
+            "Hiragino Sans",
+            "Apple SD Gothic Neo",
+            "Songti SC",
+            "STHeiti",
+            "Microsoft YaHei",
+            "SimHei",
+            "Noto Sans CJK SC",
+            "Noto Sans CJK JP",
+            "Noto Sans CJK",
+            "Source Han Sans SC",
+            "Source Han Sans",
+            "Arial Unicode MS",
+            "Arial Unicode",
+            "Segoe UI Symbol",
+        ];
+        let mut faces = Vec::new();
+        for family in preferred {
+            let query = fontdb::Query {
+                families: &[fontdb::Family::Name(family)],
+                weight: fontdb::Weight::NORMAL,
+                stretch: fontdb::Stretch::Normal,
+                style: fontdb::Style::Normal,
+            };
+            if let Some(id) = db.query(&query) {
+                push_unique_face(&mut faces, id);
+            }
+        }
+        for family in [fontdb::Family::SansSerif, fontdb::Family::Serif] {
+            let query = fontdb::Query {
+                families: &[family],
+                weight: fontdb::Weight::NORMAL,
+                stretch: fontdb::Stretch::Normal,
+                style: fontdb::Style::Normal,
+            };
+            if let Some(id) = db.query(&query) {
+                push_unique_face(&mut faces, id);
+            }
+        }
+        let face_infos = db.faces().map(|face| face.id).collect::<Vec<_>>();
+        for id in face_infos {
+            push_unique_face(&mut faces, id);
+        }
+        Self {
+            db,
+            faces,
+            loaded: HashMap::new(),
+            char_cache: HashMap::new(),
+            next_font_id,
+        }
+    }
+
+    fn resolve(&mut self, ch: char) -> Option<DanmakuFontFace> {
+        if let Some(font_id) = self.char_cache.get(&ch).copied() {
+            return font_id.and_then(|font_id| self.loaded_font_by_id(font_id));
+        }
+        let faces = self.faces.clone();
+        for face_id in faces {
+            let Some(face) = self.load_face(face_id) else {
+                continue;
+            };
+            if face.has_glyph(ch) {
+                self.char_cache.insert(ch, Some(face.id));
+                return Some(face);
+            }
+        }
+        self.char_cache.insert(ch, None);
+        None
+    }
+
+    fn loaded_font_by_id(&self, font_id: u32) -> Option<DanmakuFontFace> {
+        self.loaded
+            .values()
+            .filter_map(|face| face.as_ref())
+            .find(|face| face.id == font_id)
+            .cloned()
+    }
+
+    fn load_face(&mut self, id: fontdb::ID) -> Option<DanmakuFontFace> {
+        if let Some(face) = self.loaded.get(&id) {
+            return face.clone();
+        }
+        let font = self
+            .db
+            .with_face_data(id, |data, face_index| {
+                FontVec::try_from_vec_and_index(data.to_vec(), face_index)
+                    .map(FontArc::new)
+                    .ok()
+            })
+            .flatten();
+        let face = font.map(|font| {
+            let id = self.next_font_id;
+            self.next_font_id = self.next_font_id.saturating_add(1).max(1);
+            DanmakuFontFace::new(id, font)
+        });
+        self.loaded.insert(id, face.clone());
+        face
+    }
+}
+
+fn push_unique_face(faces: &mut Vec<fontdb::ID>, id: fontdb::ID) {
+    if !faces.contains(&id) {
+        faces.push(id);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TextLayoutCacheKey {
     text: Arc<str>,
@@ -901,7 +1045,8 @@ impl TextLayoutCacheKey {
 #[derive(Debug, Clone)]
 pub struct DanmakuTextRasterizer {
     shaper: TextShaper,
-    font: Option<Arc<FontArc>>,
+    primary_font: Option<DanmakuFontFace>,
+    fallback_fonts: Arc<Mutex<SystemFontFallback>>,
     glyph_cache: Arc<Mutex<HashMap<GlyphCacheKey, Arc<RasterizedGlyph>>>>,
     text_layout_cache: Arc<Mutex<HashMap<TextLayoutCacheKey, Arc<PreparedTextLayout>>>>,
     glyph_atlas: Arc<Mutex<PersistentGlyphAtlas>>,
@@ -917,7 +1062,8 @@ impl DanmakuTextRasterizer {
     pub fn new(shaper: TextShaper) -> Self {
         Self {
             shaper,
-            font: load_default_font().map(Arc::new),
+            primary_font: load_default_font().map(|font| DanmakuFontFace::new(0, font)),
+            fallback_fonts: Arc::new(Mutex::new(SystemFontFallback::new(1))),
             glyph_cache: Arc::new(Mutex::new(HashMap::new())),
             text_layout_cache: Arc::new(Mutex::new(HashMap::new())),
             glyph_atlas: Arc::new(Mutex::new(PersistentGlyphAtlas::new())),
@@ -928,8 +1074,12 @@ impl DanmakuTextRasterizer {
         let shaper = TextShaper::default();
         Self {
             shaper,
-            font: load_configured_font(&config.custom_font_family, &config.custom_font_file_path)
-                .map(Arc::new),
+            primary_font: load_configured_font(
+                &config.custom_font_family,
+                &config.custom_font_file_path,
+            )
+            .map(|font| DanmakuFontFace::new(0, font)),
+            fallback_fonts: Arc::new(Mutex::new(SystemFontFallback::new(1))),
             glyph_cache: Arc::new(Mutex::new(HashMap::new())),
             text_layout_cache: Arc::new(Mutex::new(HashMap::new())),
             glyph_atlas: Arc::new(Mutex::new(PersistentGlyphAtlas::new())),
@@ -937,16 +1087,55 @@ impl DanmakuTextRasterizer {
     }
 
     pub fn measure(&self, text: &str, font_size: f32) -> TextMeasure {
-        if let Some(font) = &self.font {
-            measure_with_font(font, text, font_size)
-        } else {
+        if self.primary_font.is_none() {
             let metrics = self.shaper.measure(text, font_size);
-            TextMeasure {
+            return TextMeasure {
                 width: metrics.width.max(1.0),
                 height: metrics.height.max(1.0),
                 ascent: metrics.ascent,
                 descent: metrics.descent,
+            };
+        }
+        self.measure_with_fallback(text, font_size)
+    }
+
+    fn measure_with_fallback(&self, text: &str, font_size: f32) -> TextMeasure {
+        let scale = PxScale::from(font_size);
+        let mut width = 0.0f32;
+        let mut max_ascent = 0.0f32;
+        let mut max_descent = 0.0f32;
+        let mut max_line_gap = 0.0f32;
+        let mut previous: Option<(u32, GlyphId)> = None;
+        for ch in text.chars() {
+            let Some(face) = self.resolve_font(ch) else {
+                let metrics = self.shaper.measure(&ch.to_string(), font_size);
+                width += metrics.width.max(font_size * 0.5);
+                max_ascent = max_ascent.max(metrics.ascent);
+                max_descent = max_descent.max(metrics.descent);
+                previous = None;
+                continue;
+            };
+            let scaled = face.font.as_scaled(scale);
+            let glyph_id = scaled.glyph_id(ch);
+            if let Some((previous_font_id, previous_glyph_id)) = previous {
+                if previous_font_id == face.id {
+                    width += scaled.kern(previous_glyph_id, glyph_id);
+                }
             }
+            width += scaled.h_advance(glyph_id).max(0.0);
+            max_ascent = max_ascent.max(scaled.ascent());
+            max_descent = max_descent.max(scaled.descent().abs());
+            max_line_gap = max_line_gap.max(scaled.line_gap());
+            previous = Some((face.id, glyph_id));
+        }
+        let ascent = max_ascent.max(font_size * 0.8);
+        let descent = max_descent.max(font_size * 0.2);
+        let height = (ascent + descent + max_line_gap).max(font_size * 1.2);
+        TextMeasure {
+            width: width.max(1.0),
+            height,
+            ascent,
+            descent,
         }
     }
 
@@ -984,26 +1173,47 @@ impl DanmakuTextRasterizer {
         let outline_width = key.outline_width();
         let mut glyphs = Vec::new();
         let mut pen_x = 0.0f32;
-        let mut previous = None;
-        let scaled = self
-            .font
-            .as_ref()
-            .map(|font| font.as_scaled(PxScale::from(font_size)));
+        let mut previous: Option<(u32, GlyphId)> = None;
         for ch in key.text.chars() {
-            let glyph_id = scaled.as_ref().map(|scaled| scaled.glyph_id(ch));
-            if let (Some(scaled), Some(previous), Some(current)) =
-                (scaled.as_ref(), previous, glyph_id)
+            let face = self.resolve_font(ch);
+            let glyph_id = face.as_ref().map(|face| face.glyph_id(ch));
+            if let (Some(face), Some((previous_font_id, previous_glyph_id)), Some(current)) =
+                (face.as_ref(), previous, glyph_id)
             {
-                pen_x += scaled.kern(previous, current);
+                if previous_font_id == face.id {
+                    pen_x += face
+                        .font
+                        .as_scaled(PxScale::from(font_size))
+                        .kern(previous_glyph_id, current);
+                }
             }
-            let glyph_key = GlyphCacheKey::new(ch, font_size, outline_width);
+            let glyph_key = GlyphCacheKey::new(
+                face.as_ref().map(|face| face.id).unwrap_or(u32::MAX),
+                ch,
+                font_size,
+                outline_width,
+            );
             let glyph = self.cached_glyph_by_key(glyph_key);
             let advance = glyph.advance;
             glyphs.push(PreparedGlyphPlacement { glyph, pen_x });
             pen_x += advance;
-            previous = glyph_id;
+            previous = face
+                .as_ref()
+                .and_then(|face| glyph_id.map(|glyph_id| (face.id, glyph_id)));
         }
         PreparedTextLayout { metrics, glyphs }
+    }
+
+    fn resolve_font(&self, ch: char) -> Option<DanmakuFontFace> {
+        if let Some(font) = &self.primary_font {
+            if font.has_glyph(ch) {
+                return Some(font.clone());
+            }
+        }
+        self.fallback_fonts
+            .lock()
+            .expect("danmaku system font fallback lock")
+            .resolve(ch)
     }
 
     pub fn render_plan(&self, layout: &DanmakuFrameLayout) -> DanmakuRenderPlan {
@@ -1126,11 +1336,12 @@ impl DanmakuTextRasterizer {
     }
 
     fn rasterize_glyph(&self, key: GlyphCacheKey) -> RasterizedGlyph {
-        if let Some(font) = &self.font {
-            rasterize_font_glyph(font, key)
-        } else {
-            rasterize_fallback_glyph(&self.shaper, key)
+        if let Some(font) = self.resolve_font(key.ch) {
+            if font.id == key.font_id {
+                return rasterize_font_glyph(&font.font, key);
+            }
         }
+        rasterize_fallback_glyph(&self.shaper, key)
     }
 }
 
@@ -1147,14 +1358,16 @@ struct PendingGlyphInstance {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct GlyphCacheKey {
+    font_id: u32,
     ch: char,
     font_size_milli: u32,
     outline_radius: u16,
 }
 
 impl GlyphCacheKey {
-    fn new(ch: char, font_size: f32, outline_width: f32) -> Self {
+    fn new(font_id: u32, ch: char, font_size: f32, outline_width: f32) -> Self {
         Self {
+            font_id,
             ch,
             font_size_milli: (sanitize_f32(font_size, DEFAULT_NATIVE_FONT_SIZE).max(1.0) * 1000.0)
                 .round() as u32,
@@ -1934,30 +2147,6 @@ fn load_default_font() -> Option<FontArc> {
         }
     }
     None
-}
-
-fn measure_with_font(font: &FontArc, text: &str, font_size: f32) -> TextMeasure {
-    let scale = PxScale::from(font_size);
-    let scaled = font.as_scaled(scale);
-    let mut width = 0.0f32;
-    let mut previous = None;
-    for ch in text.chars() {
-        let glyph_id = scaled.glyph_id(ch);
-        if let Some(previous) = previous {
-            width += scaled.kern(previous, glyph_id);
-        }
-        width += scaled.h_advance(glyph_id);
-        previous = Some(glyph_id);
-    }
-    let ascent = scaled.ascent();
-    let descent = scaled.descent().abs();
-    let height = (ascent + descent + scaled.line_gap()).max(font_size * 1.2);
-    TextMeasure {
-        width: width.max(1.0),
-        height,
-        ascent,
-        descent,
-    }
 }
 
 fn rasterize_font_glyph(font: &FontArc, key: GlyphCacheKey) -> RasterizedGlyph {
