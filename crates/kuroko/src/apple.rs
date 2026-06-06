@@ -33,7 +33,8 @@ pub mod coreaudio {
 
     use crate::audio::{
         AudioClockSnapshot, AudioOutputBackend, AudioOutputState, AudioPushResult, AudioReadResult,
-        AudioRingBuffer, AudioRingBufferConfig, AudioRingBufferStats,
+        AudioRingBuffer, AudioRingBufferConfig, AudioRingBufferStats, apply_volume,
+        normalize_volume,
     };
     use crate::ffmpeg::{PcmAudioFrame, PcmFormat, PcmSampleFormat};
 
@@ -199,6 +200,14 @@ pub mod coreaudio {
         fn stop(&mut self) -> crate::audio::Result<()> {
             CoreAudioOutput::stop(self)
                 .map_err(|error| crate::audio::AudioError::Backend(error.to_string()))
+        }
+
+        fn set_volume(&mut self, volume: f32) {
+            CoreAudioOutput::set_volume(self, volume);
+        }
+
+        fn volume(&self) -> f32 {
+            CoreAudioOutput::volume(self)
         }
 
         fn push(&mut self, frame: PcmAudioFrame) -> crate::audio::Result<AudioPushResult> {

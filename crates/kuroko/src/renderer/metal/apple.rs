@@ -1,6 +1,7 @@
 use std::ffi::c_void;
 use std::mem;
 use std::ptr::NonNull;
+use std::time::{Duration, Instant};
 
 use crate::core::{PlayerError, Result};
 use objc2::rc::Retained;
@@ -30,7 +31,7 @@ use objc2_metal::{
     MTLTextureUsage,
 };
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLDevice, MTLDrawable,
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLDevice, MTLDrawable,
     MTLRenderPassDescriptor, MTLTexture,
 };
 use objc2_metal::{
@@ -40,7 +41,7 @@ use objc2_metal::{
 use objc2_metal::{MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerState};
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
-use crate::danmaku::{DanmakuGlyphAtlas, DanmakuGlyphInstance, DanmakuRenderPlan};
+use crate::danmaku::{DanmakuGlyphAtlas, DanmakuRenderPlan};
 use crate::renderer::metal::{
     ClearColor, DanmakuRenderFrame, ImportedVideoFormat, ImportedVideoFrameInfo,
     ImportedVideoPlaneInfo, MetalDrawablePixelFormat, MetalOutputMode, MetalRendererConfig,
@@ -104,9 +105,12 @@ pub struct MetalRendererImpl {
     texture_cache: Option<CFRetained<CVMetalTextureCache>>,
     video_pipeline: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
     overlay_pipeline: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
+    danmaku_batch_pipeline: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
     video_sampler: Option<Retained<ProtocolObject<dyn MTLSamplerState>>>,
     overlay_alpha_atlas_cache: Option<OverlayAlphaAtlasCache>,
     danmaku_alpha_atlas_cache: Option<DanmakuAlphaAtlasCache>,
+    danmaku_vertex_buffer: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    danmaku_vertex_buffer_len: usize,
     stats: MetalRendererStats,
 }
 
@@ -127,9 +131,12 @@ impl MetalRendererImpl {
             texture_cache: None,
             video_pipeline: None,
             overlay_pipeline: None,
+            danmaku_batch_pipeline: None,
             video_sampler: None,
             overlay_alpha_atlas_cache: None,
             danmaku_alpha_atlas_cache: None,
+            danmaku_vertex_buffer: None,
+            danmaku_vertex_buffer_len: 0,
             stats: MetalRendererStats::default(),
         })
     }
@@ -189,7 +196,10 @@ impl MetalRendererImpl {
         }
         self.video_pipeline = None;
         self.overlay_pipeline = None;
+        self.danmaku_batch_pipeline = None;
         self.overlay_alpha_atlas_cache = None;
+        self.danmaku_vertex_buffer = None;
+        self.danmaku_vertex_buffer_len = 0;
     }
 
     pub fn record_prepared_overlay_frame(&mut self, info: PreparedOverlayFrameInfo) {
@@ -339,6 +349,12 @@ impl MetalRendererImpl {
         let danmaku_item_count = danmaku
             .as_ref()
             .map_or(0usize, |danmaku| danmaku.plan.items.len());
+        self.stats.last_danmaku_atlas_duration = Duration::ZERO;
+        self.stats.last_danmaku_vertex_build_duration = Duration::ZERO;
+        self.stats.last_danmaku_vertex_copy_duration = Duration::ZERO;
+        self.stats.last_danmaku_encode_duration = Duration::ZERO;
+        self.stats.last_danmaku_vertex_bytes = 0;
+        self.stats.last_danmaku_vertex_count = 0;
         let Some(layer) = &self.layer else {
             return Err(PlayerError::Renderer(
                 "no CAMetalLayer attached".to_string(),
@@ -585,20 +601,20 @@ impl MetalRendererImpl {
                 atlas.stride
             )));
         }
-        let pipeline = self.overlay_pipeline_state()?;
+        let pipeline = self.danmaku_batch_pipeline_state()?;
         let sampler = self.video_sampler_state()?;
+        let atlas_started = Instant::now();
         let (fill_texture, outline_texture) = self.prepare_danmaku_alpha_atlas(atlas)?;
-        for item in &plan.items {
-            self.draw_danmaku_glyph(
-                encoder,
-                &pipeline,
-                &sampler,
-                item,
-                &fill_texture,
-                &outline_texture,
-                layout,
-            );
-        }
+        self.stats.last_danmaku_atlas_duration = atlas_started.elapsed();
+        self.draw_danmaku_batch(
+            encoder,
+            &pipeline,
+            &sampler,
+            plan,
+            &fill_texture,
+            &outline_texture,
+            layout,
+        )?;
         Ok(())
     }
 
@@ -637,44 +653,100 @@ impl MetalRendererImpl {
         Ok((fill_texture, outline_texture))
     }
 
-    fn draw_danmaku_glyph(
-        &self,
+    fn draw_danmaku_batch(
+        &mut self,
         encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
         pipeline: &ProtocolObject<dyn MTLRenderPipelineState>,
         sampler: &ProtocolObject<dyn MTLSamplerState>,
-        item: &DanmakuGlyphInstance,
+        plan: &DanmakuRenderPlan,
         fill_texture: &ProtocolObject<dyn MTLTexture>,
         outline_texture: &ProtocolObject<dyn MTLTexture>,
         layout: VideoPresentationLayout,
-    ) {
-        if item.shadow_rgba[3] > 0.0 {
-            let mut rect = item.rect;
-            rect[0] += item.shadow_offset[0];
-            rect[1] += item.shadow_offset[1];
-            let uniforms = OverlayUniforms::from_output_alpha_atlas_rect(
-                item.shadow_rgba,
-                rect,
-                item.tex_rect,
-                layout,
+    ) -> Result<()> {
+        let build_started = Instant::now();
+        let uniforms = DanmakuBatchUniforms {
+            viewport: layout.overlay_viewport(),
+            _reserved0: [0.0, 0.0],
+        };
+        unsafe {
+            encoder.setRenderPipelineState(pipeline);
+            encoder.setFragmentSamplerState_atIndex(Some(sampler), 0);
+            encoder.setVertexBytes_length_atIndex(
+                NonNull::new(
+                    (&uniforms as *const DanmakuBatchUniforms)
+                        .cast::<c_void>()
+                        .cast_mut(),
+                )
+                .expect("danmaku batch uniforms pointer is non-null"),
+                mem::size_of::<DanmakuBatchUniforms>(),
+                1,
             );
-            draw_alpha_mask(encoder, pipeline, sampler, outline_texture, &uniforms);
         }
-        if item.outline_rgba[3] > 0.0 {
-            let uniforms = OverlayUniforms::from_output_alpha_atlas_rect(
-                item.outline_rgba,
-                item.rect,
-                item.tex_rect,
-                layout,
-            );
-            draw_alpha_mask(encoder, pipeline, sampler, outline_texture, &uniforms);
+        let shadow_count = plan
+            .items
+            .iter()
+            .filter(|item| item.shadow_rgba[3] > 0.0)
+            .count();
+        let outline_count = plan
+            .items
+            .iter()
+            .filter(|item| item.outline_rgba[3] > 0.0)
+            .count();
+        let outline_texture_count = shadow_count
+            .checked_add(outline_count)
+            .ok_or_else(|| PlayerError::Renderer("danmaku instance count overflow".to_string()))?;
+        let fill_count = plan.items.len();
+        let total_instances = outline_texture_count
+            .checked_add(fill_count)
+            .ok_or_else(|| PlayerError::Renderer("danmaku instance count overflow".to_string()))?;
+        let total_bytes = instance_bytes_len(total_instances)?;
+        self.stats.last_danmaku_vertex_bytes = total_bytes;
+        self.stats.last_danmaku_vertex_count = total_instances;
+        self.ensure_danmaku_vertex_buffer(total_bytes)?;
+        let buffer = self
+            .danmaku_vertex_buffer
+            .as_ref()
+            .expect("danmaku vertex buffer exists")
+            .clone();
+        write_danmaku_instances_direct(
+            &buffer,
+            plan,
+            shadow_count,
+            outline_texture_count,
+            total_instances,
+        )?;
+        self.stats.last_danmaku_vertex_build_duration = build_started.elapsed();
+        self.stats.last_danmaku_vertex_copy_duration = Duration::ZERO;
+
+        let encode_started = Instant::now();
+        draw_danmaku_instance_batch(encoder, outline_texture, &buffer, 0, outline_texture_count)?;
+        let fill_offset = instance_bytes_len(outline_texture_count)?;
+        draw_danmaku_instance_batch(
+            encoder,
+            fill_texture,
+            &buffer,
+            fill_offset,
+            fill_count,
+        )?;
+        self.stats.last_danmaku_encode_duration = encode_started.elapsed();
+        Ok(())
+    }
+
+    fn ensure_danmaku_vertex_buffer(&mut self, required_len: usize) -> Result<()> {
+        if required_len == 0 {
+            return Ok(());
         }
-        let uniforms = OverlayUniforms::from_output_alpha_atlas_rect(
-            item.color_rgba,
-            item.rect,
-            item.tex_rect,
-            layout,
-        );
-        draw_alpha_mask(encoder, pipeline, sampler, fill_texture, &uniforms);
+        if self.danmaku_vertex_buffer_len >= required_len && self.danmaku_vertex_buffer.is_some() {
+            return Ok(());
+        }
+        let len = required_len.next_power_of_two().max(4096);
+        let buffer = self
+            .device
+            .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| PlayerError::Renderer("newBufferWithLength returned nil".to_string()))?;
+        self.danmaku_vertex_buffer = Some(buffer);
+        self.danmaku_vertex_buffer_len = len;
+        Ok(())
     }
 
     fn prepare_overlay_alpha_atlas(
@@ -1042,6 +1114,65 @@ impl MetalRendererImpl {
             .expect("overlay pipeline exists")
             .clone())
     }
+
+    fn danmaku_batch_pipeline_state(
+        &mut self,
+    ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
+        if self.danmaku_batch_pipeline.is_none() {
+            let library = self
+                .device
+                .newLibraryWithSource_options_error(&NSString::from_str(VIDEO_SHADER_SOURCE), None)
+                .map_err(|error| {
+                    PlayerError::Renderer(format!(
+                        "Metal danmaku batch shader compile failed: {}",
+                        error.localizedDescription()
+                    ))
+                })?;
+            let vertex = library
+                .newFunctionWithName(&NSString::from_str("kuroko_danmaku_batch_vertex"))
+                .ok_or_else(|| {
+                    PlayerError::Renderer(
+                        "Metal shader missing kuroko_danmaku_batch_vertex".to_string(),
+                    )
+                })?;
+            let fragment = library
+                .newFunctionWithName(&NSString::from_str("kuroko_danmaku_batch_fragment"))
+                .ok_or_else(|| {
+                    PlayerError::Renderer(
+                        "Metal shader missing kuroko_danmaku_batch_fragment".to_string(),
+                    )
+                })?;
+            let descriptor = MTLRenderPipelineDescriptor::new();
+            descriptor.setLabel(Some(&NSString::from_str("Kuroko Danmaku Batch Pipeline")));
+            descriptor.setVertexFunction(Some(&*vertex));
+            descriptor.setFragmentFunction(Some(&*fragment));
+            let attachments = descriptor.colorAttachments();
+            let attachment = unsafe { attachments.objectAtIndexedSubscript(0) };
+            attachment.setPixelFormat(metal_pixel_format(self.drawable_pixel_format));
+            attachment.setBlendingEnabled(true);
+            attachment.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
+            attachment.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+            attachment.setRgbBlendOperation(MTLBlendOperation::Add);
+            attachment.setSourceAlphaBlendFactor(MTLBlendFactor::One);
+            attachment.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+            attachment.setAlphaBlendOperation(MTLBlendOperation::Add);
+            let pipeline = self
+                .device
+                .newRenderPipelineStateWithDescriptor_error(&descriptor)
+                .map_err(|error| {
+                    PlayerError::Renderer(format!(
+                        "Metal danmaku batch pipeline create failed: {}",
+                        error.localizedDescription()
+                    ))
+                })?;
+            self.danmaku_batch_pipeline = Some(pipeline);
+        }
+        Ok(self
+            .danmaku_batch_pipeline
+            .as_ref()
+            .expect("danmaku batch pipeline exists")
+            .clone())
+    }
 }
 
 fn set_layer_edr_enabled(layer: &CAMetalLayer, enabled: bool) {
@@ -1162,6 +1293,31 @@ struct OverlayUniforms {
     color: [f32; 4],
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DanmakuBatchUniforms {
+    viewport: [f32; 2],
+    _reserved0: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DanmakuBatchInstance {
+    rect: [f32; 4],
+    tex_rect: [f32; 4],
+    color: [f32; 4],
+}
+
+impl DanmakuBatchInstance {
+    fn new(rect: [f32; 4], tex_rect: [f32; 4], color: [f32; 4]) -> Self {
+        Self {
+            rect,
+            tex_rect,
+            color,
+        }
+    }
+}
+
 impl OverlayUniforms {
     fn from_plane(
         x: i32,
@@ -1215,21 +1371,6 @@ impl OverlayUniforms {
         }
     }
 
-    fn from_output_alpha_atlas_rect(
-        color: [f32; 4],
-        rect: [f32; 4],
-        tex_rect: [f32; 4],
-        layout: VideoPresentationLayout,
-    ) -> Self {
-        Self {
-            rect,
-            tex_rect,
-            viewport: layout.overlay_viewport(),
-            overlay_mode: 1,
-            _reserved0: 0,
-            color,
-        }
-    }
 }
 
 fn overlay_uniform_pointer(uniforms: &OverlayUniforms) -> NonNull<c_void> {
@@ -1241,29 +1382,86 @@ fn overlay_uniform_pointer(uniforms: &OverlayUniforms) -> NonNull<c_void> {
     .expect("overlay uniform pointer is non-null")
 }
 
-fn draw_alpha_mask(
-    encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
-    pipeline: &ProtocolObject<dyn MTLRenderPipelineState>,
-    sampler: &ProtocolObject<dyn MTLSamplerState>,
-    texture: &ProtocolObject<dyn MTLTexture>,
-    uniforms: &OverlayUniforms,
-) {
-    unsafe {
-        encoder.setRenderPipelineState(pipeline);
-        encoder.setFragmentTexture_atIndex(Some(texture), 0);
-        encoder.setFragmentSamplerState_atIndex(Some(sampler), 0);
-        encoder.setVertexBytes_length_atIndex(
-            overlay_uniform_pointer(uniforms),
-            mem::size_of::<OverlayUniforms>(),
-            0,
-        );
-        encoder.setFragmentBytes_length_atIndex(
-            overlay_uniform_pointer(uniforms),
-            mem::size_of::<OverlayUniforms>(),
-            0,
-        );
-        encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
+fn instance_bytes_len(instance_count: usize) -> Result<usize> {
+    instance_count
+        .checked_mul(mem::size_of::<DanmakuBatchInstance>())
+        .ok_or_else(|| PlayerError::Renderer("danmaku batch instance buffer overflow".to_string()))
+}
+
+fn write_danmaku_instances_direct(
+    buffer: &ProtocolObject<dyn MTLBuffer>,
+    plan: &DanmakuRenderPlan,
+    shadow_count: usize,
+    outline_texture_count: usize,
+    total_instances: usize,
+) -> Result<()> {
+    if total_instances == 0 {
+        return Ok(());
     }
+    let byte_len = instance_bytes_len(total_instances)?;
+    let end = byte_len;
+    if end > buffer.length() {
+        return Err(PlayerError::Renderer(
+            "danmaku instance buffer too small".to_string(),
+        ));
+    }
+    unsafe {
+        let dst = buffer.contents().as_ptr() as *mut DanmakuBatchInstance;
+        let mut shadow_index = 0usize;
+        let mut outline_index = shadow_count;
+        let mut fill_index = outline_texture_count;
+        for item in &plan.items {
+            if item.shadow_rgba[3] > 0.0 {
+                let mut rect = item.rect;
+                rect[0] += item.shadow_offset[0];
+                rect[1] += item.shadow_offset[1];
+                dst.add(shadow_index)
+                    .write(DanmakuBatchInstance::new(rect, item.tex_rect, item.shadow_rgba));
+                shadow_index += 1;
+            }
+            if item.outline_rgba[3] > 0.0 {
+                dst.add(outline_index).write(DanmakuBatchInstance::new(
+                    item.rect,
+                    item.tex_rect,
+                    item.outline_rgba,
+                ));
+                outline_index += 1;
+            }
+            dst.add(fill_index).write(DanmakuBatchInstance::new(
+                item.rect,
+                item.tex_rect,
+                item.color_rgba,
+            ));
+            fill_index += 1;
+        }
+        debug_assert_eq!(shadow_index, shadow_count);
+        debug_assert_eq!(outline_index, outline_texture_count);
+        debug_assert_eq!(fill_index, total_instances);
+    }
+    Ok(())
+}
+
+fn draw_danmaku_instance_batch(
+    encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+    texture: &ProtocolObject<dyn MTLTexture>,
+    buffer: &ProtocolObject<dyn MTLBuffer>,
+    offset: usize,
+    instance_count: usize,
+) -> Result<()> {
+    if instance_count == 0 {
+        return Ok(());
+    }
+    unsafe {
+        encoder.setFragmentTexture_atIndex(Some(texture), 0);
+        encoder.setVertexBuffer_offset_atIndex(Some(buffer), offset, 0);
+        encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
+            MTLPrimitiveType::Triangle,
+            0,
+            6,
+            instance_count,
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1708,6 +1906,59 @@ fragment float4 kuroko_overlay_fragment(
         return float4(uniforms.color.rgb, uniforms.color.a * sampled.r);
     }
     return sampled;
+}
+
+struct DanmakuBatchUniforms {
+    float2 viewport;
+    float2 reserved0;
+};
+
+struct DanmakuBatchInstance {
+    float4 rect;
+    float4 tex_rect;
+    float4 color;
+};
+
+struct DanmakuBatchOut {
+    float4 position [[position]];
+    float2 tex_coord;
+    float4 color;
+};
+
+vertex DanmakuBatchOut kuroko_danmaku_batch_vertex(
+    uint vertex_id [[vertex_id]],
+    uint instance_id [[instance_id]],
+    constant DanmakuBatchInstance* instances [[buffer(0)]],
+    constant DanmakuBatchUniforms& uniforms [[buffer(1)]]) {
+    constexpr float2 corners[6] = {
+        float2(0.0, 0.0),
+        float2(1.0, 0.0),
+        float2(0.0, 1.0),
+        float2(1.0, 0.0),
+        float2(1.0, 1.0),
+        float2(0.0, 1.0),
+    };
+    DanmakuBatchInstance glyph = instances[instance_id];
+    float2 corner = corners[vertex_id];
+    float2 position = glyph.rect.xy + corner * glyph.rect.zw;
+    float2 tex_coord = glyph.tex_rect.xy + corner * glyph.tex_rect.zw;
+    float2 ndc = float2(
+        position.x / max(uniforms.viewport.x, 1.0) * 2.0 - 1.0,
+        1.0 - position.y / max(uniforms.viewport.y, 1.0) * 2.0
+    );
+    DanmakuBatchOut out;
+    out.position = float4(ndc, 0.0, 1.0);
+    out.tex_coord = tex_coord;
+    out.color = glyph.color;
+    return out;
+}
+
+fragment float4 kuroko_danmaku_batch_fragment(
+    DanmakuBatchOut in [[stage_in]],
+    texture2d<float, access::sample> atlas_texture [[texture(0)]],
+    sampler atlas_sampler [[sampler(0)]]) {
+    float mask = atlas_texture.sample(atlas_sampler, in.tex_coord).r;
+    return float4(in.color.rgb, in.color.a * mask);
 }
 "#;
 

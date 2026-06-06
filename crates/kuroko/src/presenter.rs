@@ -1,4 +1,10 @@
-use std::{env, fs::OpenOptions, io::Write, path::PathBuf, time::Duration};
+use std::{
+    env,
+    fs::OpenOptions,
+    io::Write,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use crossbeam_channel::Receiver;
 
@@ -9,12 +15,13 @@ use crate::audio::BufferedAudioOutput;
 use crate::audio::{AudioClockSnapshot, AudioOutputBackend, AudioRingBufferConfig};
 use crate::core::{
     MediaRequest, PlatformSurface, Player, PlayerAudioFrame, PlayerConfig, PlayerSubtitleFrame,
-    PlayerVideoFrame, RenderFrameContext, RendererBackend, RendererBackendPreference, TrackInfo,
-    TrackSelection,
+    PlayerVideoFrame, RenderFrameContext, RendererBackend, RendererBackendPreference,
+    RendererRuntimeStats, TrackInfo, TrackSelection,
 };
 use crate::danmaku::{
-    DanmakuLayoutConfig, DanmakuRenderPlan, DanmakuSession, DanmakuTimeline, DanmakuTrackInfo,
-    DanmakuTrackSource, DanmakuViewport, DfmLayoutEngine,
+    DANMAKU_DEBUG_BUCKETS, DanmakuDebugBucket, DanmakuLayoutConfig, DanmakuPreparedStats,
+    DanmakuRenderPlan, DanmakuSession, DanmakuTimeline, DanmakuTrackInfo, DanmakuTrackSource,
+    DanmakuViewport, DfmLayoutEngine,
 };
 use crate::overlay::{OverlayFrame, OverlayTimeline, OverlayViewport};
 use crate::renderer::metal::{MetalRenderer, MetalRendererConfig};
@@ -97,6 +104,42 @@ pub struct PresenterStats {
     pub audio_failures: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PresenterRuntimeSnapshot {
+    pub stats: PresenterStats,
+    pub renderer: RendererRuntimeStats,
+    pub media_time: Duration,
+    pub generation: u64,
+    pub playing: bool,
+    pub current_danmaku_items: usize,
+    pub current_danmaku_atlas_version: u64,
+    pub current_danmaku_atlas_bytes: usize,
+    pub current_danmaku_viewport_width: u32,
+    pub current_danmaku_viewport_height: u32,
+    pub current_danmaku_placed_items: usize,
+    pub current_danmaku_scroll_items: usize,
+    pub current_danmaku_top_items: usize,
+    pub current_danmaku_bottom_items: usize,
+    pub current_danmaku_scroll_rows: usize,
+    pub current_danmaku_scroll_track_min: usize,
+    pub current_danmaku_scroll_track_max: usize,
+    pub current_danmaku_scroll_min_y: f32,
+    pub current_danmaku_scroll_max_y: f32,
+    pub current_danmaku_scroll_bucket_count: usize,
+    pub current_danmaku_scroll_buckets: [DanmakuDebugBucket; DANMAKU_DEBUG_BUCKETS],
+    pub current_danmaku_prepared: DanmakuPreparedStats,
+    pub last_tick_duration: Duration,
+    pub last_pump_duration: Duration,
+    pub last_audio_pump_duration: Duration,
+    pub last_subtitle_pump_duration: Duration,
+    pub last_video_pump_duration: Duration,
+    pub last_clock_sync_duration: Duration,
+    pub last_danmaku_plan_duration: Duration,
+    pub last_render_duration: Duration,
+    pub last_render_current_duration: Duration,
+    pub last_render_test_duration: Duration,
+}
+
 pub struct PresenterRuntime {
     player: Player,
     renderer: Box<dyn RendererBackend>,
@@ -120,6 +163,16 @@ pub struct PresenterRuntime {
     danmaku_generation: u64,
     danmaku_trace: DanmakuTimeTrace,
     stats: PresenterStats,
+    last_tick_duration: Duration,
+    last_pump_duration: Duration,
+    last_audio_pump_duration: Duration,
+    last_subtitle_pump_duration: Duration,
+    last_video_pump_duration: Duration,
+    last_clock_sync_duration: Duration,
+    last_danmaku_plan_duration: Duration,
+    last_render_duration: Duration,
+    last_render_current_duration: Duration,
+    last_render_test_duration: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +272,16 @@ impl PresenterRuntime {
             danmaku_generation: 1,
             danmaku_trace: DanmakuTimeTrace::from_env(),
             stats: PresenterStats::default(),
+            last_tick_duration: Duration::ZERO,
+            last_pump_duration: Duration::ZERO,
+            last_audio_pump_duration: Duration::ZERO,
+            last_subtitle_pump_duration: Duration::ZERO,
+            last_video_pump_duration: Duration::ZERO,
+            last_clock_sync_duration: Duration::ZERO,
+            last_danmaku_plan_duration: Duration::ZERO,
+            last_render_duration: Duration::ZERO,
+            last_render_current_duration: Duration::ZERO,
+            last_render_test_duration: Duration::ZERO,
         })
     }
 
@@ -464,11 +527,29 @@ impl PresenterRuntime {
     }
 
     pub fn render_tick(&mut self, time_seconds: f64) -> Result<PresenterStats> {
+        let tick_started = Instant::now();
+        let pump_started = Instant::now();
+
+        let audio_started = Instant::now();
         self.pump_audio();
+        self.last_audio_pump_duration = audio_started.elapsed();
+
+        let subtitle_started = Instant::now();
         self.pump_subtitles();
+        self.last_subtitle_pump_duration = subtitle_started.elapsed();
+
+        let video_started = Instant::now();
         self.pump_video();
+        self.last_video_pump_duration = video_started.elapsed();
+
+        let sync_started = Instant::now();
         self.sync_media_time_from_player();
+        self.last_clock_sync_duration = sync_started.elapsed();
+
+        let plan_started = Instant::now();
         self.refresh_stale_danmaku_plan();
+        self.last_danmaku_plan_duration = plan_started.elapsed();
+        self.last_pump_duration = pump_started.elapsed();
         let plan_time = self.current_danmaku.as_ref().map(|plan| plan.media_time);
         let plan_generation = self.current_danmaku.as_ref().map(|plan| plan.generation);
         let plan_items = self
@@ -495,10 +576,18 @@ impl PresenterRuntime {
                 self.current_output_viewport
                     .map_or(0, |viewport| viewport.height),
             );
-        match self.renderer.render_current_frame(context) {
+        let render_started = Instant::now();
+        let render_result = self.renderer.render_current_frame(context);
+        self.last_render_current_duration = render_started.elapsed();
+        self.last_render_duration = self.last_render_current_duration;
+        self.last_render_test_duration = Duration::ZERO;
+        match render_result {
             Ok(true) => self.stats.rendered_video_frames += 1,
             Ok(false) => {
+                let render_started = Instant::now();
                 self.renderer.render_test_frame(time_seconds)?;
+                self.last_render_test_duration = render_started.elapsed();
+                self.last_render_duration = self.last_render_test_duration;
                 self.stats.rendered_test_frames += 1;
             }
             Err(error) => {
@@ -507,11 +596,67 @@ impl PresenterRuntime {
             }
         }
 
+        self.last_tick_duration = tick_started.elapsed();
         Ok(self.stats)
     }
 
     pub fn stats(&self) -> PresenterStats {
         self.stats
+    }
+
+    pub fn runtime_snapshot(&self) -> PresenterRuntimeSnapshot {
+        let renderer = self.renderer.runtime_stats();
+        let (current_danmaku_items, current_danmaku_atlas_version, current_danmaku_atlas_bytes) =
+            self.current_danmaku.as_ref().map_or((0, 0, 0), |plan| {
+                let atlas = plan.atlas.as_ref();
+                (
+                    plan.items.len(),
+                    atlas.map_or(0, |atlas| atlas.version),
+                    atlas.map_or(0, |atlas| atlas.required_len().saturating_mul(2)),
+                )
+            });
+        let frame_stats = self
+            .current_danmaku
+            .as_ref()
+            .map_or(Default::default(), |plan| plan.frame_stats);
+        PresenterRuntimeSnapshot {
+            stats: self.stats,
+            renderer,
+            media_time: self.current_media_time,
+            generation: self.current_generation,
+            playing: self.is_playing(),
+            current_danmaku_items,
+            current_danmaku_atlas_version,
+            current_danmaku_atlas_bytes,
+            current_danmaku_viewport_width: self
+                .current_danmaku_viewport
+                .map_or(0, |viewport| viewport.width),
+            current_danmaku_viewport_height: self
+                .current_danmaku_viewport
+                .map_or(0, |viewport| viewport.height),
+            current_danmaku_placed_items: frame_stats.placed_items,
+            current_danmaku_scroll_items: frame_stats.scroll_items,
+            current_danmaku_top_items: frame_stats.top_items,
+            current_danmaku_bottom_items: frame_stats.bottom_items,
+            current_danmaku_scroll_rows: frame_stats.scroll_rows,
+            current_danmaku_scroll_track_min: frame_stats.scroll_track_min,
+            current_danmaku_scroll_track_max: frame_stats.scroll_track_max,
+            current_danmaku_scroll_min_y: frame_stats.scroll_min_y,
+            current_danmaku_scroll_max_y: frame_stats.scroll_max_y,
+            current_danmaku_scroll_bucket_count: frame_stats.scroll_bucket_count,
+            current_danmaku_scroll_buckets: frame_stats.scroll_buckets,
+            current_danmaku_prepared: frame_stats.prepared,
+            last_tick_duration: self.last_tick_duration,
+            last_pump_duration: self.last_pump_duration,
+            last_audio_pump_duration: self.last_audio_pump_duration,
+            last_subtitle_pump_duration: self.last_subtitle_pump_duration,
+            last_video_pump_duration: self.last_video_pump_duration,
+            last_clock_sync_duration: self.last_clock_sync_duration,
+            last_danmaku_plan_duration: self.last_danmaku_plan_duration,
+            last_render_duration: self.last_render_duration,
+            last_render_current_duration: self.last_render_current_duration,
+            last_render_test_duration: self.last_render_test_duration,
+        }
     }
 
     fn pump_video(&mut self) {

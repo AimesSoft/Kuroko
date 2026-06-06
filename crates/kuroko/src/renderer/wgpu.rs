@@ -3,7 +3,8 @@ use wgpu::util::DeviceExt;
 
 use crate::core::{
     ColorPrimaries, PlatformSurface, PlayerError, PlayerVideoFrame, RenderFrameContext,
-    RendererBackend, Result, TransferFunction, WgpuSurfaceHandle, WgpuSurfaceKind,
+    RendererBackend, RendererRuntimeStats, Result, TransferFunction, WgpuSurfaceHandle,
+    WgpuSurfaceKind,
 };
 use crate::danmaku::{DanmakuGlyphAtlas, DanmakuGlyphInstance, DanmakuRenderPlan};
 use crate::ffmpeg::{PlanarFrame, PlanarPixelFormat};
@@ -1593,6 +1594,29 @@ impl RendererBackend for WgpuRenderer {
             self.stats.danmaku_items += danmaku_draws as u64;
         }
         Ok(true)
+    }
+
+    fn runtime_stats(&self) -> RendererRuntimeStats {
+        let stats = self.stats();
+        RendererRuntimeStats {
+            surface_width: stats.surface_width,
+            surface_height: stats.surface_height,
+            rendered_frames: stats.rendered_frames,
+            offscreen_frames: stats.offscreen_frames,
+            prepared_overlay_frames: 0,
+            prepared_overlay_subtitle_planes: 0,
+            danmaku_passes: stats.danmaku_passes,
+            danmaku_draw_items: stats.danmaku_items,
+            overlay_alpha_atlas_uploads: 0,
+            overlay_alpha_atlas_reuses: 0,
+            last_danmaku_atlas_duration: Default::default(),
+            last_danmaku_vertex_build_duration: Default::default(),
+            last_danmaku_vertex_copy_duration: Default::default(),
+            last_danmaku_encode_duration: Default::default(),
+            last_danmaku_vertex_bytes: 0,
+            last_danmaku_vertex_count: 0,
+            attached: stats.attached,
+        }
     }
 }
 

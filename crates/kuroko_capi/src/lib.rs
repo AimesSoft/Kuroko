@@ -851,7 +851,7 @@ pub unsafe extern "C" fn kuroko_presenter_set_volume(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_add_external_subtitle(
     handle: *mut KurokoPresenterHandle,
@@ -1336,7 +1336,7 @@ pub unsafe extern "C" fn kuroko_presenter_set_volume(
     KurokoStatus::PlayerError
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kuroko_presenter_load_danmaku_file(
     _handle: *mut std::ffi::c_void,
@@ -2116,7 +2116,7 @@ mod tests {
         unsafe { kuroko_presenter_destroy(handle) };
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[test]
     fn c_presenter_can_be_created_with_edr_config() {
         let handle = kuroko_presenter_create_with_config(KurokoPresenterConfig {

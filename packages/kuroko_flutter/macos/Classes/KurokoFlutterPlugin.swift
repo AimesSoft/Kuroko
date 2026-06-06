@@ -8,6 +8,8 @@ import QuartzCore
 private let kurokoWindowHostedVideoSurfaceId: Int64 = -1
 private let kurokoDebugLabelsEnabled =
   ProcessInfo.processInfo.environment["KUROKO_DEBUG_LABELS"] == "1"
+private let kurokoDefaultDisplayFps = 60.0
+private let kurokoDisplayFpsEpsilon = 0.5
 
 private struct KurokoVideoParamsC {
   var width: UInt32 = 0
@@ -368,6 +370,7 @@ private final class KurokoPlayerHost {
   private let handle: UnsafeMutableRawPointer
   private weak var attachedView: KurokoMetalSurfaceView?
   private var displayTimer: Timer?
+  private var displayTimerFps: Double = 0.0
   private var startTimeSeconds: CFTimeInterval = CACurrentMediaTime()
   private var currentDanmakuConfig = KurokoDanmakuConfigC()
 
@@ -382,7 +385,7 @@ private final class KurokoPlayerHost {
   }
 
   deinit {
-    displayTimer?.invalidate()
+    stopDisplayTimer()
     _ = library.detachSurface(handle)
     library.destroy(handle)
   }
@@ -667,7 +670,7 @@ private final class KurokoPlayerHost {
     attachedView = view
     view.attachedPlayerId = id
     try attachOrResize(view: view, attach: true)
-    startDisplayTimerIfNeeded()
+    startDisplayTimerIfNeeded(resetClock: true)
   }
 
   func detach(viewId: Int64?) {
@@ -676,8 +679,7 @@ private final class KurokoPlayerHost {
     }
     attachedView?.attachedPlayerId = nil
     attachedView = nil
-    displayTimer?.invalidate()
-    displayTimer = nil
+    stopDisplayTimer()
     _ = library.detachSurface(handle)
   }
 
@@ -687,6 +689,7 @@ private final class KurokoPlayerHost {
     }
     do {
       try attachOrResize(view: view, attach: false)
+      startDisplayTimerIfNeeded(resetClock: false)
     } catch {
       NSLog("KurokoFlutterPlugin: resize failed: \(error)")
     }
@@ -743,19 +746,45 @@ private final class KurokoPlayerHost {
     }
   }
 
-  private func startDisplayTimerIfNeeded() {
-    guard displayTimer == nil else {
+  private func startDisplayTimerIfNeeded(resetClock: Bool) {
+    let targetFps = resolvedDisplayTimerFps()
+    if displayTimer != nil && abs(displayTimerFps - targetFps) <= kurokoDisplayFpsEpsilon {
       return
     }
-    startTimeSeconds = CACurrentMediaTime()
-    let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+    stopDisplayTimer()
+    if resetClock {
+      startTimeSeconds = CACurrentMediaTime()
+    }
+    let timer = Timer(timeInterval: 1.0 / targetFps, repeats: true) { [weak self] _ in
       guard let self else {
         return
       }
       self.renderTick(sendEvent: KurokoFlutterPlugin.sharedEventSink)
     }
     displayTimer = timer
+    displayTimerFps = targetFps
     RunLoop.main.add(timer, forMode: .common)
+  }
+
+  private func stopDisplayTimer() {
+    displayTimer?.invalidate()
+    displayTimer = nil
+    displayTimerFps = 0.0
+  }
+
+  private func resolvedDisplayTimerFps() -> Double {
+    if let override = ProcessInfo.processInfo.environment["KUROKO_FLUTTER_TARGET_FPS"],
+       let fps = Double(override), fps.isFinite, fps > 0.0 {
+      return min(max(fps, 1.0), 1000.0)
+    }
+    let screen = attachedView?.window?.screen ?? NSScreen.main
+    if #available(macOS 10.15, *), let screen = screen {
+      let fps = Double(screen.maximumFramesPerSecond)
+      if fps.isFinite && fps > 0.0 {
+        return fps
+      }
+    }
+    return kurokoDefaultDisplayFps
   }
 
   private func check(_ status: Int32, operation: String) throws {

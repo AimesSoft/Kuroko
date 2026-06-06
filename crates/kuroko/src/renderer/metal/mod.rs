@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::core::{
     ColorPrimaries, PlatformSurface, PlayerError, PlayerVideoFrame, RenderFrameContext,
-    RendererBackend, Result, TransferFunction,
+    RendererBackend, RendererRuntimeStats, Result, TransferFunction,
 };
 use crate::danmaku::DanmakuRenderPlan;
 use crate::ffmpeg::Frame;
@@ -115,6 +115,12 @@ pub struct MetalRendererStats {
     pub danmaku_items: u64,
     pub overlay_alpha_atlas_uploads: u64,
     pub overlay_alpha_atlas_reuses: u64,
+    pub last_danmaku_atlas_duration: Duration,
+    pub last_danmaku_vertex_build_duration: Duration,
+    pub last_danmaku_vertex_copy_duration: Duration,
+    pub last_danmaku_encode_duration: Duration,
+    pub last_danmaku_vertex_bytes: usize,
+    pub last_danmaku_vertex_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -600,6 +606,29 @@ impl RendererBackend for MetalRenderer {
         );
         self.current_frame = Some(frame);
         result.map(|()| true)
+    }
+
+    fn runtime_stats(&self) -> RendererRuntimeStats {
+        let stats = self.stats();
+        RendererRuntimeStats {
+            surface_width: stats.drawable_width,
+            surface_height: stats.drawable_height,
+            rendered_frames: stats.rendered_frames,
+            offscreen_frames: 0,
+            prepared_overlay_frames: stats.prepared_overlay_frames,
+            prepared_overlay_subtitle_planes: stats.prepared_overlay_subtitle_planes,
+            danmaku_passes: stats.danmaku_passes,
+            danmaku_draw_items: stats.danmaku_items,
+            overlay_alpha_atlas_uploads: stats.overlay_alpha_atlas_uploads,
+            overlay_alpha_atlas_reuses: stats.overlay_alpha_atlas_reuses,
+            last_danmaku_atlas_duration: stats.last_danmaku_atlas_duration,
+            last_danmaku_vertex_build_duration: stats.last_danmaku_vertex_build_duration,
+            last_danmaku_vertex_copy_duration: stats.last_danmaku_vertex_copy_duration,
+            last_danmaku_encode_duration: stats.last_danmaku_encode_duration,
+            last_danmaku_vertex_bytes: stats.last_danmaku_vertex_bytes,
+            last_danmaku_vertex_count: stats.last_danmaku_vertex_count,
+            attached: stats.drawable_width > 0 && stats.drawable_height > 0,
+        }
     }
 }
 

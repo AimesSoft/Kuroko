@@ -413,6 +413,31 @@ pub trait RendererBackend {
     /// surface. Returns `false` if there is no current frame to draw, letting the
     /// caller fall back to a test frame.
     fn render_current_frame(&mut self, context: RenderFrameContext<'_>) -> Result<bool>;
+
+    fn runtime_stats(&self) -> RendererRuntimeStats {
+        RendererRuntimeStats::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RendererRuntimeStats {
+    pub surface_width: u32,
+    pub surface_height: u32,
+    pub rendered_frames: u64,
+    pub offscreen_frames: u64,
+    pub prepared_overlay_frames: u64,
+    pub prepared_overlay_subtitle_planes: u64,
+    pub danmaku_passes: u64,
+    pub danmaku_draw_items: u64,
+    pub overlay_alpha_atlas_uploads: u64,
+    pub overlay_alpha_atlas_reuses: u64,
+    pub last_danmaku_atlas_duration: Duration,
+    pub last_danmaku_vertex_build_duration: Duration,
+    pub last_danmaku_vertex_copy_duration: Duration,
+    pub last_danmaku_encode_duration: Duration,
+    pub last_danmaku_vertex_bytes: usize,
+    pub last_danmaku_vertex_count: usize,
+    pub attached: bool,
 }
 
 struct PlayerInner {
