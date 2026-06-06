@@ -2,8 +2,11 @@ use std::{env, fs::OpenOptions, io::Write, path::PathBuf, time::Duration};
 
 use crossbeam_channel::Receiver;
 
+#[cfg(target_os = "macos")]
 use crate::apple::coreaudio::{CoreAudioOutput, CoreAudioOutputConfig};
-use crate::audio::AudioClockSnapshot;
+#[cfg(not(target_os = "macos"))]
+use crate::audio::BufferedAudioOutput;
+use crate::audio::{AudioClockSnapshot, AudioOutputBackend, AudioRingBufferConfig};
 use crate::core::{
     MediaRequest, PlatformSurface, Player, PlayerAudioFrame, PlayerConfig, PlayerSubtitleFrame,
     PlayerVideoFrame, RenderFrameContext, RendererBackend, RendererBackendPreference, TrackInfo,
@@ -33,18 +36,44 @@ const AUDIO_START_BUFFER: Duration = Duration::from_millis(50);
 #[derive(Debug, Clone)]
 pub struct PresenterConfig {
     pub player: PlayerConfig,
-    pub audio: CoreAudioOutputConfig,
+    pub audio: PresenterAudioConfig,
     pub renderer: MetalRendererConfig,
     pub overlay: OverlayTimeline,
     pub danmaku: Option<DanmakuTimeline>,
     pub danmaku_config: DanmakuLayoutConfig,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresenterAudioConfig {
+    pub ring_buffer: AudioRingBufferConfig,
+}
+
+impl Default for PresenterAudioConfig {
+    fn default() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            let config = CoreAudioOutputConfig::default();
+            Self {
+                ring_buffer: config.ring_buffer,
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self {
+                ring_buffer: AudioRingBufferConfig {
+                    capacity_frames: 96_000,
+                    drop_oldest_on_overflow: true,
+                },
+            }
+        }
+    }
+}
+
 impl Default for PresenterConfig {
     fn default() -> Self {
         Self {
             player: PlayerConfig::default(),
-            audio: CoreAudioOutputConfig::default(),
+            audio: PresenterAudioConfig::default(),
             renderer: MetalRendererConfig::default(),
             overlay: OverlayTimeline::default(),
             danmaku: None,
@@ -74,7 +103,7 @@ pub struct PresenterRuntime {
     video_frames: Receiver<PlayerVideoFrame>,
     audio_frames: Receiver<PlayerAudioFrame>,
     subtitle_frames: Receiver<PlayerSubtitleFrame>,
-    audio_output: CoreAudioOutput,
+    audio_output: Box<dyn AudioOutputBackend>,
     audio_configured: bool,
     audio_started: bool,
     last_audio_clock_sync: Option<AudioClockSyncState>,
@@ -173,7 +202,7 @@ impl PresenterRuntime {
             video_frames,
             audio_frames,
             subtitle_frames,
-            audio_output: CoreAudioOutput::new(config.audio),
+            audio_output: build_audio_output(config.audio),
             audio_configured: false,
             audio_started: false,
             last_audio_clock_sync: None,
@@ -241,7 +270,7 @@ impl PresenterRuntime {
         let result = self.player.pause();
         if let Err(error) = self.audio_output.pause() {
             self.stats.audio_failures += 1;
-            eprintln!("Kuroko presenter CoreAudio pause failed: {error}");
+            eprintln!("Kuroko presenter audio pause failed: {error}");
         }
         self.audio_started = false;
         self.last_audio_clock_sync = None;
@@ -777,7 +806,7 @@ impl PresenterRuntime {
     }
 
     fn sync_player_to_audio_output(&mut self) {
-        let Ok(snapshot) = self.audio_output.clock_snapshot() else {
+        let Some(snapshot) = self.audio_output.clock_snapshot() else {
             return;
         };
         if !self.should_sync_audio_clock(snapshot) {
@@ -819,7 +848,7 @@ impl PresenterRuntime {
         if !self.audio_configured {
             if let Err(error) = self.audio_output.configure(frame.frame.format) {
                 self.stats.audio_failures += 1;
-                eprintln!("Kuroko presenter CoreAudio configure failed: {error}");
+                eprintln!("Kuroko presenter audio configure failed: {error}");
                 return;
             }
             self.audio_configured = true;
@@ -829,7 +858,7 @@ impl PresenterRuntime {
             Ok(_) => self.stats.pushed_audio_frames += 1,
             Err(error) => {
                 self.stats.audio_failures += 1;
-                eprintln!("Kuroko presenter CoreAudio push failed: {error}");
+                eprintln!("Kuroko presenter audio push failed: {error}");
                 return;
             }
         }
@@ -837,7 +866,7 @@ impl PresenterRuntime {
         if !self.audio_started && self.audio_output_ready_to_start() {
             if let Err(error) = self.audio_output.start() {
                 self.stats.audio_failures += 1;
-                eprintln!("Kuroko presenter CoreAudio start failed: {error}");
+                eprintln!("Kuroko presenter audio start failed: {error}");
                 return;
             }
             self.audio_started = true;
@@ -848,7 +877,6 @@ impl PresenterRuntime {
     fn audio_output_ready_to_start(&self) -> bool {
         self.audio_output
             .clock_snapshot()
-            .ok()
             .and_then(|snapshot| snapshot.queued_duration)
             .is_some_and(|queued| queued >= AUDIO_START_BUFFER)
     }
@@ -856,7 +884,7 @@ impl PresenterRuntime {
     fn reset_audio_output(&mut self) {
         if let Err(error) = self.audio_output.stop() {
             self.stats.audio_failures += 1;
-            eprintln!("Kuroko presenter CoreAudio reset failed: {error}");
+            eprintln!("Kuroko presenter audio reset failed: {error}");
         }
         self.audio_configured = false;
         self.audio_started = false;
@@ -954,6 +982,19 @@ fn build_renderer(
         RendererBackendPreference::FlutterTexture => Err(PlayerError::Renderer(
             "Flutter texture backend is not supported by the presenter runtime".to_string(),
         )),
+    }
+}
+
+fn build_audio_output(config: PresenterAudioConfig) -> Box<dyn AudioOutputBackend> {
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(CoreAudioOutput::new(CoreAudioOutputConfig {
+            ring_buffer: config.ring_buffer,
+        }))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Box::new(BufferedAudioOutput::new(config.ring_buffer))
     }
 }
 

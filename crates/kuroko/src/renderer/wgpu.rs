@@ -89,7 +89,7 @@ impl WgpuOffscreenReadback {
 }
 
 /// Fragment-shader uniforms for the video pipeline. The field order and byte layout
-/// mirror the Metal `VideoUniforms` in `renderer/metal/macos.rs` exactly, so both
+/// mirror the Metal `VideoUniforms` in `renderer/metal/apple.rs` exactly, so both
 /// backends consume the same data and produce the same pixels.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]

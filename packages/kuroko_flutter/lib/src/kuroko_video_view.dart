@@ -58,18 +58,35 @@ class _KurokoVideoViewState extends State<KurokoVideoView> {
 
   @override
   Widget build(BuildContext context) {
-    if (kIsWeb || defaultTargetPlatform != TargetPlatform.macOS) {
+    if (kIsWeb) {
       return const SizedBox.shrink();
     }
-    return AppKitView(
-      viewType: 'kuroko_flutter/video_view',
-      layoutDirection: TextDirection.ltr,
-      creationParamsCodec: const StandardMessageCodec(),
-      creationParams: <String, Object?>{
-        if (widget.debugLabel case final label?) 'debugLabel': label,
-      },
-      onPlatformViewCreated: _handlePlatformViewCreated,
-    );
+    final creationParams = <String, Object?>{
+      if (widget.debugLabel case final label?) 'debugLabel': label,
+    };
+    switch (defaultTargetPlatform) {
+      case TargetPlatform.macOS:
+        return AppKitView(
+          viewType: 'kuroko_flutter/video_view',
+          layoutDirection: TextDirection.ltr,
+          creationParamsCodec: const StandardMessageCodec(),
+          creationParams: creationParams,
+          onPlatformViewCreated: _handlePlatformViewCreated,
+        );
+      case TargetPlatform.iOS:
+        return UiKitView(
+          viewType: 'kuroko_flutter/video_view',
+          layoutDirection: TextDirection.ltr,
+          creationParamsCodec: const StandardMessageCodec(),
+          creationParams: creationParams,
+          onPlatformViewCreated: _handlePlatformViewCreated,
+        );
+      case TargetPlatform.android:
+      case TargetPlatform.fuchsia:
+      case TargetPlatform.linux:
+      case TargetPlatform.windows:
+        return const SizedBox.shrink();
+    }
   }
 }
 

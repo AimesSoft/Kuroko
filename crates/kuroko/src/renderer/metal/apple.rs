@@ -4,7 +4,7 @@ use std::ptr::NonNull;
 
 use crate::core::{PlayerError, Result};
 use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
+use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2_core_foundation::CFRetained;
 use objc2_core_foundation::CGSize;
 use objc2_core_graphics::{CGColorSpace, kCGColorSpaceExtendedLinearSRGB, kCGColorSpaceSRGB};
@@ -178,7 +178,7 @@ impl MetalRendererImpl {
     fn configure_layer_output(&mut self, layer: &CAMetalLayer) {
         self.drawable_pixel_format = self.output_mode.pixel_format();
         layer.setPixelFormat(metal_pixel_format(self.drawable_pixel_format));
-        layer.setWantsExtendedDynamicRangeContent(self.output_mode.is_edr());
+        set_layer_edr_enabled(layer, self.output_mode.is_edr());
         let color_space_name = if self.output_mode.is_edr() {
             Some(unsafe { kCGColorSpaceExtendedLinearSRGB })
         } else {
@@ -1041,6 +1041,12 @@ impl MetalRendererImpl {
             .as_ref()
             .expect("overlay pipeline exists")
             .clone())
+    }
+}
+
+fn set_layer_edr_enabled(layer: &CAMetalLayer, enabled: bool) {
+    if layer.respondsToSelector(objc2::sel!(setWantsExtendedDynamicRangeContent:)) {
+        layer.setWantsExtendedDynamicRangeContent(enabled);
     }
 }
 
