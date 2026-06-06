@@ -176,6 +176,33 @@ void main() {
     await player.dispose();
   });
 
+  test('danmaku config coalesces rapid updates', () async {
+    final player = KurokoPlayer();
+
+    final first = player.setDanmakuConfig(fontSize: 24.0);
+    final second = player.setDanmakuConfig(fontSize: 30.0);
+    final third = player.setDanmakuConfig(fontSize: 30.0, opacity: 0.75);
+    await Future.wait(<Future<void>>[first, second, third]);
+
+    final calls = playerCalls
+        .where((MethodCall call) => call.method == 'setDanmakuConfig')
+        .toList(growable: false);
+    expect(calls, hasLength(1));
+    expect(calls.single.arguments, <String, Object?>{
+      'playerId': 7,
+      'fontSize': 30.0,
+      'opacity': 0.75,
+    });
+
+    await player.setDanmakuConfig(fontSize: 30.0, opacity: 0.75);
+    final callsAfterDuplicate = playerCalls
+        .where((MethodCall call) => call.method == 'setDanmakuConfig')
+        .toList(growable: false);
+    expect(callsAfterDuplicate, hasLength(1));
+
+    await player.dispose();
+  });
+
   test('danmaku track controls forward multi-track input', () async {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(playerChannel, (MethodCall call) async {

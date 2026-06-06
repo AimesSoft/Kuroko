@@ -416,7 +416,9 @@ impl PresenterRuntime {
     }
 
     pub fn set_danmaku_config(&mut self, config: DanmakuLayoutConfig) {
-        self.danmaku.set_config(config);
+        if !self.danmaku.set_config(config) {
+            return;
+        }
         self.current_danmaku = None;
         self.current_danmaku_viewport = None;
         self.bump_danmaku_generation();
@@ -1337,6 +1339,26 @@ mod tests {
 
         assert_eq!(danmaku_generation, 5);
         assert_eq!(generation, 8);
+    }
+
+    #[test]
+    fn repeated_danmaku_config_does_not_bump_generation() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+        let original_generation = presenter.current_generation;
+
+        presenter.set_danmaku_config(DanmakuLayoutConfig::default());
+
+        assert_eq!(presenter.current_generation, original_generation);
+
+        let mut config = DanmakuLayoutConfig::default();
+        config.font_size += 1.0;
+        presenter.set_danmaku_config(config.clone());
+        let changed_generation = presenter.current_generation;
+
+        assert!(changed_generation > original_generation);
+        presenter.set_danmaku_config(config);
+
+        assert_eq!(presenter.current_generation, changed_generation);
     }
 
     #[test]
