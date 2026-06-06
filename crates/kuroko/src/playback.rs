@@ -1451,9 +1451,12 @@ impl VideoPlaybackEngine {
 
         let frame = self.pending_audio.take().expect("pending audio exists");
         let late_by = pts.and_then(|pts| media_time.checked_sub(pts));
-        if let Some(pts) = pts {
-            self.sync_clock_to_audio(pts, now);
-        }
+        // The master clock is disciplined to the audio OUTPUT's real playback
+        // position (presenter::sync_player_to_audio_output -> update_audio_clock
+        // -> sync_to_audio_clock), NOT to this just-decoded frame's pts.
+        // Disciplining to the decode pts pulled the clock to the audio buffer's
+        // leading edge, so video ran ahead of the audio actually being heard,
+        // drifting worse as the buffer filled.
         Ok(Some(TimedAudioFrame {
             frame,
             pts,
@@ -1592,14 +1595,6 @@ impl VideoPlaybackEngine {
         Ok(())
     }
 
-    fn sync_clock_to_audio(&mut self, pts: Duration, now: Instant) {
-        if self.timing.clock_mode != PlaybackClockMode::AudioMaster {
-            return;
-        }
-        let _ =
-            self.clock
-                .discipline_to(pts, now, PlaybackClockSource::Audio, self.timing.audio_sync);
-    }
 }
 
 fn drain_video_frames(decoder: &mut Decoder, frames: &mut VecDeque<Frame>) -> Result<()> {
