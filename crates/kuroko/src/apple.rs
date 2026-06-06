@@ -263,24 +263,6 @@ pub mod coreaudio {
         Ok(())
     }
 
-    fn normalize_volume(volume: f32) -> f32 {
-        if volume.is_finite() {
-            volume.clamp(0.0, 1.0)
-        } else {
-            1.0
-        }
-    }
-
-    fn apply_volume(samples: &mut [f32], volume: f32) {
-        let volume = normalize_volume(volume);
-        if (volume - 1.0).abs() <= f32::EPSILON {
-            return;
-        }
-        for sample in samples {
-            *sample *= volume;
-        }
-    }
-
     fn configure_buffer(buffer: &Arc<Mutex<AudioRingBuffer>>, format: PcmFormat) -> Result<()> {
         let mut buffer = buffer
             .lock()
