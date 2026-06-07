@@ -9,7 +9,7 @@ version.workspace = true
 build = "build.rs"
 
 [dependencies]
-kuroko = { path = "../../crates/kuroko" }
+erika = { path = "../../crates/erika" }
 
 [build-dependencies]
 cc = "1.2.47"

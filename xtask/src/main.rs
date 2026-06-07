@@ -278,7 +278,7 @@ fn workspace_layout(profile: NativeDependencyProfile) -> Result<WorkspaceLayout>
 }
 
 fn print_dependency_plan(profile: NativeDependencyProfile) {
-    println!("Kuroko native dependency plan");
+    println!("Erika native dependency plan");
     println!("profile: {}", profile_name(profile));
     println!("ffmpeg: {FFMPEG_VERSION} ({})", FFMPEG_URLS[0]);
     println!("libass: {LIBASS_VERSION} ({})", LIBASS_URLS[0]);
@@ -332,7 +332,7 @@ fn build_dependencies(options: DepsOptions) -> Result<()> {
 }
 
 fn print_dependency_status(layout: &WorkspaceLayout) -> Result<()> {
-    println!("Kuroko native dependency status");
+    println!("Erika native dependency status");
     println!("workspace: {}", layout.root.display());
     println!("cache dir: {}", layout.cache_dir.display());
     println!("source dir: {}", layout.source_dir.display());
@@ -377,10 +377,10 @@ fn print_dependency_status(layout: &WorkspaceLayout) -> Result<()> {
         "libass dist: {}",
         status_word(layout.libass_prefix.join("lib/libass.a").exists())
     );
-    if layout.dist_dir.join("kuroko-native-deps.txt").exists() {
+    if layout.dist_dir.join("erika-native-deps.txt").exists() {
         println!(
             "metadata: {}",
-            layout.dist_dir.join("kuroko-native-deps.txt").display()
+            layout.dist_dir.join("erika-native-deps.txt").display()
         );
     } else {
         println!("metadata: missing");
@@ -882,7 +882,7 @@ fn write_profile_metadata(
     profile: NativeDependencyProfile,
 ) -> Result<()> {
     fs::write(
-        layout.dist_dir.join("kuroko-native-deps.txt"),
+        layout.dist_dir.join("erika-native-deps.txt"),
         format!(
             "profile={}\nffmpeg={}\nffmpeg_dist={}\nlibass={}\nlibass_source={}\nharfbuzz={}\nharfbuzz_source={}\nfreetype={}\nfreetype_source={}\n",
             profile_name(profile),
@@ -902,10 +902,10 @@ fn write_profile_metadata(
 
 fn check_license_policy() -> Result<()> {
     let root = workspace_root()?;
-    let manifest = fs::read_to_string(root.join("crates/kuroko_ffmpeg_sys/Cargo.toml"))
-        .context("read kuroko_ffmpeg_sys manifest")?;
+    let manifest = fs::read_to_string(root.join("crates/erika_ffmpeg_sys/Cargo.toml"))
+        .context("read erika_ffmpeg_sys manifest")?;
     if !manifest.contains("default = [\"lgpl\"]") {
-        bail!("kuroko_ffmpeg_sys default feature must be exactly lgpl");
+        bail!("erika_ffmpeg_sys default feature must be exactly lgpl");
     }
     if !NativeDependencyProfile::Lgpl
         .ffmpeg_configure_flags()
@@ -990,7 +990,7 @@ fn command_display(command: &Command) -> String {
 }
 
 fn print_help() {
-    println!("Kuroko xtask");
+    println!("Erika xtask");
     println!("  cargo run -p xtask -- deps plan --profile lgpl");
     println!("  cargo run -p xtask -- deps fetch --profile lgpl [--all]");
     println!("  cargo run -p xtask -- deps status --profile lgpl");

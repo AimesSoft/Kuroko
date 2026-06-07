@@ -1,6 +1,6 @@
 # Flutter Embedding
 
-Kuroko is not a Flutter video renderer. Flutter is an optional host UI.
+Erika is not a Flutter video renderer. Flutter is an optional host UI.
 The player owns decode, timing, native rendering, subtitles, danmaku, audio, and
 HDR presentation.
 
@@ -11,14 +11,14 @@ foundation.
 
 There are two C ABI entrypoint families:
 
-- `KurokoHandle`: control and event API. Use this when the host owns its own
+- `ErikaHandle`: control and event API. Use this when the host owns its own
   presenter loop or only wants to probe/control playback.
-- `KurokoPresenterHandle`: presenter-owned API. Use this when Kuroko should
+- `ErikaPresenterHandle`: presenter-owned API. Use this when Erika should
   own `Player + MetalRenderer + CoreAudio` and the host only supplies a native
   surface plus a display-tick callback.
 
 Both families are declared in
-`crates/kuroko_capi/include/kuroko.h`.
+`crates/erika_capi/include/erika.h`.
 
 ## macOS HDR Path
 
@@ -38,39 +38,39 @@ The intended plugin shape is:
 4. The plugin sends geometry updates to native code with a surface generation
    number.
 5. Native code attaches the `CAMetalLayer` pointer through
-   `kuroko_presenter_attach_metal_layer`.
-6. Native code drives `kuroko_presenter_render_tick` from a display timer such as
+   `erika_presenter_attach_metal_layer`.
+6. Native code drives `erika_presenter_render_tick` from a display timer such as
    `CVDisplayLink`, AppKit display callbacks, or a platform timer.
 7. Dispose/hide calls only detach the surface if their generation still matches
    the currently attached surface.
 
 The important ownership rule is simple: Flutter owns layout and controls;
-Kuroko owns the video plane, subtitle plane, danmaku plane, audio, and
+Erika owns the video plane, subtitle plane, danmaku plane, audio, and
 timing.
 
 ## Minimal macOS Presenter Flow
 
 ```c
-KurokoPresenterHandle *presenter = kuroko_presenter_create();
-kuroko_presenter_attach_metal_layer(
+ErikaPresenterHandle *presenter = erika_presenter_create();
+erika_presenter_attach_metal_layer(
     presenter,
     (uint64_t)cametal_layer,
     width,
     height,
     backing_scale);
-kuroko_presenter_open(presenter, "/path/to/media.mp4");
-kuroko_presenter_play(presenter);
+erika_presenter_open(presenter, "/path/to/media.mp4");
+erika_presenter_play(presenter);
 
 // On every display tick:
-KurokoPresenterStats stats;
-kuroko_presenter_render_tick(presenter, host_time_seconds, &stats);
+ErikaPresenterStats stats;
+erika_presenter_render_tick(presenter, host_time_seconds, &stats);
 
 // On resize:
-kuroko_presenter_resize_surface(presenter, width, height, backing_scale);
+erika_presenter_resize_surface(presenter, width, height, backing_scale);
 
 // On dispose:
-kuroko_presenter_detach_surface(presenter);
-kuroko_presenter_destroy(presenter);
+erika_presenter_detach_surface(presenter);
+erika_presenter_destroy(presenter);
 ```
 
 The current native demo already uses this pattern:
@@ -91,7 +91,7 @@ Texture output is useful for:
 Texture output is not the preferred HDR/EDR route because video enters
 Flutter's compositor. On Apple platforms, that means it cannot be treated as
 equivalent to a renderer-owned Metal surface. The C ABI already has
-`kuroko_attach_flutter_texture` so the host API shape is reserved, but the
+`erika_attach_flutter_texture` so the host API shape is reserved, but the
 production renderer path should keep HDR playback on the native presenter.
 
 ## WGPU Fallback
@@ -121,10 +121,10 @@ surface.
 The ownership is different:
 
 - Earlier NipaPlay work proved the host-side macOS HDR embedding strategy.
-- Kuroko moves decode, frame import, Metal rendering, CoreAudio, subtitle
+- Erika moves decode, frame import, Metal rendering, CoreAudio, subtitle
   overlay, danmaku layout, and timing into a standalone Rust player.
 - Flutter will call a narrow C ABI instead of owning playback internals.
 
 That makes the native-surface approach a normal player-kernel integration:
-Flutter remains the app shell, while Kuroko behaves like a platform media
+Flutter remains the app shell, while Erika behaves like a platform media
 engine that presents directly into native surfaces.

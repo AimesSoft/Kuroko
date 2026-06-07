@@ -2,7 +2,7 @@ use std::env;
 use std::process;
 use std::time::Duration;
 
-use kuroko::ffmpeg::{Demuxer, StreamSelection};
+use erika::ffmpeg::{Demuxer, StreamSelection};
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -57,7 +57,7 @@ fn main() {
     }
 
     let probe = demuxer.probe();
-    println!("Kuroko FFmpeg demux");
+    println!("Erika FFmpeg demux");
     println!("uri: {}", probe.uri);
     match probe.duration {
         Some(duration) => println!("duration: {:.3}s", duration.as_secs_f64()),
@@ -98,7 +98,7 @@ fn main() {
     }
 }
 
-fn read_next_packet(demuxer: &mut Demuxer) -> Option<kuroko::ffmpeg::Packet> {
+fn read_next_packet(demuxer: &mut Demuxer) -> Option<erika::ffmpeg::Packet> {
     match demuxer.read_packet() {
         Ok(packet) => packet,
         Err(error) => {

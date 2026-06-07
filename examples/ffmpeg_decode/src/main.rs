@@ -1,8 +1,8 @@
 use std::env;
 use std::process;
 
-use kuroko::TrackKind;
-use kuroko::ffmpeg::{DecoderOutputFrame, Demuxer, StreamSelection};
+use erika::TrackKind;
+use erika::ffmpeg::{DecoderOutputFrame, Demuxer, StreamSelection};
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -57,7 +57,7 @@ fn main() {
         process::exit(1);
     });
 
-    println!("Kuroko FFmpeg decode");
+    println!("Erika FFmpeg decode");
     println!("uri: {}", demuxer.probe().uri);
     println!("stream: {stream_index}");
 
@@ -87,7 +87,7 @@ fn main() {
     }
 }
 
-fn drain_frames(decoder: &mut kuroko::ffmpeg::Decoder, decoded: &mut usize, limit: usize) {
+fn drain_frames(decoder: &mut erika::ffmpeg::Decoder, decoded: &mut usize, limit: usize) {
     loop {
         match decoder.receive_frame() {
             Ok(DecoderOutputFrame::Frame(frame)) => {

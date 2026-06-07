@@ -1,8 +1,8 @@
 use std::env;
 use std::process;
 
-use kuroko::MediaRequest;
-use kuroko::playback::{PlaybackSession, PlaybackSessionConfig};
+use erika::MediaRequest;
+use erika::playback::{PlaybackSession, PlaybackSessionConfig};
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -28,7 +28,7 @@ fn main() {
             process::exit(1);
         });
     let info = session.info();
-    println!("Kuroko playback audio tick");
+    println!("Erika playback audio tick");
     println!("uri: {}", info.uri);
     println!("duration: {:?}", info.duration);
     println!("selected audio: {:?}", info.selected_audio_track);

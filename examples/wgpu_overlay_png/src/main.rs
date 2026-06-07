@@ -2,9 +2,9 @@
 //! subtitle bitmap over them through the wgpu overlay pass, writing a PNG. Proves
 //! the wgpu overlay/subtitle compositing path (alpha-blended over the video).
 
-use kuroko::overlay::{OverlayFrame, OverlayViewport};
-use kuroko::renderer::wgpu::{VideoUniforms, WgpuRenderer};
-use kuroko::subtitle::{SubtitleAlphaBitmap, SubtitleBitmapPlacement, SubtitleBitmapPlane};
+use erika::overlay::{OverlayFrame, OverlayViewport};
+use erika::renderer::wgpu::{VideoUniforms, WgpuRenderer};
+use erika::subtitle::{SubtitleAlphaBitmap, SubtitleBitmapPlacement, SubtitleBitmapPlane};
 
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 180;
@@ -23,7 +23,7 @@ const BARS: [[u8; 3]; 8] = [
 fn main() {
     let out = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "/tmp/kuroko_wgpu_overlay.png".to_string());
+        .unwrap_or_else(|| "/tmp/erika_wgpu_overlay.png".to_string());
 
     let (luma, chroma) = color_bars_nv12();
     let mut renderer = WgpuRenderer::new().expect("create wgpu renderer");

@@ -9,18 +9,18 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use kuroko::core::PlayerConfig;
-use kuroko::danmaku::{
+use erika::core::PlayerConfig;
+use erika::danmaku::{
     DanmakuColor, DanmakuFrameStats, DanmakuItem, DanmakuLayoutConfig, DanmakuMode,
     DanmakuShadowStyle, DanmakuTimeline, DanmakuViewport, DfmLayoutEngine,
 };
-use kuroko::playback::{PlaybackSessionConfig, VideoDecodePreference, VideoPlaybackEngine};
-use kuroko::presenter::{PresenterConfig, PresenterRuntime};
-use kuroko::renderer::metal::MetalRendererConfig;
-use kuroko::{MediaRequest, MetalSurfaceHandle, PlatformSurface};
+use erika::playback::{PlaybackSessionConfig, VideoDecodePreference, VideoPlaybackEngine};
+use erika::presenter::{PresenterConfig, PresenterRuntime};
+use erika::renderer::metal::MetalRendererConfig;
+use erika::{MediaRequest, MetalSurfaceHandle, PlatformSurface};
 
 unsafe extern "C" {
-    fn kuroko_perf_lab_run_app();
+    fn erika_perf_lab_run_app();
 }
 
 static WINDOW_OPTIONS: OnceLock<PerfOptions> = OnceLock::new();
@@ -74,7 +74,7 @@ fn run(options: PerfOptions) -> Result<(), String> {
     let viewport = DanmakuViewport::new(options.width, options.height);
     let mut engine = DfmLayoutEngine::new(timeline, config);
 
-    println!("Kuroko danmaku perf lab");
+    println!("Erika danmaku perf lab");
     println!(
         "mode: {}",
         if options.video_uri.is_some() {
@@ -159,7 +159,7 @@ fn run_window(options: PerfOptions) -> Result<(), String> {
     WINDOW_OPTIONS
         .set(options)
         .map_err(|_| "window options already initialized".to_string())?;
-    unsafe { kuroko_perf_lab_run_app() };
+    unsafe { erika_perf_lab_run_app() };
     Ok(())
 }
 
@@ -170,9 +170,8 @@ fn run_synthetic(
     samples: &mut Vec<FrameSample>,
 ) {
     for frame_index in 0..options.frames {
-        let media_time = Duration::from_secs_f64(
-            options.start_time_seconds + frame_index as f64 / options.fps,
-        );
+        let media_time =
+            Duration::from_secs_f64(options.start_time_seconds + frame_index as f64 / options.fps);
         samples.push(run_one_frame(
             engine,
             viewport,
@@ -274,9 +273,11 @@ impl WindowLabState {
         })
         .map_err(|error| error.to_string())?;
         let metrics_log = match options.metrics_log_path.as_deref() {
-            Some(path) => Some(BufWriter::new(
-                File::create(path).map_err(|error| format!("metrics log create failed: {error}"))?,
-            )),
+            Some(path) => {
+                Some(BufWriter::new(File::create(path).map_err(|error| {
+                    format!("metrics log create failed: {error}")
+                })?))
+            }
             None => None,
         };
         let now = Instant::now();
@@ -645,7 +646,7 @@ fn layout_config_from_options(options: &PerfOptions) -> DanmakuLayoutConfig {
 
 fn format_buckets(
     count: usize,
-    buckets: &[kuroko::danmaku::DanmakuDebugBucket; kuroko::danmaku::DANMAKU_DEBUG_BUCKETS],
+    buckets: &[erika::danmaku::DanmakuDebugBucket; erika::danmaku::DANMAKU_DEBUG_BUCKETS],
 ) -> String {
     if count == 0 {
         return "-".to_string();
@@ -695,7 +696,7 @@ fn window_options_or_default() -> PerfOptions {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_attach_layer(
+pub extern "C" fn erika_perf_lab_attach_layer(
     layer: *mut c_void,
     width: u32,
     height: u32,
@@ -705,37 +706,37 @@ pub extern "C" fn kuroko_perf_lab_attach_layer(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_resize_layer(width: u32, height: u32, scale: f64) {
+pub extern "C" fn erika_perf_lab_resize_layer(width: u32, height: u32, scale: f64) {
     with_lab_mut((), |lab| lab.resize_surface(width, height, scale));
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_render_frame(host_time_seconds: f64) {
+pub extern "C" fn erika_perf_lab_render_frame(host_time_seconds: f64) {
     with_lab_mut((), |lab| lab.render_tick(host_time_seconds));
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_should_auto_exit() -> bool {
+pub extern "C" fn erika_perf_lab_should_auto_exit() -> bool {
     with_lab_mut(false, |lab| lab.should_auto_exit())
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_toggle_play_pause() {
+pub extern "C" fn erika_perf_lab_toggle_play_pause() {
     with_lab_mut((), WindowLabState::toggle_play_pause);
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_seek_seconds(seconds: f64) {
+pub extern "C" fn erika_perf_lab_seek_seconds(seconds: f64) {
     with_lab_mut((), |lab| lab.seek(seconds));
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_position_seconds() -> f64 {
+pub extern "C" fn erika_perf_lab_position_seconds() -> f64 {
     with_lab_mut(0.0, |lab| lab.presenter.media_time().as_secs_f64())
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_duration_seconds() -> f64 {
+pub extern "C" fn erika_perf_lab_duration_seconds() -> f64 {
     with_lab_mut(0.0, |lab| {
         lab.presenter
             .duration()
@@ -745,12 +746,12 @@ pub extern "C" fn kuroko_perf_lab_duration_seconds() -> f64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_is_playing() -> bool {
+pub extern "C" fn erika_perf_lab_is_playing() -> bool {
     with_lab_mut(false, |lab| lab.presenter.is_playing())
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_metrics_text() -> *const i8 {
+pub extern "C" fn erika_perf_lab_metrics_text() -> *const i8 {
     let text = with_lab_mut(String::new(), WindowLabState::metrics_text);
     let c_string = CString::new(text).unwrap_or_else(|_| CString::new("invalid metrics").unwrap());
     if let Ok(mut slot) = METRICS_TEXT.lock() {
@@ -763,27 +764,27 @@ pub extern "C" fn kuroko_perf_lab_metrics_text() -> *const i8 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_set_density(comments_per_second: f64) {
+pub extern "C" fn erika_perf_lab_set_density(comments_per_second: f64) {
     with_lab_mut((), |lab| lab.set_density(comments_per_second));
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_set_font_size(font_size: f64) {
+pub extern "C" fn erika_perf_lab_set_font_size(font_size: f64) {
     with_lab_mut((), |lab| lab.set_font_size(font_size));
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_set_display_area(display_area: f64) {
+pub extern "C" fn erika_perf_lab_set_display_area(display_area: f64) {
     with_lab_mut((), |lab| lab.set_display_area(display_area));
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_set_outline(outline_width: f64) {
+pub extern "C" fn erika_perf_lab_set_outline(outline_width: f64) {
     with_lab_mut((), |lab| lab.set_outline(outline_width));
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_density() -> f64 {
+pub extern "C" fn erika_perf_lab_density() -> f64 {
     LAB.with(|slot| {
         slot.borrow()
             .as_ref()
@@ -793,7 +794,7 @@ pub extern "C" fn kuroko_perf_lab_density() -> f64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_font_size() -> f64 {
+pub extern "C" fn erika_perf_lab_font_size() -> f64 {
     LAB.with(|slot| {
         slot.borrow()
             .as_ref()
@@ -803,7 +804,7 @@ pub extern "C" fn kuroko_perf_lab_font_size() -> f64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_display_area() -> f64 {
+pub extern "C" fn erika_perf_lab_display_area() -> f64 {
     LAB.with(|slot| {
         slot.borrow()
             .as_ref()
@@ -813,7 +814,7 @@ pub extern "C" fn kuroko_perf_lab_display_area() -> f64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_outline() -> f64 {
+pub extern "C" fn erika_perf_lab_outline() -> f64 {
     LAB.with(|slot| {
         slot.borrow()
             .as_ref()
@@ -823,38 +824,44 @@ pub extern "C" fn kuroko_perf_lab_outline() -> f64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_window_width() -> f64 {
-    window_options_or_default().window_width.map_or(0.0, f64::from)
+pub extern "C" fn erika_perf_lab_window_width() -> f64 {
+    window_options_or_default()
+        .window_width
+        .map_or(0.0, f64::from)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_window_height() -> f64 {
-    window_options_or_default().window_height.map_or(0.0, f64::from)
+pub extern "C" fn erika_perf_lab_window_height() -> f64 {
+    window_options_or_default()
+        .window_height
+        .map_or(0.0, f64::from)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_fullscreen() -> bool {
+pub extern "C" fn erika_perf_lab_fullscreen() -> bool {
     window_options_or_default().fullscreen
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_uncapped() -> bool {
+pub extern "C" fn erika_perf_lab_uncapped() -> bool {
     window_options_or_default().uncapped
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_target_fps() -> f64 {
+pub extern "C" fn erika_perf_lab_target_fps() -> f64 {
     window_options_or_default().target_fps
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_hide_panel() -> bool {
+pub extern "C" fn erika_perf_lab_hide_panel() -> bool {
     window_options_or_default().hide_panel
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kuroko_perf_lab_surface_scale_override() -> f64 {
-    window_options_or_default().surface_scale_override.unwrap_or(0.0)
+pub extern "C" fn erika_perf_lab_surface_scale_override() -> f64 {
+    window_options_or_default()
+        .surface_scale_override
+        .unwrap_or(0.0)
 }
 
 fn prewarm_atlas(
@@ -1180,7 +1187,7 @@ fn text_for(pattern: PerfPattern, index: usize) -> String {
     const BASE: &[&str] = &[
         "这句好戳",
         "现在这条应该跟着画面走",
-        "Kuroko 原生弹幕压测",
+        "Erika 原生弹幕压测",
         "seek 后不能回跳",
         "DFM+ track collision",
         "莉可丽丝",
@@ -1396,7 +1403,8 @@ fn parse_args(args: &[String]) -> Result<PerfOptions, String> {
             "--hide-panel" => options.hide_panel = true,
             "--surface-scale" => {
                 let scale: f64 = next_parse(args, &mut index, "--surface-scale")?;
-                options.surface_scale_override = (scale.is_finite() && scale > 0.0).then_some(scale);
+                options.surface_scale_override =
+                    (scale.is_finite() && scale > 0.0).then_some(scale);
             }
             "--target-fps" => options.target_fps = next_parse(args, &mut index, "--target-fps")?,
             "--font-size" => options.font_size = next_parse(args, &mut index, "--font-size")?,

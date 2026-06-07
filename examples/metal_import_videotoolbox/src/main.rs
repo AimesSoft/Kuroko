@@ -1,9 +1,9 @@
 use std::env;
 use std::process;
 
-use kuroko::TrackKind;
-use kuroko::ffmpeg::{DecoderConfig, DecoderOutputFrame, Demuxer, StreamSelection};
-use kuroko::renderer::metal::{MetalRenderer, VideoFrameTextureSource};
+use erika::TrackKind;
+use erika::ffmpeg::{DecoderConfig, DecoderOutputFrame, Demuxer, StreamSelection};
+use erika::renderer::metal::{MetalRenderer, VideoFrameTextureSource};
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -49,7 +49,7 @@ fn main() {
             process::exit(1);
         });
     let mut decoder =
-        kuroko::ffmpeg::Decoder::open_with_config(parameters, DecoderConfig::videotoolbox())
+        erika::ffmpeg::Decoder::open_with_config(parameters, DecoderConfig::videotoolbox())
             .unwrap_or_else(|error| {
                 eprintln!("VideoToolbox decoder open failed: {error}");
                 process::exit(1);
@@ -59,7 +59,7 @@ fn main() {
         process::exit(1);
     });
 
-    println!("Kuroko VideoToolbox -> CVMetalTextureCache import");
+    println!("Erika VideoToolbox -> CVMetalTextureCache import");
     println!("uri: {}", demuxer.probe().uri);
     println!("stream: {stream_index}");
 
@@ -93,7 +93,7 @@ fn main() {
     }
 }
 
-fn import_first_frame(decoder: &mut kuroko::ffmpeg::Decoder, renderer: &mut MetalRenderer) -> bool {
+fn import_first_frame(decoder: &mut erika::ffmpeg::Decoder, renderer: &mut MetalRenderer) -> bool {
     loop {
         match decoder.receive_frame() {
             Ok(DecoderOutputFrame::Frame(frame)) => {

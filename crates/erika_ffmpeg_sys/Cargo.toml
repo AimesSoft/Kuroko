@@ -1,0 +1,18 @@
+[package]
+name = "erika_ffmpeg_sys"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+default = ["lgpl"]
+gpl-full = []
+lgpl = []
+
+[dependencies]
+libc.workspace = true
+
+[build-dependencies]
+bindgen.workspace = true
