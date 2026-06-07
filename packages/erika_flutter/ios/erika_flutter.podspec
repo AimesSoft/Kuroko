@@ -16,6 +16,7 @@ Flutter iOS plugin that hosts a CAMetalLayer and drives Erika through its C ABI.
   s.script_phase = {
     :name => 'Build Erika C ABI',
     :execution_position => :before_compile,
+    :output_files => ['${PODS_TARGET_SRCROOT}/native/liberika_capi.a'],
     :script => <<-SCRIPT
 set -eu
 
