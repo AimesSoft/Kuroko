@@ -8,7 +8,10 @@ use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2_core_foundation::CFRetained;
 use objc2_core_foundation::CGSize;
-use objc2_core_graphics::{CGColorSpace, kCGColorSpaceExtendedLinearSRGB, kCGColorSpaceSRGB};
+use objc2_core_graphics::{
+    CGColorSpace, kCGColorSpaceDisplayP3_PQ, kCGColorSpaceExtendedLinearSRGB,
+    kCGColorSpaceITUR_2100_PQ, kCGColorSpaceSRGB,
+};
 use objc2_core_video::kCVReturnSuccess;
 use objc2_core_video::{
     CVImageBuffer, CVMetalTexture, CVMetalTextureCache, CVMetalTextureGetTexture,
@@ -41,6 +44,7 @@ use objc2_metal::{
 use objc2_metal::{MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerState};
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
+use crate::core::{ColorPrimaries, TransferFunction};
 use crate::danmaku::{DanmakuGlyphAtlas, DanmakuRenderPlan};
 use crate::renderer::metal::{
     ClearColor, DanmakuRenderFrame, ImportedVideoFormat, ImportedVideoFrameInfo,
@@ -112,6 +116,7 @@ pub struct MetalRendererImpl {
     danmaku_vertex_buffer: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     danmaku_vertex_buffer_len: usize,
     stats: MetalRendererStats,
+    layer_color_space_label: &'static str,
 }
 
 impl MetalRendererImpl {
@@ -138,6 +143,7 @@ impl MetalRendererImpl {
             danmaku_vertex_buffer: None,
             danmaku_vertex_buffer_len: 0,
             stats: MetalRendererStats::default(),
+            layer_color_space_label: "unconfigured",
         })
     }
 
@@ -186,10 +192,10 @@ impl MetalRendererImpl {
         self.drawable_pixel_format = self.output_mode.pixel_format();
         layer.setPixelFormat(metal_pixel_format(self.drawable_pixel_format));
         set_layer_edr_enabled(layer, self.output_mode.is_edr());
-        let color_space_name = if self.output_mode.is_edr() {
-            Some(unsafe { kCGColorSpaceExtendedLinearSRGB })
+        let (color_space_name, color_space_label) = if self.output_mode.is_edr() {
+            edr_layer_color_space(None)
         } else {
-            Some(unsafe { kCGColorSpaceSRGB })
+            (Some(unsafe { kCGColorSpaceSRGB }), "srgb")
         };
         if let Some(color_space) = CGColorSpace::with_name(color_space_name) {
             layer.setColorspace(Some(&color_space));
@@ -200,6 +206,25 @@ impl MetalRendererImpl {
         self.overlay_alpha_atlas_cache = None;
         self.danmaku_vertex_buffer = None;
         self.danmaku_vertex_buffer_len = 0;
+        self.layer_color_space_label = color_space_label;
+    }
+
+    fn configure_layer_source_color(
+        &mut self,
+        layer: &CAMetalLayer,
+        source: crate::renderer::pipeline::SourceColorState,
+    ) {
+        if !self.output_mode.is_edr() {
+            return;
+        }
+        let (color_space_name, color_space_label) = edr_layer_color_space(Some(source));
+        if color_space_label == self.layer_color_space_label {
+            return;
+        }
+        if let Some(color_space) = CGColorSpace::with_name(color_space_name) {
+            layer.setColorspace(Some(&color_space));
+            self.layer_color_space_label = color_space_label;
+        }
     }
 
     pub fn record_prepared_overlay_frame(&mut self, info: PreparedOverlayFrameInfo) {
@@ -355,7 +380,7 @@ impl MetalRendererImpl {
         self.stats.last_danmaku_encode_duration = Duration::ZERO;
         self.stats.last_danmaku_vertex_bytes = 0;
         self.stats.last_danmaku_vertex_count = 0;
-        let Some(layer) = &self.layer else {
+        let Some(layer) = self.layer.as_ref().cloned() else {
             return Err(PlayerError::Renderer(
                 "no CAMetalLayer attached".to_string(),
             ));
@@ -377,7 +402,11 @@ impl MetalRendererImpl {
             ));
         };
 
-        frame.pipeline = frame.pipeline.with_target(self.output_mode.target_color());
+        let source_color = frame.pipeline.source;
+        self.configure_layer_source_color(&layer, source_color);
+        frame.pipeline = frame
+            .pipeline
+            .with_target(self.output_mode.target_color_for_source(source_color));
 
         unsafe {
             let Some(drawable): Option<Retained<ProtocolObject<dyn CAMetalDrawable>>> =
@@ -1252,6 +1281,27 @@ fn metal_pixel_format(format: MetalDrawablePixelFormat) -> MTLPixelFormat {
     }
 }
 
+fn edr_layer_color_space(
+    source: Option<crate::renderer::pipeline::SourceColorState>,
+) -> (
+    Option<&'static objc2_core_foundation::CFString>,
+    &'static str,
+) {
+    match source.map(|source| (source.primaries, source.transfer)) {
+        Some((ColorPrimaries::DisplayP3, TransferFunction::Pq)) => {
+            (Some(unsafe { kCGColorSpaceDisplayP3_PQ }), "display-p3-pq")
+        }
+        Some((ColorPrimaries::Bt2020, TransferFunction::Pq))
+        | Some((ColorPrimaries::Unknown, TransferFunction::Pq)) => {
+            (Some(unsafe { kCGColorSpaceITUR_2100_PQ }), "itur-2100-pq")
+        }
+        _ => (
+            Some(unsafe { kCGColorSpaceExtendedLinearSRGB }),
+            "extended-linear-srgb",
+        ),
+    }
+}
+
 fn transfer_code(transfer: crate::core::TransferFunction) -> u32 {
     match transfer {
         crate::core::TransferFunction::Srgb => 1,
@@ -1706,6 +1756,16 @@ float pq_eotf(float encoded) {
     return pow(num / den, 1.0 / m1);
 }
 
+float pq_inverse_eotf(float normalized_nits) {
+    constexpr float m1 = 0.1593017578125;
+    constexpr float m2 = 78.84375;
+    constexpr float c1 = 0.8359375;
+    constexpr float c2 = 18.8515625;
+    constexpr float c3 = 18.6875;
+    float p = pow(clamp(normalized_nits, 0.0, 1.0), m1);
+    return pow((c1 + c2 * p) / max(1.0 + c3 * p, 0.000001), m2);
+}
+
 float3 transfer_to_source_reference_linear(float3 rgb, constant VideoUniforms& uniforms) {
     rgb = max(rgb, float3(0.0));
     if (uniforms.source_transfer == 3) {
@@ -1758,6 +1818,15 @@ float3 target_nits_to_reference_linear(float3 nits, constant VideoUniforms& unif
 }
 
 float3 target_reference_linear_to_output(float3 rgb, constant VideoUniforms& uniforms) {
+    if (uniforms.target_transfer == 3) {
+        constexpr float pq_absolute_peak_nits = 10000.0;
+        float3 nits = max(rgb, float3(0.0)) * target_reference_white_nits(uniforms);
+        return float3(
+            pq_inverse_eotf(nits.r / pq_absolute_peak_nits),
+            pq_inverse_eotf(nits.g / pq_absolute_peak_nits),
+            pq_inverse_eotf(nits.b / pq_absolute_peak_nits)
+        );
+    }
     if (uniforms.edr_output != 0) {
         return max(rgb, float3(0.0));
     }
@@ -1771,6 +1840,9 @@ float3 target_reference_linear_to_output(float3 rgb, constant VideoUniforms& uni
 }
 
 float4 final_output(float3 rgb, constant VideoUniforms& uniforms) {
+    if (uniforms.target_transfer == 3) {
+        return float4(clamp(rgb, 0.0, 1.0), 1.0);
+    }
     if (uniforms.edr_output != 0) {
         float headroom = max(target_peak_nits(uniforms) / target_reference_white_nits(uniforms), 1.0);
         return float4(clamp(rgb, 0.0, headroom), 1.0);

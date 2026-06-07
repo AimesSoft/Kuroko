@@ -82,12 +82,30 @@ impl MetalOutputMode {
     }
 
     pub fn target_color(self) -> crate::renderer::pipeline::TargetColorState {
+        self.target_color_for_source(SourceColorState::default())
+    }
+
+    pub fn target_color_for_source(
+        self,
+        source: SourceColorState,
+    ) -> crate::renderer::pipeline::TargetColorState {
         match self {
             Self::Sdr => crate::renderer::pipeline::TargetColorState::sdr(ColorPrimaries::Bt709),
-            Self::AppleEdr { headroom } => crate::renderer::pipeline::TargetColorState::apple_edr(
-                ColorPrimaries::Bt709,
-                headroom,
-            ),
+            Self::AppleEdr { headroom } => {
+                let primaries = match (source.transfer, source.primaries) {
+                    (TransferFunction::Pq, ColorPrimaries::Unknown) => ColorPrimaries::Bt2020,
+                    (TransferFunction::Pq, primaries) => primaries,
+                    _ => ColorPrimaries::Bt709,
+                };
+                let mut target =
+                    crate::renderer::pipeline::TargetColorState::apple_edr(primaries, headroom);
+                if matches!(source.transfer, TransferFunction::Pq) {
+                    target.transfer = TransferFunction::Pq;
+                    target.peak_nits = 10_000.0;
+                    target.reference_white_nits = 203.0;
+                }
+                target
+            }
         }
     }
 }
@@ -773,6 +791,21 @@ mod tests {
         assert_eq!(target.primaries, ColorPrimaries::Bt709);
         assert_eq!(target.transfer, TransferFunction::Srgb);
         assert_eq!(target.peak_nits, 812.0);
+        assert_eq!(target.reference_white_nits, 203.0);
+        assert_eq!(target.edr_headroom, 4.0);
+    }
+
+    #[test]
+    fn metal_output_mode_maps_pq_source_to_pq_edr_target() {
+        let output = MetalOutputMode::apple_edr(4.0);
+        let source = SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq)
+            .nominal_peak_nits(1200.0);
+
+        let target = output.target_color_for_source(source);
+
+        assert_eq!(target.primaries, ColorPrimaries::Bt2020);
+        assert_eq!(target.transfer, TransferFunction::Pq);
+        assert_eq!(target.peak_nits, 10_000.0);
         assert_eq!(target.reference_white_nits, 203.0);
         assert_eq!(target.edr_headroom, 4.0);
     }

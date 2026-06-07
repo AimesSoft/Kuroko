@@ -781,8 +781,8 @@ private final class ErikaPlayerHost {
        let fps = Double(override), fps.isFinite, fps > 0.0 {
       return min(max(fps, 1.0), 1000.0)
     }
-    let screen = attachedView?.window?.screen ?? NSScreen.main
-    if #available(macOS 10.15, *), let screen = screen {
+    let screen = (attachedView as? NSView)?.window?.screen ?? NSScreen.main
+    if #available(macOS 12.0, *), let screen = screen {
       let fps = Double(screen.maximumFramesPerSecond)
       if fps.isFinite && fps > 0.0 {
         return fps
