@@ -283,6 +283,7 @@ private final class ErikaNativeLibrary {
   }
 
   private static func openLibrary() throws -> (handle: UnsafeMutableRawPointer, path: String) {
+    var failures: [ErikaPluginError] = []
     if let handle = dlopen(nil, RTLD_NOW), dlsym(handle, "erika_presenter_create") != nil {
       return (handle, "main executable")
     }
@@ -293,6 +294,9 @@ private final class ErikaNativeLibrary {
       candidates.append(override)
     }
     let bundle = Bundle(for: ErikaFlutterPlugin.self)
+    if let pluginExecutable = bundle.executablePath {
+      candidates.append(pluginExecutable)
+    }
     if let resourcePath = bundle.path(forResource: "liberika_capi", ofType: "dylib") {
       candidates.append(resourcePath)
     }
@@ -304,10 +308,14 @@ private final class ErikaNativeLibrary {
       candidates.append(URL(fileURLWithPath: executableDirectory).appendingPathComponent("liberika_capi.dylib").path)
     }
 
-    var failures: [ErikaPluginError] = []
     for path in candidates {
       if let handle = dlopen(path, RTLD_NOW | RTLD_LOCAL) {
-        return (handle, path)
+        if dlsym(handle, "erika_presenter_create") != nil {
+          return (handle, path)
+        }
+        dlclose(handle)
+        failures.append(.libraryLoadFailed(path, "erika_presenter_create not found"))
+        continue
       }
       let detail = dlerror().map { String(cString: $0) }
       failures.append(.libraryLoadFailed(path, detail))
