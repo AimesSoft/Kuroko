@@ -4,9 +4,9 @@ use std::process;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use kuroko_capi::{
-    KurokoEvent, KurokoEventKind, KurokoState, KurokoStatus, kuroko_close, kuroko_create,
-    kuroko_destroy, kuroko_open, kuroko_play, kuroko_poll_event, kuroko_state, kuroko_stop,
+use erika_capi::{
+    ErikaEvent, ErikaEventKind, ErikaState, ErikaStatus, erika_close, erika_create, erika_destroy,
+    erika_open, erika_play, erika_poll_event, erika_state, erika_stop,
 };
 
 fn main() {
@@ -19,38 +19,38 @@ fn main() {
         process::exit(2);
     });
 
-    let player = kuroko_create();
+    let player = erika_create();
     if player.is_null() {
-        eprintln!("kuroko_create returned null");
+        eprintln!("erika_create returned null");
         process::exit(1);
     }
 
     let result = unsafe { run_smoke(player, &uri) };
-    unsafe { kuroko_destroy(player) };
+    unsafe { erika_destroy(player) };
     if let Err(error) = result {
         eprintln!("C API smoke failed: {error}");
         process::exit(1);
     }
 }
 
-unsafe fn run_smoke(player: *mut kuroko_capi::KurokoHandle, uri: &CString) -> Result<(), String> {
-    ensure(unsafe { kuroko_open(player, uri.as_ptr()) }, "open")?;
+unsafe fn run_smoke(player: *mut erika_capi::ErikaHandle, uri: &CString) -> Result<(), String> {
+    ensure(unsafe { erika_open(player, uri.as_ptr()) }, "open")?;
     wait_for_ready(player)?;
-    ensure(unsafe { kuroko_play(player) }, "play")?;
+    ensure(unsafe { erika_play(player) }, "play")?;
     wait_for_position(player)?;
-    ensure(unsafe { kuroko_stop(player) }, "stop")?;
-    ensure(unsafe { kuroko_close(player) }, "close")?;
+    ensure(unsafe { erika_stop(player) }, "stop")?;
+    ensure(unsafe { erika_close(player) }, "close")?;
 
-    let mut state = KurokoState::Idle;
-    ensure(unsafe { kuroko_state(player, &mut state) }, "state")?;
-    if state != KurokoState::Closed {
+    let mut state = ErikaState::Idle;
+    ensure(unsafe { erika_state(player, &mut state) }, "state")?;
+    if state != ErikaState::Closed {
         return Err(format!("expected Closed state, got {state:?}"));
     }
     println!("C API smoke done: final_state={state:?}");
     Ok(())
 }
 
-fn wait_for_ready(player: *mut kuroko_capi::KurokoHandle) -> Result<(), String> {
+fn wait_for_ready(player: *mut erika_capi::ErikaHandle) -> Result<(), String> {
     let started = Instant::now();
     let mut saw_tracks = false;
     let mut saw_video = false;
@@ -60,7 +60,7 @@ fn wait_for_ready(player: *mut kuroko_capi::KurokoHandle) -> Result<(), String> 
         }
         match poll_event(player)? {
             Some(event) => match event.kind {
-                KurokoEventKind::StateChanged if event.state == KurokoState::Ready => {
+                ErikaEventKind::StateChanged if event.state == ErikaState::Ready => {
                     if !saw_tracks || !saw_video {
                         return Err(format!(
                             "ready before required probe events tracks={saw_tracks} video={saw_video}"
@@ -68,21 +68,21 @@ fn wait_for_ready(player: *mut kuroko_capi::KurokoHandle) -> Result<(), String> 
                     }
                     return Ok(());
                 }
-                KurokoEventKind::TracksChanged => {
+                ErikaEventKind::TracksChanged => {
                     saw_tracks = event.tracks.video > 0 || event.tracks.audio > 0;
                     println!(
                         "tracks: video={} audio={} subtitle={}",
                         event.tracks.video, event.tracks.audio, event.tracks.subtitle
                     );
                 }
-                KurokoEventKind::VideoParamsChanged => {
+                ErikaEventKind::VideoParamsChanged => {
                     saw_video = event.video.width > 0 && event.video.height > 0;
                     println!(
                         "video: {}x{} transfer={}",
                         event.video.width, event.video.height, event.video.transfer
                     );
                 }
-                KurokoEventKind::Error => {
+                ErikaEventKind::Error => {
                     return Err("player emitted error while opening".to_string());
                 }
                 _ => {}
@@ -92,7 +92,7 @@ fn wait_for_ready(player: *mut kuroko_capi::KurokoHandle) -> Result<(), String> 
     }
 }
 
-fn wait_for_position(player: *mut kuroko_capi::KurokoHandle) -> Result<(), String> {
+fn wait_for_position(player: *mut erika_capi::ErikaHandle) -> Result<(), String> {
     let started = Instant::now();
     loop {
         if started.elapsed() > Duration::from_secs(5) {
@@ -100,11 +100,11 @@ fn wait_for_position(player: *mut kuroko_capi::KurokoHandle) -> Result<(), Strin
         }
         match poll_event(player)? {
             Some(event) => match event.kind {
-                KurokoEventKind::PositionChanged if event.position_micros > 0 => {
+                ErikaEventKind::PositionChanged if event.position_micros > 0 => {
                     println!("position: {}us", event.position_micros);
                     return Ok(());
                 }
-                KurokoEventKind::Error => {
+                ErikaEventKind::Error => {
                     return Err("player emitted error while playing".to_string());
                 }
                 _ => {}
@@ -114,17 +114,17 @@ fn wait_for_position(player: *mut kuroko_capi::KurokoHandle) -> Result<(), Strin
     }
 }
 
-fn poll_event(player: *mut kuroko_capi::KurokoHandle) -> Result<Option<KurokoEvent>, String> {
-    let mut event = KurokoEvent::default();
-    match unsafe { kuroko_poll_event(player, &mut event) } {
-        KurokoStatus::Ok => Ok(Some(event)),
-        KurokoStatus::NoEvent => Ok(None),
+fn poll_event(player: *mut erika_capi::ErikaHandle) -> Result<Option<ErikaEvent>, String> {
+    let mut event = ErikaEvent::default();
+    match unsafe { erika_poll_event(player, &mut event) } {
+        ErikaStatus::Ok => Ok(Some(event)),
+        ErikaStatus::NoEvent => Ok(None),
         status => Err(format!("poll_event returned {status:?}")),
     }
 }
 
-fn ensure(status: KurokoStatus, operation: &str) -> Result<(), String> {
-    if status == KurokoStatus::Ok {
+fn ensure(status: ErikaStatus, operation: &str) -> Result<(), String> {
+    if status == ErikaStatus::Ok {
         Ok(())
     } else {
         Err(format!("{operation} returned {status:?}"))

@@ -1,7 +1,7 @@
 use std::env;
 use std::process;
 
-use kuroko::ffmpeg::{MediaProbe, probe_uri, version};
+use erika::ffmpeg::{MediaProbe, probe_uri, version};
 
 fn main() {
     let Some(uri) = env::args().nth(1) else {
@@ -19,7 +19,7 @@ fn main() {
 }
 
 fn print_probe(probe: &MediaProbe) {
-    println!("Kuroko FFmpeg probe");
+    println!("Erika FFmpeg probe");
     println!("ffmpeg: {}", version());
     println!("uri: {}", probe.uri);
     match probe.duration {

@@ -3,8 +3,8 @@ use std::process;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use kuroko::apple::coreaudio::{CoreAudioOutput, CoreAudioOutputConfig};
-use kuroko::{MediaRequest, Player, PlayerConfig, PlayerEvent, PlayerState};
+use erika::apple::coreaudio::{CoreAudioOutput, CoreAudioOutputConfig};
+use erika::{MediaRequest, Player, PlayerConfig, PlayerEvent, PlayerState};
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -96,7 +96,7 @@ fn main() {
 }
 
 fn pump_audio(
-    audio: &crossbeam_channel::Receiver<kuroko::PlayerAudioFrame>,
+    audio: &crossbeam_channel::Receiver<erika::PlayerAudioFrame>,
     output: &mut CoreAudioOutput,
     configured: &mut bool,
 ) -> usize {

@@ -1,8 +1,8 @@
 use std::env;
 use std::process;
 
-use kuroko::TrackKind;
-use kuroko::ffmpeg::{AudioResampler, DecoderOutputFrame, Demuxer, PcmFormat, StreamSelection};
+use erika::TrackKind;
+use erika::ffmpeg::{AudioResampler, DecoderOutputFrame, Demuxer, PcmFormat, StreamSelection};
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -53,7 +53,7 @@ fn main() {
         process::exit(1);
     });
 
-    println!("Kuroko FFmpeg audio decode");
+    println!("Erika FFmpeg audio decode");
     println!("uri: {}", demuxer.probe().uri);
     println!("stream: {stream_index}");
     for audio in &demuxer.probe().audio {
@@ -95,7 +95,7 @@ fn main() {
 }
 
 fn drain_pcm_frames(
-    decoder: &mut kuroko::ffmpeg::Decoder,
+    decoder: &mut erika::ffmpeg::Decoder,
     resampler: &mut Option<AudioResampler>,
     decoded: &mut usize,
     limit: usize,

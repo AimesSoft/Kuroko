@@ -3,8 +3,8 @@ use std::process;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use kuroko::MediaRequest;
-use kuroko::playback::{PlaybackSessionConfig, VideoPlaybackEngine};
+use erika::MediaRequest;
+use erika::playback::{PlaybackSessionConfig, VideoPlaybackEngine};
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -29,7 +29,7 @@ fn main() {
         });
 
     let info = engine.info();
-    println!("Kuroko playback tick");
+    println!("Erika playback tick");
     println!("uri: {}", info.uri);
     println!("duration: {:?}", info.duration);
     println!("video: {:?}", info.video_params);

@@ -5,7 +5,7 @@ fn main() {
         .file("native/DanmakuPerfLab.m")
         .flag("-fobjc-arc")
         .flag("-fmodules")
-        .compile("KurokoDanmakuPerfLab");
+        .compile("ErikaDanmakuPerfLab");
 
     println!("cargo:rustc-link-lib=framework=AppKit");
     println!("cargo:rustc-link-lib=framework=QuartzCore");

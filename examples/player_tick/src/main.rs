@@ -2,8 +2,8 @@ use std::env;
 use std::process;
 use std::time::Duration;
 
-use kuroko::audio::{AudioOutputBackend, AudioRingBufferConfig, BufferedAudioOutput};
-use kuroko::{MediaRequest, Player, PlayerConfig, PlayerEvent, PlayerState};
+use erika::audio::{AudioOutputBackend, AudioRingBufferConfig, BufferedAudioOutput};
+use erika::{MediaRequest, Player, PlayerConfig, PlayerEvent, PlayerState};
 
 fn main() {
     let mut args = env::args().skip(1);

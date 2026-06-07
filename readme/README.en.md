@@ -1,10 +1,10 @@
 [中文](../README.md) | [English](README.en.md) | [日本語](README.ja.md)
 
-# Kuroko
+# Erika
 
 A standalone media player engine written in Rust.
 
-Kuroko owns playback, timing, audio output, subtitle and danmaku overlay, and native rendering. The host frontend -- Flutter, Swift, or anything with a C FFI -- supplies a surface and issues commands. It does not touch frames.
+Erika owns playback, timing, audio output, subtitle and danmaku overlay, and native rendering. The host frontend -- Flutter, Swift, or anything with a C FFI -- supplies a surface and issues commands. It does not touch frames.
 
 ## Capabilities
 
@@ -20,10 +20,10 @@ Cross-platform support via wgpu is planned. macOS 14+ is the current target.
 
 ## Embedding
 
-Kuroko exposes two C ABI families:
+Erika exposes two C ABI families:
 
-- **`KurokoHandle`** — player control and event polling. Use this when the host owns its own render loop or only needs to drive playback.
-- **`KurokoPresenterHandle`** — Kuroko owns the full presenter stack (player, renderer, audio, overlays). The host supplies a native surface and calls `render_tick` from its display timer.
+- **`ErikaHandle`** — player control and event polling. Use this when the host owns its own render loop or only needs to drive playback.
+- **`ErikaPresenterHandle`** — Erika owns the full presenter stack (player, renderer, audio, overlays). The host supplies a native surface and calls `render_tick` from its display timer.
 
 See [`docs/flutter_embedding.md`](../docs/flutter_embedding.md) for the Flutter integration model and the macOS HDR embedding strategy.
 

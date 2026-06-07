@@ -1,9 +1,9 @@
 use std::env;
 use std::process;
 
-use kuroko::MediaSourceHint;
-use kuroko::ffmpeg::{Demuxer, MediaProbe, version};
-use kuroko::source::source_from_uri_with_hint;
+use erika::MediaSourceHint;
+use erika::ffmpeg::{Demuxer, MediaProbe, version};
+use erika::source::source_from_uri_with_hint;
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -44,7 +44,7 @@ fn parse_hint(value: &str) -> MediaSourceHint {
 }
 
 fn print_probe(probe: &MediaProbe) {
-    println!("Kuroko FFmpeg source-backed probe");
+    println!("Erika FFmpeg source-backed probe");
     println!("ffmpeg: {}", version());
     println!("uri: {}", probe.uri);
     match probe.duration {

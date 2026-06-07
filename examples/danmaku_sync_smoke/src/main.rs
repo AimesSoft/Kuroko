@@ -3,9 +3,9 @@ use std::process;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use kuroko::MediaRequest;
-use kuroko::danmaku::{DanmakuLayoutConfig, DanmakuTimeline, DanmakuViewport, DfmLayoutEngine};
-use kuroko::playback::{PlaybackSessionConfig, VideoDecodePreference, VideoPlaybackEngine};
+use erika::MediaRequest;
+use erika::danmaku::{DanmakuLayoutConfig, DanmakuTimeline, DanmakuViewport, DfmLayoutEngine};
+use erika::playback::{PlaybackSessionConfig, VideoDecodePreference, VideoPlaybackEngine};
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -118,7 +118,7 @@ struct FramePlan {
     media_time: Duration,
     generation: u64,
     viewport: DanmakuViewport,
-    items: Vec<kuroko::danmaku::DanmakuGlyphInstance>,
+    items: Vec<erika::danmaku::DanmakuGlyphInstance>,
 }
 
 fn next_video_plan(
