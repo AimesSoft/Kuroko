@@ -1625,7 +1625,8 @@ mod tests {
     use super::*;
     use crate::core::MetalSurfaceHandle;
     use crate::danmaku::{
-        DanmakuGlyphAtlas, DanmakuGlyphInstance, DanmakuRenderPlan, DanmakuViewport,
+        DanmakuFrameStats, DanmakuGlyphAtlas, DanmakuGlyphInstance, DanmakuRenderPlan,
+        DanmakuViewport,
     };
     use std::time::Duration;
 
@@ -1705,6 +1706,7 @@ mod tests {
                 shadow_rgba: [0.0, 0.0, 0.0, 0.0],
                 shadow_offset: [1.0, 1.0],
             }],
+            frame_stats: DanmakuFrameStats::default(),
         };
 
         let draws = renderer.prepare_danmaku_draws(&plan).unwrap();

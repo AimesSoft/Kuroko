@@ -127,13 +127,6 @@ cargo run -p macos_native_demo -- "$SAMPLE"
 cargo run -p macos_native_demo -- --smoke-seconds 3 "$SAMPLE"
 ```
 
-## Design Principles
-
-- **Erika does not embed mpv, gpu-next, or libplacebo.** The renderer is a clean Rust implementation that references the design direction of similar projects without introducing runtime dependencies.
-- **The host never touches frame data.** Video frames flow entirely within the engine from decode to render. Subtitles and danmaku are composited in the same render pass.
-- **Platform-native first.** Apple platforms use Metal + VideoToolbox + CoreAudio native paths; wgpu serves as a cross-platform fallback.
-- **Clear license boundaries.** The default FFmpeg build targets LGPL. GPL components are opt-in via `--profile gpl-full`.
-
 ## License
 
 Rust workspace: [MPL-2.0](../LICENSE)
