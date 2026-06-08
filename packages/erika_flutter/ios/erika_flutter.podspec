@@ -91,12 +91,21 @@ case "${PLATFORM_NAME:-iphoneos}" in
     ;;
 esac
 
-if [ "${CONFIGURATION:-Debug}" = "Debug" ]; then
+if [ -n "${ERIKA_IOS_CAPI_PROFILE:-}" ]; then
+  CARGO_PROFILE="$ERIKA_IOS_CAPI_PROFILE"
+elif [ "${CONFIGURATION:-Debug}" = "Release" ]; then
+  CARGO_PROFILE="release"
+else
   CARGO_PROFILE="debug"
+fi
+
+if [ "$CARGO_PROFILE" = "release" ]; then
+  CARGO_ARGS="--release"
+elif [ "$CARGO_PROFILE" = "debug" ]; then
   CARGO_ARGS=""
 else
-  CARGO_PROFILE="release"
-  CARGO_ARGS="--release"
+  echo "error: unsupported ERIKA_IOS_CAPI_PROFILE=$CARGO_PROFILE" >&2
+  exit 1
 fi
 
 if [ -n "${ERIKA_IOS_CAPI_STATICLIB:-}" ]; then
