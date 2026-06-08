@@ -2,35 +2,140 @@
 
 # Erika
 
-A standalone media player engine written in Rust.
+An embeddable media playback library written in Rust.
 
-Erika owns playback, timing, audio output, subtitle and danmaku overlay, and native rendering. The host frontend -- Flutter, Swift, or anything with a C FFI -- supplies a surface and issues commands. It does not touch frames.
+Erika is a standalone media playback engine that gives applications full playback capability from decode to render. The host application provides a rendering surface and sends playback commands -- decoding, timing, video rendering, subtitles, danmaku, and audio output are handled entirely inside Erika, without passing through the host's rendering pipeline.
 
-## Capabilities
+## Features
 
-- Local file and HTTP range media sources
-- Hardware-accelerated video decode (VideoToolbox on macOS)
-- Native Metal/CAMetalLayer presentation path aimed at HDR/EDR
-- Subtitle support: SRT, WebVTT, ASS
-- Danmaku: Bilibili XML and JSON-lines, with collision-aware lane layout
-- Audio output through CoreAudio
-- Opaque C ABI -- callable from Swift, Dart FFI, C/C++, or any Rust crate
+- **Hardware-accelerated decoding** -- VideoToolbox (macOS/iOS), extensible to other platform backends
+- **Zero-copy rendering** -- CVPixelBuffer to MTLTexture passthrough, video frames never round-trip through CPU memory
+- **HDR/EDR output** -- native Apple EDR support, PQ (BT.2020) metadata preservation and tone mapping
+- **Native Metal renderer** -- YCbCr sampling, color space conversion, tone mapping, subtitle/danmaku compositing in a single render pass
+- **Audio output** -- CoreAudio (macOS) / AudioQueue (iOS), f32 PCM ring buffer, audio clock synchronization
+- **Subtitles** -- SRT / WebVTT / ASS parsing, libass rendering (statically linked), embedded and external subtitle tracks
+- **Danmaku** -- Bilibili XML / JSON parsing, DFM+ collision-aware lane layout engine, glyph atlas native GPU rendering
+- **Playback engine** -- play / pause / stop / seek / rate control, audio-master clock discipline, vsync-quantized frame scheduling
+- **C ABI** -- 82 exported functions, opaque handle design, callable from C / C++ / Swift / Dart FFI / any FFI-capable language
+- **Flutter plugin** -- macOS + iOS native view embedding, HDR native layer path support
+- **wgpu backend** -- cross-platform rendering foundation in place (Windows / Linux / Android direction)
 
-Cross-platform support via wgpu is planned. macOS 14+ is the current target.
+## Quick Start
 
-## Embedding
+### Rust
 
-Erika exposes two C ABI families:
+```rust
+use erika::{Player, PlayerConfig, MediaRequest};
 
-- **`ErikaHandle`** — player control and event polling. Use this when the host owns its own render loop or only needs to drive playback.
-- **`ErikaPresenterHandle`** — Erika owns the full presenter stack (player, renderer, audio, overlays). The host supplies a native surface and calls `render_tick` from its display timer.
+let player = Player::new(PlayerConfig::default())?;
+player.open(MediaRequest::file("/path/to/video.mp4"))?;
+player.play()?;
+```
 
-See [`docs/flutter_embedding.md`](../docs/flutter_embedding.md) for the Flutter integration model and the macOS HDR embedding strategy.
+### C ABI
 
-## Status
+```c
+#include "erika.h"
 
-Early foundation. The macOS playback path is working end-to-end. Not ready for production use.
+ErikaPresenterHandle *presenter = erika_presenter_create();
+erika_presenter_attach_metal_layer(presenter, (uint64_t)layer, w, h, scale);
+erika_presenter_open(presenter, "/path/to/video.mp4");
+erika_presenter_play(presenter);
+
+// On every display tick:
+ErikaPresenterStats stats;
+erika_presenter_render_tick(presenter, host_time, &stats);
+```
+
+### Flutter
+
+```dart
+final player = ErikaPlayer();
+await player.open('/path/to/video.mp4');
+await player.play();
+
+// In your widget tree:
+ErikaVideoView(player: player)
+```
+
+## C ABI Families
+
+Erika provides two C ABI entrypoint families for different embedding scenarios:
+
+| Family | Use Case | Rendering |
+|--------|----------|-----------|
+| `ErikaHandle` | Host manages its own render loop | Host pulls frame data |
+| `ErikaPresenterHandle` | Erika owns the full playback stack | Host provides a surface and drives `render_tick` |
+
+Header: [`crates/erika_capi/include/erika.h`](crates/erika_capi/include/erika.h)
+
+## Platform Support
+
+| Platform | Decode | Render | Audio | Status |
+|----------|--------|--------|-------|--------|
+| macOS 14+ | VideoToolbox | Metal | CoreAudio | **Available** |
+| iOS 16+ | VideoToolbox | Metal | AudioQueue | **Available** |
+| Windows | -- | wgpu (planned) | -- | Planned |
+| Linux | -- | wgpu (planned) | -- | Planned |
+| Android | -- | wgpu (planned) | -- | Planned |
+
+## Repository Structure
+
+```
+crates/erika              Core playback library
+crates/erika_capi         C ABI export layer
+crates/erika_ffmpeg_sys   Low-level FFmpeg bindings
+packages/erika_flutter    Flutter plugin (macOS + iOS)
+examples/                 Validation and demo programs
+xtask/                    Native dependency build orchestration
+docs/                     Architecture and embedding documentation
+```
+
+## Building
+
+### Prerequisites
+
+- Rust 1.92+
+- Xcode Command Line Tools (macOS/iOS)
+- CMake, pkg-config
+
+### Build Native Dependencies
+
+```sh
+# Build FFmpeg (LGPL profile)
+cargo run -p xtask -- deps build --profile lgpl
+
+# Build all dependencies (including libass/FreeType/HarfBuzz/FriBidi)
+cargo run -p xtask -- deps build --all --profile lgpl
+
+# Check dependency status
+cargo run -p xtask -- deps status
+```
+
+### Compile and Test
+
+```sh
+cargo build -p erika
+cargo test --workspace
+```
+
+### Verify Playback Path
+
+```sh
+export SAMPLE="/path/to/video.mp4"
+cargo run -p macos_native_demo -- "$SAMPLE"
+cargo run -p macos_native_demo -- --smoke-seconds 3 "$SAMPLE"
+```
+
+## Design Principles
+
+- **Erika does not embed mpv, gpu-next, or libplacebo.** The renderer is a clean Rust implementation that references the design direction of similar projects without introducing runtime dependencies.
+- **The host never touches frame data.** Video frames flow entirely within the engine from decode to render. Subtitles and danmaku are composited in the same render pass.
+- **Platform-native first.** Apple platforms use Metal + VideoToolbox + CoreAudio native paths; wgpu serves as a cross-platform fallback.
+- **Clear license boundaries.** The default FFmpeg build targets LGPL. GPL components are opt-in via `--profile gpl-full`.
 
 ## License
 
-MPL-2.0. Native dependency profiles are managed separately; the default FFmpeg build is LGPL-oriented with GPL components opt-in.
+Rust workspace: [MPL-2.0](../LICENSE)
+
+Native dependency build profiles and license boundaries are managed independently through `xtask`.

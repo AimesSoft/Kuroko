@@ -2,35 +2,140 @@
 
 # Erika
 
-Rust で実装された独立型メディアプレーヤーエンジンです。
+Rust で実装された組み込み可能なメディア再生ライブラリ。
 
-再生制御、タイミング同期、音声出力、字幕・弾幕合成、そしてネイティブレンダリングは Erika が担います。Flutter や Swift など C FFI に対応したホスト環境は、レンダリングサーフェスの提供とコマンドの送信のみを行い、フレームデータには一切触れません。
+Erika はデコードからレンダリングまでの完全な再生機能をアプリケーションに提供する独立型メディア再生エンジンです。ホストアプリケーションはレンダリングサーフェスの提供と再生コマンドの送信のみを行い、デコード、タイミング同期、映像レンダリング、字幕、弾幕、音声出力はすべて Erika 内部で完結します。
 
 ## 機能
 
-- ローカルファイルおよび HTTP Range メディアソース
-- ハードウェアアクセラレーションによる動画デコード（macOS では VideoToolbox を使用）
-- HDR/EDR を見据えた Metal と CAMetalLayer によるネイティブ表示パス
-- 字幕対応：SRT、WebVTT、ASS
-- 弾幕対応：Bilibili XML および JSON-lines 形式、衝突回避レーン配置付き
-- CoreAudio による音声出力
-- 不透明な C ABI — Swift、Dart FFI、C/C++、または任意の Rust クレートから呼び出し可能
+- **ハードウェアアクセラレーション** -- VideoToolbox (macOS/iOS)、他プラットフォームバックエンドへ拡張可能
+- **ゼロコピーレンダリング** -- CVPixelBuffer から MTLTexture への直接パススルー、CPU メモリを経由しない
+- **HDR/EDR 出力** -- Apple EDR ネイティブサポート、PQ (BT.2020) メタデータ保持とトーンマッピング
+- **Metal ネイティブレンダラー** -- YCbCr サンプリング、色空間変換、トーンマッピング、字幕/弾幕合成を単一レンダーパスで実行
+- **音声出力** -- CoreAudio (macOS) / AudioQueue (iOS)、f32 PCM リングバッファ、音声クロック同期
+- **字幕** -- SRT / WebVTT / ASS パーサー、libass レンダリング（静的リンク）、埋め込みおよび外部字幕トラック
+- **弾幕** -- Bilibili XML / JSON パーサー、DFM+ 衝突回避レーン配置エンジン、グリフアトラスによるネイティブ GPU レンダリング
+- **再生エンジン** -- play / pause / stop / seek / 再生速度制御、音声マスタークロック同期、vsync 量子化フレームスケジューリング
+- **C ABI** -- 82 のエクスポート関数、不透明ハンドル設計、C / C++ / Swift / Dart FFI / 任意の FFI 対応言語から呼び出し可能
+- **Flutter プラグイン** -- macOS + iOS ネイティブビュー組み込み、HDR ネイティブレイヤーパスサポート
+- **wgpu バックエンド** -- クロスプラットフォームレンダリング基盤構築済み (Windows / Linux / Android 方向)
 
-wgpu を通じたクロスプラットフォーム対応は計画中です。現在のターゲットは macOS 14+ です。
+## クイックスタート
 
-## 組み込み
+### Rust
 
-Erika は二種類の C ABI を提供します：
+```rust
+use erika::{Player, PlayerConfig, MediaRequest};
 
-- **`ErikaHandle`** — 再生制御とイベントポーリング。ホスト側で独自のレンダリングループを持つ場合、または再生制御のみが必要な場合に使用します。
-- **`ErikaPresenterHandle`** — プレゼンタースタック全体（プレーヤー、レンダラー、音声、オーバーレイ）を Erika が管理します。ホストはネイティブサーフェスを提供し、ディスプレイタイマーから `render_tick` を呼び出すだけで済みます。
+let player = Player::new(PlayerConfig::default())?;
+player.open(MediaRequest::file("/path/to/video.mp4"))?;
+player.play()?;
+```
 
-Flutter との統合方法および macOS HDR 組み込み戦略については [`docs/flutter_embedding.md`](../docs/flutter_embedding.md) を参照してください。
+### C ABI
 
-## 現在の状態
+```c
+#include "erika.h"
 
-初期段階のエンジン基盤です。macOS の再生パスはエンドツーエンドで動作しています。プロダクション利用にはまだ対応していません。
+ErikaPresenterHandle *presenter = erika_presenter_create();
+erika_presenter_attach_metal_layer(presenter, (uint64_t)layer, w, h, scale);
+erika_presenter_open(presenter, "/path/to/video.mp4");
+erika_presenter_play(presenter);
+
+// ディスプレイティック毎に:
+ErikaPresenterStats stats;
+erika_presenter_render_tick(presenter, host_time, &stats);
+```
+
+### Flutter
+
+```dart
+final player = ErikaPlayer();
+await player.open('/path/to/video.mp4');
+await player.play();
+
+// ウィジェットツリー内:
+ErikaVideoView(player: player)
+```
+
+## C ABI インターフェースファミリー
+
+異なる組み込みシナリオに対応する二つの C ABI エントリーポイントファミリーを提供します：
+
+| ファミリー | ユースケース | レンダリング |
+|-----------|-------------|-------------|
+| `ErikaHandle` | ホストが独自のレンダーループを管理 | ホストがフレームデータを取得 |
+| `ErikaPresenterHandle` | Erika が再生スタック全体を管理 | ホストはサーフェスを提供し `render_tick` を駆動 |
+
+ヘッダー: [`crates/erika_capi/include/erika.h`](../crates/erika_capi/include/erika.h)
+
+## プラットフォームサポート
+
+| プラットフォーム | デコード | レンダリング | 音声 | 状態 |
+|----------------|---------|-------------|------|------|
+| macOS 14+ | VideoToolbox | Metal | CoreAudio | **利用可能** |
+| iOS 16+ | VideoToolbox | Metal | AudioQueue | **利用可能** |
+| Windows | -- | wgpu (計画中) | -- | 計画中 |
+| Linux | -- | wgpu (計画中) | -- | 計画中 |
+| Android | -- | wgpu (計画中) | -- | 計画中 |
+
+## リポジトリ構成
+
+```
+crates/erika              コア再生ライブラリ
+crates/erika_capi         C ABI エクスポート層
+crates/erika_ffmpeg_sys   FFmpeg 低レベルバインディング
+packages/erika_flutter    Flutter プラグイン (macOS + iOS)
+examples/                 検証・デモプログラム
+xtask/                    ネイティブ依存関係ビルドオーケストレーション
+docs/                     アーキテクチャと組み込みドキュメント
+```
+
+## ビルド
+
+### 前提条件
+
+- Rust 1.92+
+- Xcode Command Line Tools (macOS/iOS)
+- CMake, pkg-config
+
+### ネイティブ依存関係のビルド
+
+```sh
+# FFmpeg のビルド (LGPL プロファイル)
+cargo run -p xtask -- deps build --profile lgpl
+
+# 全依存関係のビルド (libass/FreeType/HarfBuzz/FriBidi 含む)
+cargo run -p xtask -- deps build --all --profile lgpl
+
+# 依存関係の状態確認
+cargo run -p xtask -- deps status
+```
+
+### コンパイルとテスト
+
+```sh
+cargo build -p erika
+cargo test --workspace
+```
+
+### 再生パスの検証
+
+```sh
+export SAMPLE="/path/to/video.mp4"
+cargo run -p macos_native_demo -- "$SAMPLE"
+cargo run -p macos_native_demo -- --smoke-seconds 3 "$SAMPLE"
+```
+
+## 設計原則
+
+- **Erika は mpv、gpu-next、libplacebo を組み込みません。** レンダラーは同種プロジェクトの設計方向を参考にしつつ、実行時依存を導入しないクリーンな Rust 実装です。
+- **ホストはフレームデータに触れません。** 映像フレームはデコードからレンダリングまで完全にエンジン内部で流れます。字幕と弾幕は同一レンダーパスで合成されます。
+- **プラットフォームネイティブ優先。** Apple プラットフォームは Metal + VideoToolbox + CoreAudio のネイティブパスを使用し、wgpu はクロスプラットフォームフォールバックとして機能します。
+- **明確なライセンス境界。** デフォルトの FFmpeg ビルドは LGPL を対象としています。GPL コンポーネントは `--profile gpl-full` によるオプトインです。
 
 ## ライセンス
 
-Rust ワークスペースは MPL-2.0 です。ネイティブ依存関係は `xtask` で別途管理されており、デフォルトの FFmpeg ビルドは LGPL 準拠で、GPL コンポーネントはオプトイン方式です。
+Rust ワークスペース: [MPL-2.0](../LICENSE)
+
+ネイティブ依存関係のビルドプロファイルとライセンス境界は `xtask` を通じて独立管理されます。
