@@ -19,7 +19,7 @@ Rust Player Core
   Metal renderer ─────── zero-copy NV12/P010, HDR/EDR, subtitle/danmaku pass
   wgpu renderer ──────── cross-platform video + danmaku rendering
   presenter runtime ──── ties player + renderer + audio + overlays
-  C ABI ──────────────── 82 exported functions, two handle families
+  C ABI ──────────────── 61 exported functions, two handle families
   Flutter plugin ─────── macOS + iOS native view embedding
 ```
 

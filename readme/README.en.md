@@ -16,7 +16,7 @@ Erika is a standalone media playback engine that gives applications full playbac
 - **Subtitles** -- SRT / WebVTT / ASS parsing, libass rendering (statically linked), embedded and external subtitle tracks
 - **Danmaku** -- Bilibili XML / JSON parsing, DFM+ collision-aware lane layout engine, glyph atlas native GPU rendering
 - **Playback engine** -- play / pause / stop / seek / rate control, audio-master clock discipline, vsync-quantized frame scheduling
-- **C ABI** -- 82 exported functions, opaque handle design, callable from C / C++ / Swift / Dart FFI / any FFI-capable language
+- **C ABI** -- 61 exported functions, opaque handle design, callable from C / C++ / Swift / Dart FFI / any FFI-capable language
 - **Flutter plugin** -- macOS + iOS native view embedding, HDR native layer path support
 - **wgpu backend** -- cross-platform rendering foundation in place (Windows / Linux / Android direction)
 
