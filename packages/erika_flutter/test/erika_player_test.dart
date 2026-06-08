@@ -66,6 +66,20 @@ void main() {
     await player.dispose();
   });
 
+  test('HDR debug flag is passed to native create when enabled', () async {
+    final player = ErikaPlayer(hdrDebug: true);
+
+    expect(await player.ensureCreated(), 7);
+
+    final createCall = playerCalls.singleWhere(
+      (MethodCall call) => call.method == 'create',
+    );
+    final arguments = createCall.arguments as Map<Object?, Object?>;
+    expect(arguments['hdrDebug'], true);
+
+    await player.dispose();
+  });
+
   test('external subtitle add returns native track id', () async {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(playerChannel, (MethodCall call) async {

@@ -117,6 +117,19 @@ pub struct MetalRendererImpl {
     danmaku_vertex_buffer_len: usize,
     stats: MetalRendererStats,
     layer_color_space_label: &'static str,
+    logged_first_video_frame: bool,
+}
+
+fn hdr_debug_enabled() -> bool {
+    std::env::var("ERIKA_HDR_DEBUG")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.as_str(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(false)
 }
 
 impl MetalRendererImpl {
@@ -144,6 +157,7 @@ impl MetalRendererImpl {
             danmaku_vertex_buffer_len: 0,
             stats: MetalRendererStats::default(),
             layer_color_space_label: "unconfigured",
+            logged_first_video_frame: false,
         })
     }
 
@@ -207,6 +221,16 @@ impl MetalRendererImpl {
         self.danmaku_vertex_buffer = None;
         self.danmaku_vertex_buffer_len = 0;
         self.layer_color_space_label = color_space_label;
+        if hdr_debug_enabled() {
+            eprintln!(
+                "ErikaHDR: renderer configure layer output mode={:?} drawable_format={:?} metal_pixel_format={:?} edr={} colorspace={}",
+                self.output_mode,
+                self.drawable_pixel_format,
+                metal_pixel_format(self.drawable_pixel_format),
+                self.output_mode.is_edr(),
+                color_space_label,
+            );
+        }
     }
 
     fn configure_layer_source_color(
@@ -214,16 +238,32 @@ impl MetalRendererImpl {
         layer: &CAMetalLayer,
         source: crate::renderer::pipeline::SourceColorState,
     ) {
-        if !self.output_mode.is_edr() {
+        #[cfg(target_os = "ios")]
+        {
+            let _ = layer;
+            let _ = source;
             return;
         }
-        let (color_space_name, color_space_label) = edr_layer_color_space(Some(source));
-        if color_space_label == self.layer_color_space_label {
-            return;
-        }
-        if let Some(color_space) = CGColorSpace::with_name(color_space_name) {
-            layer.setColorspace(Some(&color_space));
-            self.layer_color_space_label = color_space_label;
+
+        #[cfg(not(target_os = "ios"))]
+        {
+            if !self.output_mode.is_edr() {
+                return;
+            }
+            let (color_space_name, color_space_label) = edr_layer_color_space(Some(source));
+            if color_space_label == self.layer_color_space_label {
+                return;
+            }
+            if let Some(color_space) = CGColorSpace::with_name(color_space_name) {
+                layer.setColorspace(Some(&color_space));
+                self.layer_color_space_label = color_space_label;
+                if hdr_debug_enabled() {
+                    eprintln!(
+                        "ErikaHDR: renderer source colorspace updated source={:?}/{:?} colorspace={}",
+                        source.primaries, source.transfer, color_space_label,
+                    );
+                }
+            }
         }
     }
 
@@ -407,6 +447,31 @@ impl MetalRendererImpl {
         frame.pipeline = frame
             .pipeline
             .with_target(self.output_mode.target_color_for_source(source_color));
+        if !self.logged_first_video_frame {
+            self.logged_first_video_frame = true;
+            if hdr_debug_enabled() {
+                let info = &frame.frame.info;
+                eprintln!(
+                    "ErikaHDR: first Metal video frame output_mode={:?} drawable_format={:?} layer_colorspace={} size={}x{} fourcc={} format={:?} full_range={} range={:?} primaries={:?} transfer={:?} matrix={:?} hdr_metadata={:?} source_peak_nits={:.1} source_white_nits={:.1} target={:?}",
+                    self.output_mode,
+                    self.drawable_pixel_format,
+                    self.layer_color_space_label,
+                    info.width,
+                    info.height,
+                    info.pixel_format_fourcc,
+                    info.format,
+                    info.full_range,
+                    frame.pipeline.source.range,
+                    frame.pipeline.source.primaries,
+                    frame.pipeline.source.transfer,
+                    frame.pipeline.source.matrix,
+                    frame.pipeline.source.hdr_metadata,
+                    frame.pipeline.source.nominal_peak_nits,
+                    frame.pipeline.source.reference_white_nits,
+                    frame.pipeline.target,
+                );
+            }
+        }
 
         unsafe {
             let Some(drawable): Option<Retained<ProtocolObject<dyn CAMetalDrawable>>> =

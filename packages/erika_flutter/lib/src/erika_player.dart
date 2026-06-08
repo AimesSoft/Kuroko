@@ -257,6 +257,7 @@ class ErikaPlayer {
   ErikaPlayer({
     this.outputMode,
     this.edrHeadroom,
+    this.hdrDebug = false,
   }) {
     _eventSubscription ??= _events.receiveBroadcastStream().listen(
       _dispatchNativeEvent,
@@ -287,6 +288,7 @@ class ErikaPlayer {
 
   final ErikaOutputMode? outputMode;
   final double? edrHeadroom;
+  final bool hdrDebug;
 
   int? get id => _id;
 
@@ -744,12 +746,17 @@ class ErikaPlayer {
   }
 
   Future<int> _create() async {
+    final arguments = <String, Object?>{
+      if (outputMode case final mode?) 'outputMode': mode.nativeValue,
+      if (edrHeadroom case final headroom?) 'edrHeadroom': headroom,
+      if (hdrDebug) 'hdrDebug': true,
+    };
+    if (hdrDebug) {
+      debugPrint('ErikaHDR[Dart]: create arguments=$arguments');
+    }
     final playerId = await _channel.invokeMethod<int>(
       'create',
-      <String, Object?>{
-        if (outputMode case final mode?) 'outputMode': mode.nativeValue,
-        if (edrHeadroom case final headroom?) 'edrHeadroom': headroom,
-      },
+      arguments,
     );
     if (playerId == null || playerId <= 0) {
       throw StateError('Erika presenter creation failed.');

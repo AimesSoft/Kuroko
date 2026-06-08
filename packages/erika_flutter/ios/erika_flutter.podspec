@@ -61,6 +61,7 @@ Flutter iOS plugin that hosts a CAMetalLayer and drives Erika through its C ABI.
   s.script_phase = {
     :name => 'Build Erika C ABI',
     :execution_position => :before_compile,
+    :input_files => ['${BUILT_PRODUCTS_DIR}/erika_capi_phony'],
     :output_files => ['${PODS_TARGET_SRCROOT}/native/liberika_capi.a'],
     :script => <<-SCRIPT
 set -eu
@@ -112,20 +113,21 @@ if [ -n "${ERIKA_IOS_CAPI_STATICLIB:-}" ]; then
   LIB_SOURCE="$ERIKA_IOS_CAPI_STATICLIB"
 else
   LIB_SOURCE="$ERIKA_ROOT/target/$RUST_TARGET/$CARGO_PROFILE/liberika_capi.a"
-  if [ ! -f "$LIB_SOURCE" ]; then
-    echo "Building Erika C ABI for $RUST_TARGET ($CARGO_PROFILE)"
-    (cd "$ERIKA_ROOT" && cargo build -p erika_capi --target "$RUST_TARGET" $CARGO_ARGS)
-  fi
+  echo "Building Erika C ABI staticlib for $RUST_TARGET ($CARGO_PROFILE)"
+  (cd "$ERIKA_ROOT" && cargo rustc -p erika_capi --target "$RUST_TARGET" $CARGO_ARGS --lib --crate-type staticlib)
 fi
 
 if [ ! -f "$LIB_SOURCE" ]; then
   echo "error: Erika C ABI static library not found: $LIB_SOURCE" >&2
-  echo "       Build it with: cargo build -p erika_capi --target $RUST_TARGET $CARGO_ARGS" >&2
+  echo "       Build it with: cargo rustc -p erika_capi --target $RUST_TARGET $CARGO_ARGS --lib --crate-type staticlib" >&2
   exit 1
 fi
 
 mkdir -p "$PODS_TARGET_SRCROOT/native"
 cp "$LIB_SOURCE" "$PODS_TARGET_SRCROOT/native/liberika_capi.a"
+if [ -f "$OBJROOT/XCBuildData/build.db" ]; then
+  ln -fs "$OBJROOT/XCBuildData/build.db" "$BUILT_PRODUCTS_DIR/erika_capi_phony"
+fi
     SCRIPT
   }
   s.pod_target_xcconfig = {

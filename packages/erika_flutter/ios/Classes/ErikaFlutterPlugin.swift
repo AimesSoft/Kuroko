@@ -5,6 +5,123 @@ import Metal
 import QuartzCore
 import UIKit
 
+private func erikaHdrWrite(_ message: String) {
+  fputs("ErikaHDR[iOS]: \(message)\n", stderr)
+  fflush(stderr)
+}
+
+private func erikaHdrLog(_ enabled: Bool, _ message: String) {
+  if enabled {
+    erikaHdrWrite(message)
+  }
+}
+
+private func erikaOutputModeLabel(_ config: ErikaPresenterConfigC) -> String {
+  config.outputMode == 1
+    ? String(format: "AppleEdr(headroom=%.2f)", config.edrHeadroom)
+    : "Sdr"
+}
+
+private func erikaScreenSummary(_ screen: UIScreen?) -> String {
+  guard let screen else {
+    return "screen=nil"
+  }
+  var parts = [
+    "scale=\(screen.scale)",
+    "nativeScale=\(screen.nativeScale)",
+    "brightness=\(String(format: "%.3f", screen.brightness))",
+    "gamut=\(screen.traitCollection.displayGamut.rawValue)",
+  ]
+  if #available(iOS 16.0, *) {
+    parts.append("currentEDR=\(String(format: "%.3f", screen.currentEDRHeadroom))")
+    parts.append("potentialEDR=\(String(format: "%.3f", screen.potentialEDRHeadroom))")
+  }
+  return parts.joined(separator: " ")
+}
+
+private func erikaLayerValue(_ layer: CAMetalLayer, selector name: String) -> String {
+  let selector = Selector(name)
+  guard layer.responds(to: selector) else {
+    return "unavailable"
+  }
+  return String(describing: layer.value(forKey: name) ?? "nil")
+}
+
+private func erikaConfigureLayerDynamicRange(_ layer: CAMetalLayer, config: ErikaPresenterConfigC) {
+  if config.outputMode == 1 {
+    layer.contentsFormat = .RGBA16Float
+    if #available(iOS 16.0, *) {
+      layer.wantsExtendedDynamicRangeContent = true
+      layer.edrMetadata = CAEDRMetadata.hdr10(
+        minLuminance: 0.02,
+        maxLuminance: 1200.0,
+        opticalOutputScale: 203.0
+      )
+    }
+    if #available(iOS 18.0, *) {
+      layer.toneMapMode = .ifSupported
+    }
+    if #available(iOS 26.0, *) {
+      layer.preferredDynamicRange = .high
+      layer.contentsHeadroom = CGFloat(max(config.edrHeadroom, 1.0))
+    }
+  } else {
+    layer.contentsFormat = .RGBA8Uint
+    if #available(iOS 16.0, *) {
+      layer.wantsExtendedDynamicRangeContent = false
+      layer.edrMetadata = nil
+    }
+    if #available(iOS 18.0, *) {
+      layer.toneMapMode = .automatic
+    }
+    if #available(iOS 26.0, *) {
+      layer.preferredDynamicRange = .standard
+      layer.contentsHeadroom = 0.0
+    }
+  }
+}
+
+private func erikaLayerSummary(_ layer: CAMetalLayer) -> String {
+  let wantsEDR: String
+  if #available(iOS 16.0, *) {
+    wantsEDR = String(layer.wantsExtendedDynamicRangeContent)
+  } else {
+    wantsEDR = "unavailable"
+  }
+  let toneMapMode: String
+  if #available(iOS 18.0, *) {
+    toneMapMode = String(describing: layer.toneMapMode)
+  } else {
+    toneMapMode = "unavailable"
+  }
+  let preferredDynamicRange: String
+  if #available(iOS 26.0, *) {
+    preferredDynamicRange = String(describing: layer.preferredDynamicRange)
+  } else {
+    preferredDynamicRange = "unavailable"
+  }
+  let contentsHeadroom: String
+  if #available(iOS 26.0, *) {
+    contentsHeadroom = String(format: "%.3f", layer.contentsHeadroom)
+  } else {
+    contentsHeadroom = "unavailable"
+  }
+  let colorSpace = layer.colorspace?.name.map { String(describing: $0) } ?? "nil"
+  return [
+    "pixelFormat=\(layer.pixelFormat.rawValue)",
+    "drawable=\(Int(layer.drawableSize.width))x\(Int(layer.drawableSize.height))",
+    "framebufferOnly=\(layer.framebufferOnly)",
+    "opaque=\(layer.isOpaque)",
+    "contentsFormat=\(layer.contentsFormat)",
+    "wantsEDR=\(wantsEDR)",
+    "toneMapMode=\(toneMapMode)",
+    "preferredDynamicRange=\(preferredDynamicRange)",
+    "contentsHeadroom=\(contentsHeadroom)",
+    "edrMetadata=\(erikaLayerValue(layer, selector: "EDRMetadata"))",
+    "colorspace=\(colorSpace)",
+  ].joined(separator: " ")
+}
+
 private struct ErikaTrackSelectionC {
   var video: Int64 = -1
   var audio: Int64 = -1
@@ -236,10 +353,16 @@ private final class ErikaNativeLibrary {
   let pollEvent: PollEventFn
 
   private let libraryHandle: UnsafeMutableRawPointer
+  let path: String
 
   private init() throws {
     let loaded = try Self.openLibrary()
     libraryHandle = loaded.handle
+    path = loaded.path
+    erikaHdrLog(
+      boolEnvironmentFlag("ERIKA_HDR_DEBUG", environment: ProcessInfo.processInfo.environment),
+      "loaded native library from \(path)"
+    )
 
     create = try Self.load("erika_presenter_create", from: libraryHandle, as: CreateFn.self)
     createWithOutputMode = Self.loadOptional("erika_presenter_create_with_output_mode", from: libraryHandle, as: CreateWithOutputModeFn.self)
@@ -355,14 +478,23 @@ private final class ErikaPlayerHost {
   private var displayLinkProxy: DisplayLinkProxy?
   private var startTimeSeconds: CFTimeInterval = CACurrentMediaTime()
   private var currentDanmakuConfig = ErikaDanmakuConfigC()
+  private let hdrDebug: Bool
+  private let presenterConfig: ErikaPresenterConfigC
+  private var loggedFirstRenderedVideoFrame = false
 
-  init(id: Int64, library: ErikaNativeLibrary, config: ErikaPresenterConfigC) throws {
+  init(id: Int64, library: ErikaNativeLibrary, config: ErikaPresenterConfigC, hdrDebug: Bool) throws {
     self.id = id
     self.library = library
+    self.hdrDebug = hdrDebug
+    presenterConfig = config
     guard let handle = library.createPresenter(config: config) else {
       throw ErikaPluginError.presenterCreateFailed
     }
     self.handle = handle
+    erikaHdrLog(
+      hdrDebug,
+      "created presenter player=\(id) mode=\(erikaOutputModeLabel(config)) library=\(library.path) createWithOutputMode=\(library.createWithOutputMode != nil)"
+    )
   }
 
   deinit {
@@ -656,6 +788,15 @@ private final class ErikaPlayerHost {
     if status != 0 {
       NSLog("ErikaFlutterPlugin: render_tick failed with status \(status)")
     }
+    if hdrDebug && !loggedFirstRenderedVideoFrame && stats.renderedVideoFrames > 0 {
+      loggedFirstRenderedVideoFrame = true
+      let layer = attachedView.map { erikaLayerSummary($0.metalLayer) } ?? "layer=nil"
+      let screen = erikaScreenSummary(attachedView?.window?.screen ?? UIScreen.main)
+      erikaHdrLog(
+        true,
+        "first rendered frame player=\(id) mode=\(erikaOutputModeLabel(presenterConfig)) decoded=\(stats.decodedVideoFrames) rendered=\(stats.renderedVideoFrames) test=\(stats.renderedTestFrames) \(screen) \(layer)"
+      )
+    }
     pollEvents(sendEvent: sendEvent)
   }
 
@@ -667,6 +808,12 @@ private final class ErikaPlayerHost {
         library.pollEvent(handle, UnsafeMutableRawPointer(pointer))
       }
       if status == 0 {
+        if event.kind == 6 {
+          erikaHdrLog(
+            hdrDebug,
+            "video params player=\(id) width=\(event.video.width) height=\(event.video.height) primaries=\(event.video.primaries) transfer=\(event.video.transfer)"
+          )
+        }
         sendEvent(event.toFlutterMap(playerId: id, host: self))
         continue
       }
@@ -678,6 +825,7 @@ private final class ErikaPlayerHost {
   }
 
   private func attachOrResize(view: ErikaMetalSurfaceView, attach: Bool) throws {
+    erikaConfigureLayerDynamicRange(view.metalLayer, config: presenterConfig)
     view.updateDrawableSize()
     let width = UInt32(max(1.0, view.bounds.width).rounded())
     let height = UInt32(max(1.0, view.bounds.height).rounded())
@@ -685,8 +833,16 @@ private final class ErikaPlayerHost {
     if attach {
       let rawLayer = UInt64(UInt(bitPattern: Unmanaged.passUnretained(view.metalLayer).toOpaque()))
       try check(library.attachMetalLayer(handle, rawLayer, width, height, scale), operation: "attach_metal_layer")
+      erikaHdrLog(
+        hdrDebug,
+        "attached layer player=\(id) view=\(view.platformViewId) logical=\(width)x\(height) scale=\(String(format: "%.3f", scale)) \(erikaScreenSummary(view.window?.screen ?? UIScreen.main)) \(erikaLayerSummary(view.metalLayer))"
+      )
     } else {
       try check(library.resizeSurface(handle, width, height, scale), operation: "resize_surface")
+      erikaHdrLog(
+        hdrDebug,
+        "resized layer player=\(id) view=\(view.platformViewId) logical=\(width)x\(height) scale=\(String(format: "%.3f", scale)) \(erikaLayerSummary(view.metalLayer))"
+      )
     }
   }
 
@@ -1119,43 +1275,78 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
     guard let library = ErikaNativeLibrary.shared else {
       throw ErikaPluginError.libraryNotFound(["main executable", "ERIKA_CAPI_DYLIB", "app bundle"])
     }
+    let args = arguments as? [String: Any]
+    let hdrDebug = boolValue(args?["hdrDebug"]) ??
+      boolEnvironmentFlag("ERIKA_HDR_DEBUG", environment: ProcessInfo.processInfo.environment)
+    let config = presenterConfigForNewPlayer(arguments: arguments, hdrDebug: hdrDebug)
     let id = nextPlayerId
     nextPlayerId += 1
-    players[id] = try ErikaPlayerHost(id: id, library: library, config: presenterConfigForNewPlayer(arguments: arguments))
+    players[id] = try ErikaPlayerHost(id: id, library: library, config: config, hdrDebug: hdrDebug)
     startPollTimerIfNeeded()
     return id
   }
 
-  private func presenterConfigForNewPlayer(arguments: Any?) throws -> ErikaPresenterConfigC {
+  private func presenterConfigForNewPlayer(arguments: Any?, hdrDebug: Bool) -> ErikaPresenterConfigC {
     if let args = arguments as? [String: Any], let explicitMode = int32Value(args["outputMode"]) {
       let headroom = floatValue(args["edrHeadroom"]) ?? 4.0
-      return explicitMode == 1 ? .appleEdr(headroom: headroom) : .sdr
+      let config = explicitMode == 1 ? ErikaPresenterConfigC.appleEdr(headroom: headroom) : .sdr
+      erikaHdrLog(
+        hdrDebug,
+        "create explicit outputMode=\(explicitMode) requestedHeadroom=\(String(format: "%.3f", headroom)) selected=\(erikaOutputModeLabel(config))"
+      )
+      return config
     }
-    let headroom = resolvedEdrHeadroom()
-    return headroom > 1.0 ? .appleEdr(headroom: headroom) : .sdr
+    let headroom = resolvedEdrHeadroom(hdrDebug: hdrDebug)
+    let config = headroom > 1.0 ? ErikaPresenterConfigC.appleEdr(headroom: headroom) : .sdr
+    erikaHdrLog(
+      hdrDebug,
+      "create auto selected=\(erikaOutputModeLabel(config)) resolvedHeadroom=\(String(format: "%.3f", headroom))"
+    )
+    return config
   }
 
-  private func resolvedEdrHeadroom() -> Float {
+  private func resolvedEdrHeadroom(hdrDebug: Bool) -> Float {
     let environment = ProcessInfo.processInfo.environment
-    if boolEnvironmentFlag("ERIKA_DISABLE_EDR", environment: environment) { return 1.0 }
+    if boolEnvironmentFlag("ERIKA_DISABLE_EDR", environment: environment) {
+      erikaHdrLog(hdrDebug, "EDR disabled by ERIKA_DISABLE_EDR")
+      return 1.0
+    }
     if let override = floatEnvironmentValue("ERIKA_EDR_HEADROOM", environment: environment), override > 1.0 {
+      erikaHdrLog(hdrDebug, "EDR headroom override ERIKA_EDR_HEADROOM=\(String(format: "%.3f", override))")
       return override
     }
-    let screenHeadroom = currentScreenEdrHeadroom()
+    let screenHeadroom = currentScreenEdrHeadroom(hdrDebug: hdrDebug)
     if screenHeadroom > 1.0 { return screenHeadroom }
-    if boolEnvironmentFlag("ERIKA_ENABLE_EDR", environment: environment) { return 4.0 }
+    if boolEnvironmentFlag("ERIKA_ENABLE_EDR", environment: environment) {
+      erikaHdrLog(hdrDebug, "EDR forced by ERIKA_ENABLE_EDR")
+      return 4.0
+    }
     return 1.0
   }
 
-  private func currentScreenEdrHeadroom() -> Float {
+  private func currentScreenEdrHeadroom(hdrDebug: Bool) -> Float {
     let screen = UIScreen.main
-    for key in ["currentEDRHeadroom", "potentialEDRHeadroom", "maximumPotentialExtendedDynamicRangeColorComponentValue"] {
+    var samples: [String] = []
+    for key in ["potentialEDRHeadroom", "currentEDRHeadroom", "maximumPotentialExtendedDynamicRangeColorComponentValue"] {
       let selector = Selector(key)
       if screen.responds(to: selector), let number = screen.value(forKey: key) as? NSNumber {
         let value = number.floatValue
-        if value.isFinite && value > 1.0 { return value }
+        samples.append("\(key)=\(String(format: "%.3f", value))")
+        if value.isFinite && value > 1.0 {
+          erikaHdrLog(
+            hdrDebug,
+            "screen headroom selected \(key)=\(String(format: "%.3f", value)) \(erikaScreenSummary(screen)) samples=[\(samples.joined(separator: ", "))]"
+          )
+          return value
+        }
+      } else {
+        samples.append("\(key)=unavailable")
       }
     }
+    erikaHdrLog(
+      hdrDebug,
+      "screen headroom fallback=1.000 \(erikaScreenSummary(screen)) samples=[\(samples.joined(separator: ", "))]"
+    )
     return 1.0
   }
 

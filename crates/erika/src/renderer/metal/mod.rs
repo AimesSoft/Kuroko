@@ -92,19 +92,35 @@ impl MetalOutputMode {
         match self {
             Self::Sdr => crate::renderer::pipeline::TargetColorState::sdr(ColorPrimaries::Bt709),
             Self::AppleEdr { headroom } => {
-                let primaries = match (source.transfer, source.primaries) {
-                    (TransferFunction::Pq, ColorPrimaries::Unknown) => ColorPrimaries::Bt2020,
-                    (TransferFunction::Pq, primaries) => primaries,
-                    _ => ColorPrimaries::Bt709,
-                };
-                let mut target =
-                    crate::renderer::pipeline::TargetColorState::apple_edr(primaries, headroom);
-                if matches!(source.transfer, TransferFunction::Pq) {
-                    target.transfer = TransferFunction::Pq;
-                    target.peak_nits = 10_000.0;
-                    target.reference_white_nits = 203.0;
+                #[cfg(target_os = "ios")]
+                {
+                    let _ = source;
+                    let headroom = headroom.max(1.0);
+                    return crate::renderer::pipeline::TargetColorState {
+                        primaries: ColorPrimaries::Bt709,
+                        transfer: TransferFunction::Srgb,
+                        peak_nits: 100.0 * headroom,
+                        reference_white_nits: 100.0,
+                        edr_headroom: headroom,
+                    };
                 }
-                target
+
+                #[cfg(not(target_os = "ios"))]
+                {
+                    let primaries = match (source.transfer, source.primaries) {
+                        (TransferFunction::Pq, ColorPrimaries::Unknown) => ColorPrimaries::Bt2020,
+                        (TransferFunction::Pq, primaries) => primaries,
+                        _ => ColorPrimaries::Bt709,
+                    };
+                    let mut target =
+                        crate::renderer::pipeline::TargetColorState::apple_edr(primaries, headroom);
+                    if matches!(source.transfer, TransferFunction::Pq) {
+                        target.transfer = TransferFunction::Pq;
+                        target.peak_nits = 10_000.0;
+                        target.reference_white_nits = 203.0;
+                    }
+                    target
+                }
             }
         }
     }

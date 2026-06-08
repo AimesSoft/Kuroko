@@ -72,10 +72,11 @@ fn ffmpeg_dist_dir() -> PathBuf {
     if let Ok(path) = env::var("ERIKA_FFMPEG_DIR") {
         return PathBuf::from(path);
     }
-    workspace_root()
-        .join("third_party/dist")
-        .join(native_profile())
-        .join("ffmpeg")
+    let mut dist = workspace_root().join("third_party/dist");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("ios") {
+        dist = dist.join("ios");
+    }
+    dist.join(native_profile()).join("ffmpeg")
 }
 
 fn native_profile() -> String {
