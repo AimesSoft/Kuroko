@@ -1,6 +1,8 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
@@ -80,6 +82,8 @@ class _ErikaVideoViewState extends State<ErikaVideoView> {
           creationParamsCodec: const StandardMessageCodec(),
           creationParams: creationParams,
           onPlatformViewCreated: _handlePlatformViewCreated,
+          hitTestBehavior: PlatformViewHitTestBehavior.transparent,
+          gestureRecognizers: const <Factory<OneSequenceGestureRecognizer>>{},
         );
       case TargetPlatform.android:
       case TargetPlatform.fuchsia:

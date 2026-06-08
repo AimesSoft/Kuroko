@@ -775,6 +775,7 @@ private final class ErikaMetalUIView: UIView, ErikaMetalSurfaceView {
     self.plugin = plugin
     super.init(frame: frame)
     isOpaque = true
+    isUserInteractionEnabled = false
     backgroundColor = .black
     contentScaleFactor = CGFloat(currentScale)
     metalLayer.pixelFormat = .bgra8Unorm
@@ -789,6 +790,14 @@ private final class ErikaMetalUIView: UIView, ErikaMetalSurfaceView {
 
   deinit {
     plugin?.unregisterView(viewId: platformViewId)
+  }
+
+  override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+    false
+  }
+
+  override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+    nil
   }
 
   override func layoutSubviews() {
