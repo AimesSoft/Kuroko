@@ -16,6 +16,18 @@ private func erikaHdrLog(_ enabled: Bool, _ message: String) {
   }
 }
 
+private func erikaHdrEnvironmentEnabled() -> Bool {
+  guard let value = ProcessInfo.processInfo.environment["ERIKA_HDR_DEBUG"] else {
+    return false
+  }
+  switch value.lowercased() {
+  case "1", "true", "yes", "on":
+    return true
+  default:
+    return false
+  }
+}
+
 private func erikaOutputModeLabel(_ config: ErikaPresenterConfigC) -> String {
   config.outputMode == 1
     ? String(format: "AppleEdr(headroom=%.2f)", config.edrHeadroom)
@@ -360,7 +372,7 @@ private final class ErikaNativeLibrary {
     libraryHandle = loaded.handle
     path = loaded.path
     erikaHdrLog(
-      boolEnvironmentFlag("ERIKA_HDR_DEBUG", environment: ProcessInfo.processInfo.environment),
+      erikaHdrEnvironmentEnabled(),
       "loaded native library from \(path)"
     )
 
