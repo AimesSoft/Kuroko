@@ -39,6 +39,7 @@ impl DemoState {
                 renderer: demo_renderer_config(),
                 overlay: demo_overlay_timeline(),
                 danmaku: Some(demo_danmaku_timeline()),
+                render_test_pattern_when_idle: MEDIA_URI.get().is_none(),
                 ..PresenterConfig::default()
             })?,
             load_attempted: false,

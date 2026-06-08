@@ -50,6 +50,7 @@ pub struct PresenterConfig {
     pub overlay: OverlayTimeline,
     pub danmaku: Option<DanmakuTimeline>,
     pub danmaku_config: DanmakuLayoutConfig,
+    pub render_test_pattern_when_idle: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +95,7 @@ impl Default for PresenterConfig {
             overlay: OverlayTimeline::default(),
             danmaku: None,
             danmaku_config: DanmakuLayoutConfig::default(),
+            render_test_pattern_when_idle: false,
         }
     }
 }
@@ -167,6 +169,7 @@ pub struct PresenterRuntime {
     current_danmaku_viewport: Option<DanmakuViewport>,
     subtitles: SubtitleFrameState,
     overlay: OverlayTimeline,
+    render_test_pattern_when_idle: bool,
     danmaku_session: DanmakuSession,
     danmaku: DfmLayoutEngine,
     danmaku_generation: u64,
@@ -276,6 +279,7 @@ impl PresenterRuntime {
             current_danmaku_viewport: None,
             subtitles: SubtitleFrameState::default(),
             overlay: config.overlay,
+            render_test_pattern_when_idle: config.render_test_pattern_when_idle,
             danmaku_session,
             danmaku: DfmLayoutEngine::new(danmaku_timeline, config.danmaku_config),
             danmaku_generation: 1,
@@ -593,11 +597,13 @@ impl PresenterRuntime {
         match render_result {
             Ok(true) => self.stats.rendered_video_frames += 1,
             Ok(false) => {
-                let render_started = Instant::now();
-                self.renderer.render_test_frame(time_seconds)?;
-                self.last_render_test_duration = render_started.elapsed();
-                self.last_render_duration = self.last_render_test_duration;
-                self.stats.rendered_test_frames += 1;
+                if self.render_test_pattern_when_idle {
+                    let render_started = Instant::now();
+                    self.renderer.render_test_frame(time_seconds)?;
+                    self.last_render_test_duration = render_started.elapsed();
+                    self.last_render_duration = self.last_render_test_duration;
+                    self.stats.rendered_test_frames += 1;
+                }
             }
             Err(error) => {
                 self.stats.render_failures += 1;
@@ -1507,6 +1513,24 @@ mod tests {
 
         assert_eq!(danmaku_generation, 5);
         assert_eq!(generation, 8);
+    }
+
+    #[test]
+    fn presenter_config_disables_idle_test_pattern_by_default() {
+        assert!(!PresenterConfig::default().render_test_pattern_when_idle);
+    }
+
+    #[test]
+    fn idle_tick_does_not_render_test_pattern_by_default() {
+        let mut presenter = PresenterRuntime::new(PresenterConfig::default()).unwrap();
+
+        let stats = presenter.render_tick(0.0).unwrap();
+
+        assert_eq!(stats.rendered_test_frames, 0);
+        assert_eq!(
+            presenter.runtime_snapshot().last_render_test_duration,
+            Duration::ZERO
+        );
     }
 
     #[test]

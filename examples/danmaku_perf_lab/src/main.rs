@@ -269,6 +269,7 @@ impl WindowLabState {
             renderer: MetalRendererConfig::default(),
             danmaku: Some(timeline),
             danmaku_config: layout_config_from_options(&options),
+            render_test_pattern_when_idle: options.video_uri.is_none(),
             ..PresenterConfig::default()
         })
         .map_err(|error| error.to_string())?;
