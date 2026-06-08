@@ -8,7 +8,7 @@ version.workspace = true
 build = "build.rs"
 
 [features]
-default = []
+default = ["libass"]
 libass = []
 wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 

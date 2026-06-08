@@ -4,9 +4,6 @@ Erika is not a Flutter video renderer. Flutter is an optional host UI.
 The player owns decode, timing, native rendering, subtitles, danmaku, audio, and
 HDR presentation.
 
-This document describes how a Flutter application should use the current v0
-foundation.
-
 ## API Families
 
 There are two C ABI entrypoint families:
@@ -14,41 +11,48 @@ There are two C ABI entrypoint families:
 - `ErikaHandle`: control and event API. Use this when the host owns its own
   presenter loop or only wants to probe/control playback.
 - `ErikaPresenterHandle`: presenter-owned API. Use this when Erika should
-  own `Player + MetalRenderer + CoreAudio` and the host only supplies a native
-  surface plus a display-tick callback.
+  own `Player + MetalRenderer + audio output` and the host only supplies a
+  native surface plus a display-tick callback.
 
-Both families are declared in
-`crates/erika_capi/include/erika.h`.
+Both families are declared in `crates/erika_capi/include/erika.h`.
 
 ## macOS HDR Path
 
-The macOS HDR path should use a native Metal-backed surface, not Flutter
-Texture. This matches the direction proven by NipaPlay's earlier macOS HDR PR:
+The macOS HDR path uses a native Metal-backed surface, not Flutter Texture.
 Flutter/AppKit view composition can show video but is vulnerable to black
 flicker, while a window-hosted native layer with a transparent Flutter region is
 the stable HDR direction.
 
-The intended plugin shape is:
+The plugin implements two view strategies:
 
-1. Dart creates a normal Flutter widget that reserves a rectangle for video.
-2. The macOS plugin creates a window-hosted native `NSView`/`CAMetalLayer` as a
-   sibling or underlay of Flutter's content.
-3. Flutter paints that widget region transparent or otherwise leaves a hole for
-   the native video layer.
-4. The plugin sends geometry updates to native code with a surface generation
-   number.
-5. Native code attaches the `CAMetalLayer` pointer through
-   `erika_presenter_attach_metal_layer`.
-6. Native code drives `erika_presenter_render_tick` from a display timer such as
-   `CVDisplayLink`, AppKit display callbacks, or a platform timer.
-7. Dispose/hide calls only detach the surface if their generation still matches
-   the currently attached surface.
+### ErikaVideoView (Platform View)
 
-The important ownership rule is simple: Flutter owns layout and controls;
-Erika owns the video plane, subtitle plane, danmaku plane, audio, and
-timing.
+Standard Flutter platform view backed by `NSView`/`CAMetalLayer`. The plugin
+creates a native video view registered as `erika_flutter/video_view`, attaches
+it to the presenter, and drives rendering from a display link.
 
-## Minimal macOS Presenter Flow
+### ErikaWindowOverlayVideoView (Window Overlay)
+
+For HDR/EDR on macOS, the plugin creates a window-hosted native overlay that
+sits outside Flutter's compositor:
+
+1. Dart `ErikaWindowOverlayVideoView` reserves a rectangle in the widget tree.
+2. The macOS plugin creates a window-level `CAMetalLayer` as a sibling/underlay.
+3. Flutter paints the widget region transparent, leaving a hole for native video.
+4. The widget tracks its position and sends geometry updates with a surface
+   generation number, so stale hide calls from disposed widgets cannot affect
+   newly attached surfaces.
+5. Attach retry with exponential backoff handles window readiness timing.
+
+## iOS Path
+
+The iOS plugin uses `UiKitView` backed by `CAMetalLayer`. The Erika C ABI
+static library is linked into the app through a CocoaPod script phase that
+builds the Rust `erika_capi` crate for the target iOS architecture.
+
+Touch events pass through the video view (`hitTestBehavior: transparent`).
+
+## Minimal Presenter Flow
 
 ```c
 ErikaPresenterHandle *presenter = erika_presenter_create();
@@ -73,58 +77,63 @@ erika_presenter_detach_surface(presenter);
 erika_presenter_destroy(presenter);
 ```
 
-The current native demo already uses this pattern:
-`examples/macos_native_demo` creates the AppKit window/layer, while
-`PresenterRuntime` owns playback, Metal rendering, overlay composition, and
-CoreAudio output.
-
 ## Flutter Texture Path
 
-Flutter Texture is allowed, but it is a lower-capability compatibility path.
+Flutter Texture is a lower-capability compatibility path.
 
-Texture output is useful for:
-
+Useful for:
 - SDR fallback.
 - Platforms where native view composition is not ready.
 - Test surfaces or constrained embedding environments.
 
-Texture output is not the preferred HDR/EDR route because video enters
-Flutter's compositor. On Apple platforms, that means it cannot be treated as
-equivalent to a renderer-owned Metal surface. The C ABI already has
-`erika_attach_flutter_texture` so the host API shape is reserved, but the
-production renderer path should keep HDR playback on the native presenter.
+Not the preferred HDR/EDR route because video enters Flutter's compositor. The
+C ABI reserves `erika_attach_flutter_texture` for this path.
 
-## WGPU Fallback
+## wgpu Fallback
 
-The Apple HDR path remains native Metal first. `wgpu` is the cross-platform
-fallback direction for Windows, Linux, Android, and non-HDR or less specialized
-paths.
+The Apple HDR path remains native Metal. `wgpu` is the cross-platform fallback
+direction for Windows, Linux, Android, and non-HDR paths. The wgpu renderer has
+video frame rendering and danmaku compositing implemented, but does not yet
+support VideoToolbox zero-copy import or HDR/EDR output.
 
-The current `renderer::wgpu` module intentionally only defines the lifecycle
-boundary:
+## Dart API
 
-- attach a platform surface handle;
-- resize it;
-- render a test frame;
-- detach it safely.
+```dart
+final player = ErikaPlayer(
+  outputMode: ErikaOutputMode.appleEdr,  // optional: force EDR
+  edrHeadroom: 4.0,                      // optional: EDR headroom
+);
 
-The next wgpu milestone should add the real dependency, surface creation,
-WGSL YCbCr/P010 conversion, subtitle/danmaku batches, and platform-specific
-texture import or upload strategies.
+await player.open('/path/to/video.mp4');
+await player.play();
 
-## Difference From The Earlier NipaPlay macOS HDR PR
+// Playback control
+await player.pause();
+await player.seek(Duration(seconds: 30));
+await player.setVolume(0.8);
+await player.setPlaybackRate(1.5);
 
-The composition strategy is the same where it matters: avoid sending HDR video
-through Flutter's compositor and reserve native screen real estate for a Metal
-surface.
+// Track management
+final tracks = await player.tracks();
+await player.selectAudioTrack(trackId);
+await player.selectSubtitleTrack(trackId);
+await player.addExternalSubtitle('/path/to/subtitle.srt');
 
-The ownership is different:
+// Danmaku
+await player.loadDanmakuFile('/path/to/danmaku.xml');
+await player.addDanmakuTrackJson(jsonString, name: 'source', offset: Duration.zero);
+await player.setDanmakuConfig(fontSize: 30, displayArea: 0.5);
 
-- Earlier NipaPlay work proved the host-side macOS HDR embedding strategy.
-- Erika moves decode, frame import, Metal rendering, CoreAudio, subtitle
-  overlay, danmaku layout, and timing into a standalone Rust player.
-- Flutter will call a narrow C ABI instead of owning playback internals.
+// Events
+player.events.listen((event) {
+  // event.kind, event.state, event.position, event.duration, ...
+});
 
-That makes the native-surface approach a normal player-kernel integration:
-Flutter remains the app shell, while Erika behaves like a platform media
-engine that presents directly into native surfaces.
+await player.dispose();
+```
+
+## Ownership Rule
+
+Flutter owns layout and controls. Erika owns the video plane, subtitle plane,
+danmaku plane, audio, and timing. The plugin bridges commands and events through
+a `MethodChannel`; rendering never passes through Dart.
