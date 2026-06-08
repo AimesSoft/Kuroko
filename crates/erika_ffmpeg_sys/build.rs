@@ -5,6 +5,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-env-changed=ERIKA_NATIVE_PROFILE");
+    println!("cargo:rerun-if-env-changed=ERIKA_NATIVE_TARGET");
     println!("cargo:rerun-if-env-changed=ERIKA_FFMPEG_DIR");
 
     let dist_dir = ffmpeg_dist_dir();
@@ -71,6 +72,13 @@ fn main() {
 fn ffmpeg_dist_dir() -> PathBuf {
     if let Ok(path) = env::var("ERIKA_FFMPEG_DIR") {
         return PathBuf::from(path);
+    }
+    if let Ok(target) = env::var("ERIKA_NATIVE_TARGET") {
+        return workspace_root()
+            .join("third_party/dist")
+            .join(target)
+            .join(native_profile())
+            .join("ffmpeg");
     }
     let mut dist = workspace_root().join("third_party/dist");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("ios") {

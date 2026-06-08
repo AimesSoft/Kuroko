@@ -80,18 +80,18 @@ fn deps(mut args: Vec<String>) -> Result<()> {
     let options = DepsOptions::parse(&args)?;
     match subcommand.as_str() {
         "plan" => {
-            print_dependency_plan(options.profile);
+            print_dependency_plan(options.profile, options.target);
             Ok(())
         }
         "fetch" => {
-            print_dependency_plan(options.profile);
-            let layout = workspace_layout(options.profile)?;
+            print_dependency_plan(options.profile, options.target);
+            let layout = workspace_layout(options.profile, options.target)?;
             fetch_dependency_sources(&layout, options.all)?;
-            write_profile_metadata(&layout, options.profile)
+            write_profile_metadata(&layout, options.profile, options.target)
         }
-        "status" => print_dependency_status(&workspace_layout(options.profile)?),
+        "status" => print_dependency_status(&workspace_layout(options.profile, options.target)?),
         "build" => {
-            print_dependency_plan(options.profile);
+            print_dependency_plan(options.profile, options.target);
             build_dependencies(options)
         }
         other => bail!("unknown deps subcommand: {other}"),
@@ -141,9 +141,103 @@ impl NativeDependencyProfile {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppleTarget {
+    Host,
+    Aarch64Macos,
+    X86_64Macos,
+    Aarch64Ios,
+    Aarch64IosSimulator,
+    X86_64IosSimulator,
+}
+
+impl AppleTarget {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "host" => Ok(Self::Host),
+            "aarch64-apple-darwin" => Ok(Self::Aarch64Macos),
+            "x86_64-apple-darwin" => Ok(Self::X86_64Macos),
+            "aarch64-apple-ios" => Ok(Self::Aarch64Ios),
+            "aarch64-apple-ios-sim" => Ok(Self::Aarch64IosSimulator),
+            "x86_64-apple-ios" => Ok(Self::X86_64IosSimulator),
+            other => bail!("unknown Apple target: {other}"),
+        }
+    }
+
+    fn triple(self) -> Option<&'static str> {
+        match self {
+            Self::Host => None,
+            Self::Aarch64Macos => Some("aarch64-apple-darwin"),
+            Self::X86_64Macos => Some("x86_64-apple-darwin"),
+            Self::Aarch64Ios => Some("aarch64-apple-ios"),
+            Self::Aarch64IosSimulator => Some("aarch64-apple-ios-sim"),
+            Self::X86_64IosSimulator => Some("x86_64-apple-ios"),
+        }
+    }
+
+    fn sdk(self) -> Option<&'static str> {
+        match self {
+            Self::Host => None,
+            Self::Aarch64Macos | Self::X86_64Macos => Some("macosx"),
+            Self::Aarch64Ios => Some("iphoneos"),
+            Self::Aarch64IosSimulator | Self::X86_64IosSimulator => Some("iphonesimulator"),
+        }
+    }
+
+    fn ffmpeg_arch(self) -> Option<&'static str> {
+        match self {
+            Self::Host => None,
+            Self::Aarch64Macos | Self::Aarch64Ios | Self::Aarch64IosSimulator => Some("arm64"),
+            Self::X86_64Macos | Self::X86_64IosSimulator => Some("x86_64"),
+        }
+    }
+
+    fn meson_cpu_family(self) -> Option<&'static str> {
+        match self {
+            Self::Host => None,
+            Self::Aarch64Macos | Self::Aarch64Ios | Self::Aarch64IosSimulator => Some("aarch64"),
+            Self::X86_64Macos | Self::X86_64IosSimulator => Some("x86_64"),
+        }
+    }
+
+    fn meson_cpu(self) -> Option<&'static str> {
+        match self {
+            Self::Host => None,
+            Self::Aarch64Macos | Self::Aarch64Ios | Self::Aarch64IosSimulator => Some("arm64"),
+            Self::X86_64Macos | Self::X86_64IosSimulator => Some("x86_64"),
+        }
+    }
+
+    fn is_ios(self) -> bool {
+        matches!(
+            self,
+            Self::Aarch64Ios | Self::Aarch64IosSimulator | Self::X86_64IosSimulator
+        )
+    }
+
+    fn deployment_target(self) -> Option<(String, &'static str)> {
+        match self {
+            Self::Host => None,
+            Self::Aarch64Macos | Self::X86_64Macos => Some((
+                env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "11.0".to_string()),
+                "-mmacosx-version-min",
+            )),
+            Self::Aarch64Ios => Some((
+                env::var("IPHONEOS_DEPLOYMENT_TARGET").unwrap_or_else(|_| "13.0".to_string()),
+                "-miphoneos-version-min",
+            )),
+            Self::Aarch64IosSimulator | Self::X86_64IosSimulator => Some((
+                env::var("IPHONEOS_DEPLOYMENT_TARGET").unwrap_or_else(|_| "13.0".to_string()),
+                "-mios-simulator-version-min",
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct DepsOptions {
     profile: NativeDependencyProfile,
+    target: AppleTarget,
     force: bool,
     all: bool,
     jobs: Option<usize>,
@@ -153,6 +247,7 @@ impl DepsOptions {
     fn parse(args: &[String]) -> Result<Self> {
         let mut options = Self {
             profile: NativeDependencyProfile::Lgpl,
+            target: AppleTarget::Host,
             force: false,
             all: false,
             jobs: None,
@@ -167,6 +262,11 @@ impl DepsOptions {
                         "gpl-full" => NativeDependencyProfile::GplFull,
                         other => bail!("unknown dependency profile: {other}"),
                     };
+                    index += 2;
+                }
+                "--target" => {
+                    let value = args.get(index + 1).context("--target requires a value")?;
+                    options.target = AppleTarget::parse(value)?;
                     index += 2;
                 }
                 "--force" => {
@@ -220,12 +320,28 @@ struct WorkspaceLayout {
     python_tools_dir: PathBuf,
 }
 
-fn workspace_layout(profile: NativeDependencyProfile) -> Result<WorkspaceLayout> {
+fn workspace_layout(
+    profile: NativeDependencyProfile,
+    target: AppleTarget,
+) -> Result<WorkspaceLayout> {
     let root = workspace_root()?;
     let cache_dir = root.join("third_party/cache");
     let source_dir = root.join("third_party/src");
-    let build_dir = root.join("third_party/build").join(profile_name(profile));
-    let dist_dir = root.join("third_party/dist").join(profile_name(profile));
+    let (build_dir, dist_dir) = if let Some(triple) = target.triple() {
+        (
+            root.join("third_party/build")
+                .join(triple)
+                .join(profile_name(profile)),
+            root.join("third_party/dist")
+                .join(triple)
+                .join(profile_name(profile)),
+        )
+    } else {
+        (
+            root.join("third_party/build").join(profile_name(profile)),
+            root.join("third_party/dist").join(profile_name(profile)),
+        )
+    };
     let ffmpeg_source_dir = source_dir.join(FFMPEG_DIR);
     let ffmpeg_build_dir = build_dir.join("ffmpeg");
     let ffmpeg_build_marker = ffmpeg_build_dir.join("ffmpeg-built.txt");
@@ -277,9 +393,10 @@ fn workspace_layout(profile: NativeDependencyProfile) -> Result<WorkspaceLayout>
     })
 }
 
-fn print_dependency_plan(profile: NativeDependencyProfile) {
+fn print_dependency_plan(profile: NativeDependencyProfile, target: AppleTarget) {
     println!("Erika native dependency plan");
     println!("profile: {}", profile_name(profile));
+    println!("target: {}", target.triple().unwrap_or("host"));
     println!("ffmpeg: {FFMPEG_VERSION} ({})", FFMPEG_URLS[0]);
     println!("libass: {LIBASS_VERSION} ({})", LIBASS_URLS[0]);
     println!("harfbuzz: {HARFBUZZ_VERSION} ({})", HARFBUZZ_URLS[0]);
@@ -316,14 +433,14 @@ fn fetch_dependency_sources(layout: &WorkspaceLayout, all: bool) -> Result<()> {
 
 fn build_dependencies(options: DepsOptions) -> Result<()> {
     ensure_required_tools()?;
-    let layout = workspace_layout(options.profile)?;
+    let layout = workspace_layout(options.profile, options.target)?;
     prepare_dependency_dirs(&layout)?;
     fetch_dependency_sources(&layout, options.all)?;
     build_ffmpeg(&layout, options)?;
     if options.all {
         build_text_dependencies(&layout, options)?;
     }
-    write_profile_metadata(&layout, options.profile)?;
+    write_profile_metadata(&layout, options.profile, options.target)?;
     println!(
         "\nNative dependencies are ready at {}",
         layout.dist_dir.display()
@@ -444,7 +561,8 @@ fn build_freetype(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> 
         .with_context(|| format!("create {}", layout.freetype_prefix.display()))?;
 
     println!("configure FreeType");
-    run(Command::new("cmake")
+    let mut configure = Command::new("cmake");
+    configure
         .arg("-S")
         .arg(&layout.freetype_source_dir)
         .arg("-B")
@@ -459,7 +577,9 @@ fn build_freetype(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> 
         .arg("-DFT_DISABLE_BZIP2=TRUE")
         .arg("-DFT_DISABLE_PNG=TRUE")
         .arg("-DFT_DISABLE_HARFBUZZ=TRUE")
-        .arg("-DFT_DISABLE_BROTLI=TRUE"))?;
+        .arg("-DFT_DISABLE_BROTLI=TRUE");
+    apply_cmake_apple_target(&mut configure, options.target)?;
+    run(&mut configure)?;
     cmake_build_install(&layout.freetype_build_dir, options.jobs)?;
     write_marker(
         &layout.freetype_build_marker,
@@ -484,7 +604,8 @@ fn build_harfbuzz(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> 
         .with_context(|| format!("create {}", layout.harfbuzz_prefix.display()))?;
 
     println!("configure HarfBuzz");
-    run(Command::new("cmake")
+    let mut configure = Command::new("cmake");
+    configure
         .arg("-S")
         .arg(&layout.harfbuzz_source_dir)
         .arg("-B")
@@ -502,7 +623,9 @@ fn build_harfbuzz(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> 
         .arg("-DHB_HAVE_CAIRO=OFF")
         .arg("-DHB_HAVE_CORETEXT=ON")
         .arg("-DHB_BUILD_UTILS=OFF")
-        .arg("-DHB_BUILD_SUBSET=OFF"))?;
+        .arg("-DHB_BUILD_SUBSET=OFF");
+    apply_cmake_apple_target(&mut configure, options.target)?;
+    run(&mut configure)?;
     cmake_build_install(&layout.harfbuzz_build_dir, options.jobs)?;
     write_marker(
         &layout.harfbuzz_build_marker,
@@ -535,6 +658,7 @@ fn build_fribidi(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
         .arg("--buildtype=release")
         .arg("-Ddocs=false")
         .arg("-Dtests=false");
+    apply_meson_apple_target(&mut setup, layout, options.target, "fribidi")?;
     run(&mut setup)?;
     meson_compile_install(&meson, &layout.fribidi_build_dir, options.jobs)?;
     write_marker(
@@ -579,6 +703,7 @@ fn build_libass(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
         .arg("-Dasm=disabled")
         .arg("-Dlibunibreak=disabled")
         .env("PKG_CONFIG_PATH", &pkg_config_path);
+    apply_meson_apple_target(&mut setup, layout, options.target, "libass")?;
     run(&mut setup)?;
 
     let mut compile = meson_command(&meson);
@@ -671,6 +796,116 @@ fn meson_command(meson: &MesonTools) -> Command {
     let mut command = Command::new(&meson.meson);
     prepend_path(&mut command, &meson.bin_dir);
     command
+}
+
+fn apply_cmake_apple_target(command: &mut Command, target: AppleTarget) -> Result<()> {
+    let Some(config) = apple_toolchain(target)? else {
+        return Ok(());
+    };
+    command
+        .arg(format!("-DCMAKE_C_COMPILER={}", config.clang.display()))
+        .arg(format!("-DCMAKE_CXX_COMPILER={}", config.clangxx.display()))
+        .arg(format!("-DCMAKE_AR={}", config.ar.display()))
+        .arg(format!("-DCMAKE_RANLIB={}", config.ranlib.display()))
+        .arg(format!("-DCMAKE_OSX_SYSROOT={}", config.sdk_root.display()))
+        .arg(format!("-DCMAKE_OSX_ARCHITECTURES={}", config.arch))
+        .arg(format!("-DCMAKE_SYSTEM_PROCESSOR={}", config.arch))
+        .arg(format!(
+            "-DCMAKE_OSX_DEPLOYMENT_TARGET={}",
+            config.deployment_target
+        ));
+    if target.is_ios() {
+        command.arg("-DCMAKE_SYSTEM_NAME=iOS");
+    }
+    apply_apple_target_env(command, target)
+}
+
+fn apply_meson_apple_target(
+    command: &mut Command,
+    layout: &WorkspaceLayout,
+    target: AppleTarget,
+    name: &str,
+) -> Result<()> {
+    let Some(cross_file) = meson_cross_file(layout, target, name)? else {
+        return Ok(());
+    };
+    command.arg("--cross-file").arg(cross_file);
+    apply_apple_target_env(command, target)
+}
+
+fn meson_cross_file(
+    layout: &WorkspaceLayout,
+    target: AppleTarget,
+    name: &str,
+) -> Result<Option<PathBuf>> {
+    let Some(config) = apple_toolchain(target)? else {
+        return Ok(None);
+    };
+    let pkg_config = which("pkg-config").unwrap_or_else(|| PathBuf::from("pkg-config"));
+    let arch_flags = apple_arch_flags(&config);
+    let path = layout.build_dir.join(format!("{name}-meson-cross.ini"));
+    let content = format!(
+        "[binaries]\nc = {}\ncpp = {}\nar = {}\nstrip = {}\npkg-config = {}\n\n[built-in options]\nc_args = {}\ncpp_args = {}\nc_link_args = {}\ncpp_link_args = {}\n\n[host_machine]\nsystem = 'darwin'\ncpu_family = {}\ncpu = {}\nendian = 'little'\n",
+        meson_string(&config.clang.display().to_string()),
+        meson_string(&config.clangxx.display().to_string()),
+        meson_string(&config.ar.display().to_string()),
+        meson_string(&config.strip.display().to_string()),
+        meson_string(&pkg_config.display().to_string()),
+        meson_array(&arch_flags),
+        meson_array(&arch_flags),
+        meson_array(&arch_flags),
+        meson_array(&arch_flags),
+        meson_string(
+            target
+                .meson_cpu_family()
+                .context("explicit Apple target must have a Meson CPU family")?,
+        ),
+        meson_string(
+            target
+                .meson_cpu()
+                .context("explicit Apple target must have a Meson CPU")?,
+        ),
+    );
+    fs::write(&path, content).with_context(|| format!("write {}", path.display()))?;
+    Ok(Some(path))
+}
+
+fn apply_apple_target_env(command: &mut Command, target: AppleTarget) -> Result<()> {
+    let Some(config) = apple_toolchain(target)? else {
+        return Ok(());
+    };
+    command.env("SDKROOT", &config.sdk_root);
+    if target.is_ios() {
+        command.env("IPHONEOS_DEPLOYMENT_TARGET", &config.deployment_target);
+    } else {
+        command.env("MACOSX_DEPLOYMENT_TARGET", &config.deployment_target);
+    }
+    Ok(())
+}
+
+fn apple_arch_flags(config: &AppleToolchain) -> Vec<String> {
+    vec![
+        "-arch".to_string(),
+        config.arch.to_string(),
+        "-isysroot".to_string(),
+        config.sdk_root.display().to_string(),
+        format!("{}={}", config.deployment_flag, config.deployment_target),
+    ]
+}
+
+fn meson_array(values: &[String]) -> String {
+    format!(
+        "[{}]",
+        values
+            .iter()
+            .map(|value| meson_string(value))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn meson_string(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 fn prepend_path(command: &mut Command, dir: &Path) {
@@ -845,10 +1080,50 @@ fn build_ffmpeg(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
     let mut configure = Command::new(layout.ffmpeg_source_dir.join("configure"));
     configure.current_dir(&layout.ffmpeg_build_dir);
     configure.arg(format!("--prefix={}", layout.ffmpeg_prefix.display()));
-    configure.arg("--cc=clang");
     configure.arg("--pkg-config=false");
     configure.arg("--disable-x86asm");
-    configure.arg("--extra-cflags=-fPIC");
+    let mut extra_cflags = vec!["-fPIC".to_string()];
+    let mut extra_ldflags = Vec::new();
+    if let Some(config) = apple_toolchain(options.target)? {
+        configure.arg(format!("--cc={}", config.clang.display()));
+        configure.arg(format!("--ar={}", config.ar.display()));
+        configure.arg(format!("--ranlib={}", config.ranlib.display()));
+        configure.arg(format!("--strip={}", config.strip.display()));
+        configure.arg("--target-os=darwin");
+        configure.arg("--enable-cross-compile");
+        configure.arg(format!("--arch={}", config.arch));
+        configure.arg(format!("--sysroot={}", config.sdk_root.display()));
+        extra_cflags.push(format!("-arch {}", config.arch));
+        extra_cflags.push(format!("-isysroot {}", config.sdk_root.display()));
+        extra_cflags.push(format!(
+            "{}={}",
+            config.deployment_flag, config.deployment_target
+        ));
+        extra_ldflags.push(format!("-arch {}", config.arch));
+        extra_ldflags.push(format!("-isysroot {}", config.sdk_root.display()));
+        extra_ldflags.push(format!(
+            "{}={}",
+            config.deployment_flag, config.deployment_target
+        ));
+        configure.env("SDKROOT", &config.sdk_root);
+        match options.target {
+            AppleTarget::Aarch64Macos | AppleTarget::X86_64Macos => {
+                configure.env("MACOSX_DEPLOYMENT_TARGET", &config.deployment_target);
+            }
+            AppleTarget::Aarch64Ios
+            | AppleTarget::Aarch64IosSimulator
+            | AppleTarget::X86_64IosSimulator => {
+                configure.env("IPHONEOS_DEPLOYMENT_TARGET", &config.deployment_target);
+            }
+            AppleTarget::Host => {}
+        }
+    } else {
+        configure.arg("--cc=clang");
+    }
+    configure.arg(format!("--extra-cflags={}", extra_cflags.join(" ")));
+    if !extra_ldflags.is_empty() {
+        configure.arg(format!("--extra-ldflags={}", extra_ldflags.join(" ")));
+    }
     for flag in options.profile.ffmpeg_configure_flags() {
         configure.arg(flag);
     }
@@ -868,8 +1143,9 @@ fn build_ffmpeg(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
     fs::write(
         &layout.ffmpeg_build_marker,
         format!(
-            "ffmpeg={FFMPEG_VERSION}\nprofile={}\nprefix={}\n",
+            "ffmpeg={FFMPEG_VERSION}\nprofile={}\ntarget={}\nprefix={}\n",
             profile_name(options.profile),
+            options.target.triple().unwrap_or("host"),
             layout.ffmpeg_prefix.display()
         ),
     )
@@ -877,15 +1153,52 @@ fn build_ffmpeg(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
     Ok(())
 }
 
+struct AppleToolchain {
+    clang: PathBuf,
+    clangxx: PathBuf,
+    ar: PathBuf,
+    ranlib: PathBuf,
+    strip: PathBuf,
+    sdk_root: PathBuf,
+    arch: &'static str,
+    deployment_flag: &'static str,
+    deployment_target: String,
+}
+
+fn apple_toolchain(target: AppleTarget) -> Result<Option<AppleToolchain>> {
+    let Some(sdk) = target.sdk() else {
+        return Ok(None);
+    };
+    let sdk_root = PathBuf::from(xcrun(sdk, &["--show-sdk-path"])?);
+    let (deployment_target, deployment_flag) = target
+        .deployment_target()
+        .context("explicit Apple target must have a deployment target")?;
+    Ok(Some(AppleToolchain {
+        clang: PathBuf::from(xcrun(sdk, &["-f", "clang"])?),
+        clangxx: PathBuf::from(xcrun(sdk, &["-f", "clang++"])?),
+        ar: PathBuf::from(xcrun(sdk, &["-f", "ar"])?),
+        ranlib: PathBuf::from(xcrun(sdk, &["-f", "ranlib"])?),
+        strip: PathBuf::from(xcrun(sdk, &["-f", "strip"])?),
+        sdk_root,
+        arch: target
+            .ffmpeg_arch()
+            .context("explicit Apple target must have an FFmpeg arch")?,
+        deployment_flag,
+        deployment_target,
+    }))
+}
+
 fn write_profile_metadata(
     layout: &WorkspaceLayout,
     profile: NativeDependencyProfile,
+    target: AppleTarget,
 ) -> Result<()> {
     fs::write(
         layout.dist_dir.join("erika-native-deps.txt"),
         format!(
-            "profile={}\nffmpeg={}\nffmpeg_dist={}\nlibass={}\nlibass_source={}\nharfbuzz={}\nharfbuzz_source={}\nfreetype={}\nfreetype_source={}\n",
+            "profile={}\ntarget={}\nffmpeg={}\nffmpeg_dist={}\nlibass={}\nlibass_source={}\nharfbuzz={}\nharfbuzz_source={}\nfreetype={}\nfreetype_source={}\n",
             profile_name(profile),
+            target.triple().unwrap_or("host"),
             FFMPEG_VERSION,
             layout.ffmpeg_prefix.display(),
             LIBASS_VERSION,
@@ -977,6 +1290,23 @@ fn run(command: &mut Command) -> Result<()> {
     Ok(())
 }
 
+fn xcrun(sdk: &str, args: &[&str]) -> Result<String> {
+    let output = Command::new("xcrun")
+        .arg("--sdk")
+        .arg(sdk)
+        .args(args)
+        .output()
+        .with_context(|| format!("spawn xcrun --sdk {sdk} {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "command failed ({}): xcrun --sdk {sdk} {}",
+            output.status,
+            args.join(" ")
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 fn command_display(command: &Command) -> String {
     let mut parts = Vec::new();
     parts.push(command.get_program().to_string_lossy().into_owned());
@@ -994,6 +1324,8 @@ fn print_help() {
     println!("  cargo run -p xtask -- deps plan --profile lgpl");
     println!("  cargo run -p xtask -- deps fetch --profile lgpl [--all]");
     println!("  cargo run -p xtask -- deps status --profile lgpl");
-    println!("  cargo run -p xtask -- deps build --profile lgpl [--force] [--jobs N]");
+    println!(
+        "  cargo run -p xtask -- deps build --profile lgpl [--target host|aarch64-apple-darwin|x86_64-apple-darwin|aarch64-apple-ios|aarch64-apple-ios-sim|x86_64-apple-ios] [--force] [--jobs N]"
+    );
     println!("  cargo run -p xtask -- check license");
 }

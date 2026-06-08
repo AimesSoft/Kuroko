@@ -70,6 +70,8 @@ export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 PLUGIN_IOS_DIR="$(cd "$PODS_TARGET_SRCROOT" && pwd -P)"
 ERIKA_ROOT="$(cd "$PLUGIN_IOS_DIR/../../.." && pwd -P)"
+ERIKA_NATIVE_PROFILE="${ERIKA_NATIVE_PROFILE:-lgpl}"
+HOST_JOBS="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 ARCH="${CURRENT_ARCH:-}"
 if [ -z "$ARCH" ] || [ "$ARCH" = "undefined_arch" ]; then
   ARCH="${ARCHS%% *}"
@@ -109,12 +111,30 @@ else
   exit 1
 fi
 
+if command -v rustup >/dev/null 2>&1; then
+  rustup target add "$RUST_TARGET"
+fi
+
+if [ -z "${ERIKA_FFMPEG_DIR:-}" ]; then
+  ERIKA_FFMPEG_DIR="$ERIKA_ROOT/third_party/dist/$RUST_TARGET/$ERIKA_NATIVE_PROFILE/ffmpeg"
+fi
+ERIKA_TARGET_DIST="$ERIKA_ROOT/third_party/dist/$RUST_TARGET/$ERIKA_NATIVE_PROFILE"
+ERIKA_LIBASS_DIR="${ERIKA_LIBASS_DIR:-$ERIKA_TARGET_DIST/libass}"
+ERIKA_FREETYPE_DIR="${ERIKA_FREETYPE_DIR:-$ERIKA_TARGET_DIST/freetype}"
+ERIKA_HARFBUZZ_DIR="${ERIKA_HARFBUZZ_DIR:-$ERIKA_TARGET_DIST/harfbuzz}"
+ERIKA_FRIBIDI_DIR="${ERIKA_FRIBIDI_DIR:-$ERIKA_TARGET_DIST/fribidi}"
+
+if [ ! -f "$ERIKA_FFMPEG_DIR/include/libavformat/avformat.h" ] || [ ! -f "$ERIKA_LIBASS_DIR/lib/libass.a" ]; then
+  echo "Building Erika native dependencies for $RUST_TARGET ($ERIKA_NATIVE_PROFILE, with libass)"
+  (cd "$ERIKA_ROOT" && cargo run -p xtask -- deps build --all --profile "$ERIKA_NATIVE_PROFILE" --target "$RUST_TARGET" --jobs "$HOST_JOBS")
+fi
+
 if [ -n "${ERIKA_IOS_CAPI_STATICLIB:-}" ]; then
   LIB_SOURCE="$ERIKA_IOS_CAPI_STATICLIB"
 else
   LIB_SOURCE="$ERIKA_ROOT/target/$RUST_TARGET/$CARGO_PROFILE/liberika_capi.a"
   echo "Building Erika C ABI staticlib for $RUST_TARGET ($CARGO_PROFILE)"
-  (cd "$ERIKA_ROOT" && cargo rustc -p erika_capi --target "$RUST_TARGET" $CARGO_ARGS --lib --crate-type staticlib)
+  (cd "$ERIKA_ROOT" && ERIKA_NATIVE_PROFILE="$ERIKA_NATIVE_PROFILE" ERIKA_NATIVE_TARGET="$RUST_TARGET" ERIKA_FFMPEG_DIR="$ERIKA_FFMPEG_DIR" ERIKA_LIBASS_DIR="$ERIKA_LIBASS_DIR" ERIKA_FREETYPE_DIR="$ERIKA_FREETYPE_DIR" ERIKA_HARFBUZZ_DIR="$ERIKA_HARFBUZZ_DIR" ERIKA_FRIBIDI_DIR="$ERIKA_FRIBIDI_DIR" cargo rustc -p erika_capi --target "$RUST_TARGET" --no-default-features --features libass $CARGO_ARGS --lib --crate-type staticlib)
 fi
 
 if [ ! -f "$LIB_SOURCE" ]; then

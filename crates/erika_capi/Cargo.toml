@@ -9,7 +9,11 @@ version.workspace = true
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+[features]
+default = ["libass"]
+libass = ["erika/libass"]
+
 [dependencies]
 crossbeam-channel.workspace = true
-erika = { path = "../erika" }
+erika = { path = "../erika", default-features = false }
 serde_json.workspace = true

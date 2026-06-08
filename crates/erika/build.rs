@@ -4,6 +4,7 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=ERIKA_NATIVE_PROFILE");
+    println!("cargo:rerun-if-env-changed=ERIKA_NATIVE_TARGET");
     println!("cargo:rerun-if-env-changed=ERIKA_LIBASS_DIR");
     println!("cargo:rerun-if-env-changed=ERIKA_FREETYPE_DIR");
     println!("cargo:rerun-if-env-changed=ERIKA_HARFBUZZ_DIR");
@@ -61,6 +62,13 @@ fn main() {
 fn native_dep_dir(env_name: &str, name: &str) -> PathBuf {
     if let Ok(path) = env::var(env_name) {
         return PathBuf::from(path);
+    }
+    if let Ok(target) = env::var("ERIKA_NATIVE_TARGET") {
+        return workspace_root()
+            .join("third_party/dist")
+            .join(target)
+            .join(native_profile())
+            .join(name);
     }
     workspace_root()
         .join("third_party/dist")
