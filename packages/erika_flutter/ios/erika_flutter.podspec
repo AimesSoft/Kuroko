@@ -1,4 +1,49 @@
 Pod::Spec.new do |s|
+  erika_cabi_symbols = %w[
+    erika_danmaku_track_info_free
+    erika_presenter_add_danmaku_track_file
+    erika_presenter_add_danmaku_track_json
+    erika_presenter_add_external_subtitle
+    erika_presenter_attach_metal_layer
+    erika_presenter_clear_danmaku
+    erika_presenter_close
+    erika_presenter_create
+    erika_presenter_create_with_output_mode
+    erika_presenter_danmaku_tracks
+    erika_presenter_destroy
+    erika_presenter_detach_surface
+    erika_presenter_get_danmaku_config
+    erika_presenter_load_danmaku_file
+    erika_presenter_load_danmaku_json
+    erika_presenter_open
+    erika_presenter_pause
+    erika_presenter_play
+    erika_presenter_poll_event
+    erika_presenter_remove_danmaku_track
+    erika_presenter_remove_subtitle_track
+    erika_presenter_render_tick
+    erika_presenter_resize_surface
+    erika_presenter_seek
+    erika_presenter_select_audio_track
+    erika_presenter_select_subtitle_track
+    erika_presenter_set_danmaku_block_words_json
+    erika_presenter_set_danmaku_config_ptr
+    erika_presenter_set_danmaku_enabled
+    erika_presenter_set_danmaku_font
+    erika_presenter_set_danmaku_global_offset
+    erika_presenter_set_danmaku_track_enabled
+    erika_presenter_set_danmaku_track_offset
+    erika_presenter_set_playback_rate
+    erika_presenter_set_volume
+    erika_presenter_stop
+    erika_presenter_track_selection
+    erika_presenter_tracks
+    erika_track_info_free
+  ]
+  erika_cabi_undefined_flags = erika_cabi_symbols
+    .map { |symbol| "-Wl,-u,_#{symbol}" }
+    .join(' ')
+
   s.name             = 'erika_flutter'
   s.version          = '0.0.1'
   s.summary          = 'Flutter embedder glue for the Erika Rust media engine.'
@@ -77,6 +122,6 @@ cp "$LIB_SOURCE" "$PODS_TARGET_SRCROOT/native/liberika_capi.a"
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
     'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386',
-    'OTHER_LDFLAGS' => '$(inherited) -force_load "$(PODS_TARGET_SRCROOT)/native/liberika_capi.a" -framework AVFoundation -framework AudioToolbox -framework QuartzCore -framework Metal -framework CoreVideo -framework CoreMedia -framework VideoToolbox -framework CoreFoundation -framework CoreGraphics -framework Foundation -liconv -lbz2 -lz',
+    'OTHER_LDFLAGS' => "$(inherited) \"$(PODS_TARGET_SRCROOT)/native/liberika_capi.a\" #{erika_cabi_undefined_flags} -framework AVFoundation -framework AudioToolbox -framework QuartzCore -framework Metal -framework CoreVideo -framework CoreMedia -framework VideoToolbox -framework CoreFoundation -framework CoreGraphics -framework Foundation -liconv -lbz2 -lz",
   }
 end
