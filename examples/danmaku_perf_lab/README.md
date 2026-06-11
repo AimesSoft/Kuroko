@@ -63,6 +63,30 @@ normally allow, so it is a renderer stress case rather than a real-world density
 profile. The JSONL log is the source of truth for performance; the window is only
 for visual sanity checks.
 
+## Neural upscaler comparison
+
+`--upscaler off|artcnn-c4f16|artcnn-c4f32` selects the Metal neural luma
+doubler. Run the same clip with each mode and compare the JSONL fields
+`upscaler_encode_ms`, `gpu_frame_ms`, `upscaled_frames`, and `fps`:
+
+```sh
+cargo run --release -p danmaku_perf_lab -- \
+  --window --hide-panel --items 1 \
+  --video /path/to/anime_720p.mp4 \
+  --target-fps 60 \
+  --upscaler artcnn-c4f16 \
+  --metrics-log /tmp/erika_sr.jsonl \
+  --auto-exit 25
+```
+
+The upscaler only engages when the drawable shows the video above its source
+resolution, so the window (in physical pixels) must be larger than the source.
+`gpu_frame_ms` samples completed command buffers; ticks that reuse the cached
+upscale dominate those samples, so use
+`cargo test --release -p erika --test artcnn_upscaler -- --ignored --nocapture bench`
+for the isolated GPU cost of the network itself. `ERIKA_SR_BLOCK=WxH`
+overrides the per-thread output block size for tuning experiments.
+
 ## Atlas prewarm comparison
 
 ```sh

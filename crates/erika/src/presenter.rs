@@ -512,6 +512,12 @@ impl PresenterRuntime {
         Some(self.danmaku.config())
     }
 
+    /// Switches the neural luma upscaler at runtime. Backends without an
+    /// upscaler implementation ignore the request.
+    pub fn set_luma_upscaler(&mut self, mode: crate::renderer::pipeline::LumaUpscalerMode) {
+        self.renderer.set_luma_upscaler(mode);
+    }
+
     pub fn add_external_subtitle(&self, uri: impl Into<String>) -> Result<SubtitleTrackConfig> {
         self.player.add_external_subtitle(uri)
     }

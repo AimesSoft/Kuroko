@@ -327,6 +327,25 @@ pub enum ScalerKernel {
     Lanczos3,
 }
 
+/// Neural 2x luma upscaler applied to the decoded Y plane before plane
+/// sampling. Chroma keeps its source resolution and is reconstructed by the
+/// regular scaler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LumaUpscalerMode {
+    #[default]
+    Off,
+    /// ArtCNN C4F16 (~12K parameters), lightweight real-time anime doubler.
+    ArtCnnC4F16,
+    /// ArtCNN C4F32 (~48K parameters), higher quality real-time doubler.
+    ArtCnnC4F32,
+}
+
+impl LumaUpscalerMode {
+    pub fn is_enabled(self) -> bool {
+        self != Self::Off
+    }
+}
+
 impl Default for ScalerKernel {
     fn default() -> Self {
         Self::Bilinear
@@ -470,6 +489,7 @@ impl Default for ScalerConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderPassKind {
     ImportFrame,
+    NeuralUpscale,
     PlaneSampling,
     ChromaReconstruction,
     TransferDecode,
@@ -522,6 +542,7 @@ pub struct VideoRenderPipeline {
     pub target: TargetColorState,
     pub tone_map: ToneMapConfig,
     pub scaler: ScalerConfig,
+    pub luma_upscaler: LumaUpscalerMode,
     pub graph: RenderGraph,
 }
 
@@ -529,12 +550,14 @@ impl VideoRenderPipeline {
     pub fn new(source: SourceColorState, target: TargetColorState) -> Self {
         let tone_map = ToneMapConfig::default();
         let scaler = ScalerConfig::default();
-        let graph = build_graph(source, target, scaler);
+        let luma_upscaler = LumaUpscalerMode::default();
+        let graph = build_graph(source, target, scaler, luma_upscaler);
         Self {
             source,
             target,
             tone_map,
             scaler,
+            luma_upscaler,
             graph,
         }
     }
@@ -545,7 +568,13 @@ impl VideoRenderPipeline {
 
     pub fn with_target(mut self, target: TargetColorState) -> Self {
         self.target = target;
-        self.graph = build_graph(self.source, self.target, self.scaler);
+        self.graph = build_graph(self.source, self.target, self.scaler, self.luma_upscaler);
+        self
+    }
+
+    pub fn with_luma_upscaler(mut self, mode: LumaUpscalerMode) -> Self {
+        self.luma_upscaler = mode;
+        self.graph = build_graph(self.source, self.target, self.scaler, self.luma_upscaler);
         self
     }
 
@@ -576,9 +605,16 @@ fn build_graph(
     source: SourceColorState,
     target: TargetColorState,
     scaler: ScalerConfig,
+    luma_upscaler: LumaUpscalerMode,
 ) -> RenderGraph {
     let mut graph = RenderGraph::new();
     graph.push(RenderPass::new(RenderPassKind::ImportFrame, "import frame"));
+    if luma_upscaler.is_enabled() {
+        graph.push(RenderPass::new(
+            RenderPassKind::NeuralUpscale,
+            "neural luma upscale",
+        ));
+    }
     graph.push(RenderPass::new(
         RenderPassKind::PlaneSampling,
         "sample YCbCr planes",
@@ -690,6 +726,17 @@ mod tests {
         assert_eq!(pipeline.tone_map.operator, ToneMapOperator::Clip);
         assert_eq!(pipeline.scaler.kernel, ScalerKernel::Nearest);
         assert!(!pipeline.graph.contains(RenderPassKind::Scale));
+    }
+
+    #[test]
+    fn luma_upscaler_adds_neural_upscale_pass() {
+        let pipeline = VideoRenderPipeline::sdr_default();
+        assert!(!pipeline.graph.contains(RenderPassKind::NeuralUpscale));
+
+        let pipeline = pipeline.with_luma_upscaler(LumaUpscalerMode::ArtCnnC4F16);
+
+        assert_eq!(pipeline.luma_upscaler, LumaUpscalerMode::ArtCnnC4F16);
+        assert!(pipeline.graph.contains(RenderPassKind::NeuralUpscale));
     }
 
     #[test]

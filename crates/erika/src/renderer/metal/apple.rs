@@ -34,8 +34,8 @@ use objc2_metal::{
     MTLTextureUsage,
 };
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLDevice, MTLDrawable,
-    MTLRenderPassDescriptor, MTLTexture,
+    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
+    MTLDevice, MTLDrawable, MTLRenderPassDescriptor, MTLTexture,
 };
 use objc2_metal::{
     MTLLibrary, MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPipelineDescriptor,
@@ -52,7 +52,8 @@ use crate::renderer::metal::{
     MetalRendererStats, OverlayRenderFrame, PreparedOverlayFrameInfo, VideoFrameTextureSource,
     VideoRenderFrame, fourcc_string,
 };
-use crate::renderer::pipeline::{ColorRange, ToneMapOperator};
+use crate::renderer::metal::upscaler::LumaUpscaler;
+use crate::renderer::pipeline::{ColorRange, LumaUpscalerMode, ToneMapOperator};
 use crate::subtitle::{AssColor, SubtitleAlphaBitmap};
 
 const CV_PIXEL_FORMAT_420_YP_CB_CR10_BI_PLANAR_VIDEO_RANGE: u32 =
@@ -115,6 +116,8 @@ pub struct MetalRendererImpl {
     danmaku_alpha_atlas_cache: Option<DanmakuAlphaAtlasCache>,
     danmaku_vertex_buffer: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     danmaku_vertex_buffer_len: usize,
+    upscaler: LumaUpscaler,
+    pending_gpu_timing: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     stats: MetalRendererStats,
     layer_color_space_label: &'static str,
     logged_first_video_frame: bool,
@@ -155,6 +158,12 @@ impl MetalRendererImpl {
             danmaku_alpha_atlas_cache: None,
             danmaku_vertex_buffer: None,
             danmaku_vertex_buffer_len: 0,
+            upscaler: {
+                let mut upscaler = LumaUpscaler::default();
+                upscaler.set_mode(config.luma_upscaler);
+                upscaler
+            },
+            pending_gpu_timing: None,
             stats: MetalRendererStats::default(),
             layer_color_space_label: "unconfigured",
             logged_first_video_frame: false,
@@ -473,7 +482,59 @@ impl MetalRendererImpl {
             }
         }
 
+        self.collect_gpu_timing();
+        self.stats.last_upscaler_encode_duration = Duration::ZERO;
+
+        let layout = VideoPresentationLayout::aspect_fit(
+            frame.frame.info.width as u32,
+            frame.frame.info.height as u32,
+            self.stats.drawable_width,
+            self.stats.drawable_height,
+        );
+        // The neural doubler only pays off when the video is actually shown
+        // larger than its source resolution.
+        let upscale_requested = self.upscaler.mode().is_enabled()
+            && layout.target_rect[2] > layout.source_width
+            && matches!(
+                luma.pixelFormat(),
+                MTLPixelFormat::R8Unorm | MTLPixelFormat::R16Unorm
+            );
+
         unsafe {
+            let pipeline = self.video_pipeline_state()?;
+            let sampler = self.video_sampler_state()?;
+            let Some(command_buffer) = self.queue.commandBuffer() else {
+                return Err(PlayerError::Renderer(
+                    "commandBuffer returned nil".to_string(),
+                ));
+            };
+
+            let mut upscaled_luma = None;
+            if upscale_requested {
+                let encode_start = Instant::now();
+                match self.upscaler.encode_with_token(
+                    &self.device,
+                    &command_buffer,
+                    luma,
+                    luma.pixelFormat(),
+                    frame.frame_token,
+                ) {
+                    Ok(texture) => {
+                        self.stats.last_upscaler_encode_duration = encode_start.elapsed();
+                        upscaled_luma = texture;
+                    }
+                    Err(error) => {
+                        eprintln!("Erika luma upscaler disabled after encode failure: {error}");
+                        self.upscaler.set_mode(LumaUpscalerMode::Off);
+                    }
+                }
+            }
+            if upscaled_luma.is_some() {
+                self.stats.upscaled_frames += 1;
+                frame.pipeline = frame.pipeline.with_luma_upscaler(self.upscaler.mode());
+            }
+            let luma: &ProtocolObject<dyn MTLTexture> = upscaled_luma.as_deref().unwrap_or(luma);
+
             let Some(drawable): Option<Retained<ProtocolObject<dyn CAMetalDrawable>>> =
                 layer.nextDrawable()
             else {
@@ -496,26 +557,12 @@ impl MetalRendererImpl {
                 alpha: 1.0,
             });
 
-            let pipeline = self.video_pipeline_state()?;
-            let sampler = self.video_sampler_state()?;
-            let Some(command_buffer) = self.queue.commandBuffer() else {
-                return Err(PlayerError::Renderer(
-                    "commandBuffer returned nil".to_string(),
-                ));
-            };
             let Some(encoder) = command_buffer.renderCommandEncoderWithDescriptor(&descriptor)
             else {
                 return Err(PlayerError::Renderer(
                     "renderCommandEncoderWithDescriptor returned nil".to_string(),
                 ));
             };
-
-            let layout = VideoPresentationLayout::aspect_fit(
-                frame.frame.info.width as u32,
-                frame.frame.info.height as u32,
-                self.stats.drawable_width,
-                self.stats.drawable_height,
-            );
             let uniforms = VideoUniforms {
                 is_p010: matches!(frame.frame.info.format, ImportedVideoFormat::P010) as u32,
                 full_range: matches!(frame.pipeline.source.range, ColorRange::Full) as u32,
@@ -574,6 +621,7 @@ impl MetalRendererImpl {
                 ProtocolObject::from_ref(&*drawable);
             command_buffer.presentDrawable(drawable_ref);
             command_buffer.commit();
+            self.pending_gpu_timing = Some(command_buffer);
         }
 
         self.stats.rendered_frames += 1;
@@ -583,6 +631,23 @@ impl MetalRendererImpl {
         }
 
         Ok(())
+    }
+
+    pub fn set_luma_upscaler(&mut self, mode: LumaUpscalerMode) {
+        self.upscaler.set_mode(mode);
+    }
+
+    /// Records the GPU time of the previous frame's command buffer once it
+    /// has completed. The value therefore lags by one frame, which is fine
+    /// for performance metrics.
+    fn collect_gpu_timing(&mut self) {
+        let Some(pending) = self.pending_gpu_timing.take() else {
+            return;
+        };
+        if pending.status() == MTLCommandBufferStatus::Completed {
+            let seconds = (pending.GPUEndTime() - pending.GPUStartTime()).max(0.0);
+            self.stats.last_gpu_duration = Duration::from_secs_f64(seconds);
+        }
     }
 
     fn draw_overlay_planes(

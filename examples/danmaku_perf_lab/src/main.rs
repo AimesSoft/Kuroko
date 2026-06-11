@@ -16,7 +16,7 @@ use erika::danmaku::{
 };
 use erika::playback::{PlaybackSessionConfig, VideoDecodePreference, VideoPlaybackEngine};
 use erika::presenter::{PresenterConfig, PresenterRuntime};
-use erika::renderer::metal::MetalRendererConfig;
+use erika::renderer::metal::{LumaUpscalerMode, MetalRendererConfig};
 use erika::{MediaRequest, MetalSurfaceHandle, PlatformSurface};
 
 unsafe extern "C" {
@@ -41,6 +41,7 @@ fn main() {
              [--font-size N] [--display-area N] [--scroll-duration N] [--scroll-overwrite] \
              [--window-size WxH] [--hide-panel] [--surface-scale N] [--target-fps N] \
              [--start-time SECONDS] [--self-every N] [--metrics-log PATH] [--auto-exit SECONDS] \
+             [--upscaler off|artcnn-c4f16|artcnn-c4f32] \
              [--pattern mixed|scroll|fixed|dense]"
         );
         process::exit(2);
@@ -266,7 +267,10 @@ impl WindowLabState {
                 },
                 ..PlayerConfig::default()
             },
-            renderer: MetalRendererConfig::default(),
+            renderer: MetalRendererConfig {
+                luma_upscaler: options.luma_upscaler,
+                ..MetalRendererConfig::default()
+            },
             danmaku: Some(timeline),
             danmaku_config: layout_config_from_options(&options),
             render_test_pattern_when_idle: options.video_uri.is_none(),
@@ -443,7 +447,7 @@ impl WindowLabState {
             &snapshot.current_danmaku_scroll_buckets,
         );
         format!(
-            "Playback\n  fps: {fps:.1}\n  media: {media:.3}s / {duration:.3}s\n  generation: {generation}\n  state: {state}\n\nTick timings\n  total: {tick:.3} ms\n  pump/layout: {pump:.3} ms\n  render: {render:.3} ms\n\nDanmaku load\n  pattern: {pattern:?}\n  density: {density:.0}/s\n  items: {items}\n  font/area: {font:.1} / {area:.2}\n  scroll dur: {scroll_dur:.2}s\n  self every: {self_every}\n  stacking/overwrite: {stacking}/{overwrite}\n  visible glyph quads: {glyphs}\n  placed items: {placed}\n  scroll/top/bottom: {scroll}/{top}/{bottom}\n\nScroll frame sensor\n  rows: {scroll_rows}\n  tracks: {track_min}..{track_max}\n  y span: {scroll_min:.0}..{scroll_max:.0}\n  buckets: {frame_buckets}\n\nPrepared sensor\n  source/supported/prepared/filtered: {src}/{supported}/{prep}/{filtered}\n  scroll/top/bottom: {prep_scroll}/{prep_top}/{prep_bottom}\n  expected/dfm tracks: {expected_tracks}/{dfm_tracks}\n  area h scroll/display: {scroll_area:.0}/{display_area_h:.0}\n  track h: {track_h:.1}\n  scroll rows: {prep_rows}\n  scroll y span: {prep_min:.0}..{prep_max:.0}\n  buckets: {prepared_buckets}\n\nViewport/atlas\n  viewport: {dw}x{dh}\n  atlas: v{atlas_version} {atlas_mb:.2} MiB\n\nRenderer\n  surface: {sw}x{sh}\n  rendered video: {rendered_video}\n  rendered test: {rendered_test}\n  danmaku passes: {passes}\n  danmaku draw items: {draw_items}\n  draw items/pass: {draw_ratio:.1}\n  atlas uploads: {uploads}\n  atlas reuses: {reuses}\n\nDecoder / queues\n  decoded video: {decoded_video}\n  pushed audio: {pushed_audio}\n  import failures: {import_failures}\n  render failures: {render_failures}\n  audio failures: {audio_failures}\n\nError\n  {error}",
+            "Playback\n  fps: {fps:.1}\n  media: {media:.3}s / {duration:.3}s\n  generation: {generation}\n  state: {state}\n\nTick timings\n  total: {tick:.3} ms\n  pump/layout: {pump:.3} ms\n  render: {render:.3} ms\n\nDanmaku load\n  pattern: {pattern:?}\n  density: {density:.0}/s\n  items: {items}\n  font/area: {font:.1} / {area:.2}\n  scroll dur: {scroll_dur:.2}s\n  self every: {self_every}\n  stacking/overwrite: {stacking}/{overwrite}\n  visible glyph quads: {glyphs}\n  placed items: {placed}\n  scroll/top/bottom: {scroll}/{top}/{bottom}\n\nScroll frame sensor\n  rows: {scroll_rows}\n  tracks: {track_min}..{track_max}\n  y span: {scroll_min:.0}..{scroll_max:.0}\n  buckets: {frame_buckets}\n\nPrepared sensor\n  source/supported/prepared/filtered: {src}/{supported}/{prep}/{filtered}\n  scroll/top/bottom: {prep_scroll}/{prep_top}/{prep_bottom}\n  expected/dfm tracks: {expected_tracks}/{dfm_tracks}\n  area h scroll/display: {scroll_area:.0}/{display_area_h:.0}\n  track h: {track_h:.1}\n  scroll rows: {prep_rows}\n  scroll y span: {prep_min:.0}..{prep_max:.0}\n  buckets: {prepared_buckets}\n\nViewport/atlas\n  viewport: {dw}x{dh}\n  atlas: v{atlas_version} {atlas_mb:.2} MiB\n\nRenderer\n  surface: {sw}x{sh}\n  rendered video: {rendered_video}\n  rendered test: {rendered_test}\n  danmaku passes: {passes}\n  danmaku draw items: {draw_items}\n  draw items/pass: {draw_ratio:.1}\n  atlas uploads: {uploads}\n  atlas reuses: {reuses}\n\nUpscaler\n  mode: {upscaler}\n  upscaled frames: {upscaled_frames}\n  encode: {upscaler_encode:.3} ms\n  gpu frame: {gpu_frame:.3} ms\n\nDecoder / queues\n  decoded video: {decoded_video}\n  pushed audio: {pushed_audio}\n  import failures: {import_failures}\n  render failures: {render_failures}\n  audio failures: {audio_failures}\n\nError\n  {error}",
             fps = self.fps,
             media = snapshot.media_time.as_secs_f64(),
             duration = duration.as_secs_f64(),
@@ -504,6 +508,10 @@ impl WindowLabState {
             draw_items = renderer.danmaku_draw_items,
             uploads = renderer.overlay_alpha_atlas_uploads,
             reuses = renderer.overlay_alpha_atlas_reuses,
+            upscaler = upscaler_label(self.options.luma_upscaler),
+            upscaled_frames = renderer.upscaled_frames,
+            upscaler_encode = ms(renderer.last_upscaler_encode_duration),
+            gpu_frame = ms(renderer.last_gpu_duration),
             decoded_video = stats.decoded_video_frames,
             pushed_audio = stats.pushed_audio_frames,
             import_failures = stats.import_failures,
@@ -544,7 +552,7 @@ impl WindowLabState {
         self.last_logged_danmaku_passes = renderer.danmaku_passes;
         self.last_logged_danmaku_draw_items = renderer.danmaku_draw_items;
         format!(
-            "{{\"elapsed_s\":{elapsed:.3},\"fps\":{fps:.3},\"target_fps\":{target_fps:.3},\"uncapped\":{uncapped},\"media_s\":{media:.3},\"duration_s\":{duration:.3},\"generation\":{generation},\"playing\":{playing},\"tick_ms\":{tick:.3},\"pump_ms\":{pump:.3},\"audio_pump_ms\":{audio_pump:.3},\"subtitle_pump_ms\":{subtitle_pump:.3},\"video_pump_ms\":{video_pump:.3},\"clock_sync_ms\":{clock_sync:.3},\"danmaku_plan_ms\":{danmaku_plan:.3},\"render_ms\":{render:.3},\"render_current_ms\":{render_current:.3},\"render_test_ms\":{render_test:.3},\"density\":{density:.3},\"items\":{items},\"font_size\":{font:.3},\"display_area\":{area:.3},\"scroll_duration_s\":{scroll_dur:.3},\"self_every\":{self_every},\"visible_glyph_quads\":{glyphs},\"placed_items\":{placed},\"scroll_items\":{scroll},\"top_items\":{top},\"bottom_items\":{bottom},\"scroll_rows\":{scroll_rows},\"scroll_track_min\":{track_min},\"scroll_track_max\":{track_max},\"atlas_version\":{atlas_version},\"atlas_bytes\":{atlas_bytes},\"surface_width\":{sw},\"surface_height\":{sh},\"rendered_video\":{rendered_video},\"rendered_test\":{rendered_test},\"danmaku_passes\":{passes},\"danmaku_draw_items\":{draw_items},\"draw_items_per_pass\":{draw_ratio:.3},\"danmaku_passes_delta\":{passes_delta},\"danmaku_draw_items_delta\":{draw_items_delta},\"draw_items_per_new_pass\":{draw_ratio_delta:.3},\"danmaku_atlas_ms\":{danmaku_atlas:.3},\"danmaku_vertex_build_ms\":{danmaku_vertex_build:.3},\"danmaku_vertex_copy_ms\":{danmaku_vertex_copy:.3},\"danmaku_encode_ms\":{danmaku_encode:.3},\"danmaku_vertex_bytes\":{danmaku_vertex_bytes},\"danmaku_vertex_count\":{danmaku_vertex_count},\"atlas_uploads\":{uploads},\"atlas_reuses\":{reuses},\"decoded_video\":{decoded_video},\"pushed_audio\":{pushed_audio},\"import_failures\":{import_failures},\"render_failures\":{render_failures},\"audio_failures\":{audio_failures},\"error\":\"{error}\"}}",
+            "{{\"elapsed_s\":{elapsed:.3},\"fps\":{fps:.3},\"target_fps\":{target_fps:.3},\"uncapped\":{uncapped},\"media_s\":{media:.3},\"duration_s\":{duration:.3},\"generation\":{generation},\"playing\":{playing},\"tick_ms\":{tick:.3},\"pump_ms\":{pump:.3},\"audio_pump_ms\":{audio_pump:.3},\"subtitle_pump_ms\":{subtitle_pump:.3},\"video_pump_ms\":{video_pump:.3},\"clock_sync_ms\":{clock_sync:.3},\"danmaku_plan_ms\":{danmaku_plan:.3},\"render_ms\":{render:.3},\"render_current_ms\":{render_current:.3},\"render_test_ms\":{render_test:.3},\"density\":{density:.3},\"items\":{items},\"font_size\":{font:.3},\"display_area\":{area:.3},\"scroll_duration_s\":{scroll_dur:.3},\"self_every\":{self_every},\"visible_glyph_quads\":{glyphs},\"placed_items\":{placed},\"scroll_items\":{scroll},\"top_items\":{top},\"bottom_items\":{bottom},\"scroll_rows\":{scroll_rows},\"scroll_track_min\":{track_min},\"scroll_track_max\":{track_max},\"atlas_version\":{atlas_version},\"atlas_bytes\":{atlas_bytes},\"surface_width\":{sw},\"surface_height\":{sh},\"rendered_video\":{rendered_video},\"rendered_test\":{rendered_test},\"danmaku_passes\":{passes},\"danmaku_draw_items\":{draw_items},\"draw_items_per_pass\":{draw_ratio:.3},\"danmaku_passes_delta\":{passes_delta},\"danmaku_draw_items_delta\":{draw_items_delta},\"draw_items_per_new_pass\":{draw_ratio_delta:.3},\"danmaku_atlas_ms\":{danmaku_atlas:.3},\"danmaku_vertex_build_ms\":{danmaku_vertex_build:.3},\"danmaku_vertex_copy_ms\":{danmaku_vertex_copy:.3},\"danmaku_encode_ms\":{danmaku_encode:.3},\"danmaku_vertex_bytes\":{danmaku_vertex_bytes},\"danmaku_vertex_count\":{danmaku_vertex_count},\"atlas_uploads\":{uploads},\"atlas_reuses\":{reuses},\"upscaler\":\"{upscaler}\",\"upscaled_frames\":{upscaled_frames},\"upscaler_encode_ms\":{upscaler_encode:.3},\"gpu_frame_ms\":{gpu_frame:.3},\"decoded_video\":{decoded_video},\"pushed_audio\":{pushed_audio},\"import_failures\":{import_failures},\"render_failures\":{render_failures},\"audio_failures\":{audio_failures},\"error\":\"{error}\"}}",
             elapsed = now.duration_since(self.started_at).as_secs_f64(),
             fps = self.fps,
             target_fps = self.options.target_fps,
@@ -605,6 +613,10 @@ impl WindowLabState {
             danmaku_vertex_count = renderer.last_danmaku_vertex_count,
             uploads = renderer.overlay_alpha_atlas_uploads,
             reuses = renderer.overlay_alpha_atlas_reuses,
+            upscaler = upscaler_label(self.options.luma_upscaler),
+            upscaled_frames = renderer.upscaled_frames,
+            upscaler_encode = ms(renderer.last_upscaler_encode_duration),
+            gpu_frame = ms(renderer.last_gpu_duration),
             decoded_video = stats.decoded_video_frames,
             pushed_audio = stats.pushed_audio_frames,
             import_failures = stats.import_failures,
@@ -612,6 +624,14 @@ impl WindowLabState {
             audio_failures = stats.audio_failures,
             error = json_escape(self.last_error.as_deref().unwrap_or("")),
         )
+    }
+}
+
+fn upscaler_label(mode: LumaUpscalerMode) -> &'static str {
+    match mode {
+        LumaUpscalerMode::Off => "off",
+        LumaUpscalerMode::ArtCnnC4F16 => "artcnn-c4f16",
+        LumaUpscalerMode::ArtCnnC4F32 => "artcnn-c4f32",
     }
 }
 
@@ -1263,6 +1283,7 @@ struct PerfOptions {
     hide_panel: bool,
     surface_scale_override: Option<f64>,
     target_fps: f64,
+    luma_upscaler: LumaUpscalerMode,
 }
 
 impl Default for PerfOptions {
@@ -1302,6 +1323,7 @@ impl Default for PerfOptions {
             hide_panel: false,
             surface_scale_override: None,
             target_fps: 60.0,
+            luma_upscaler: LumaUpscalerMode::Off,
         }
     }
 }
@@ -1366,6 +1388,19 @@ fn parse_args(args: &[String]) -> Result<PerfOptions, String> {
             "--danmaku" => options.danmaku_path = Some(next_string(args, &mut index, "--danmaku")?),
             "--video" => options.video_uri = Some(next_string(args, &mut index, "--video")?),
             "--software" => options.decode_preference = VideoDecodePreference::Software,
+            "--upscaler" => {
+                let value = next_string(args, &mut index, "--upscaler")?;
+                options.luma_upscaler = match value.as_str() {
+                    "off" => LumaUpscalerMode::Off,
+                    "artcnn-c4f16" => LumaUpscalerMode::ArtCnnC4F16,
+                    "artcnn-c4f32" => LumaUpscalerMode::ArtCnnC4F32,
+                    other => {
+                        return Err(format!(
+                            "invalid --upscaler value: {other} (expected off|artcnn-c4f16|artcnn-c4f32)"
+                        ));
+                    }
+                };
+            }
             "--videotoolbox" => options.decode_preference = VideoDecodePreference::VideoToolbox,
             "--items" => {
                 options.item_count = next_parse(args, &mut index, "--items")?;

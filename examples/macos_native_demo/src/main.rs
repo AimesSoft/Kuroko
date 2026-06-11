@@ -114,6 +114,7 @@ fn demo_renderer_config() -> MetalRendererConfig {
     };
     MetalRendererConfig {
         output_mode: MetalOutputMode::apple_edr(headroom),
+        ..MetalRendererConfig::default()
     }
 }
 

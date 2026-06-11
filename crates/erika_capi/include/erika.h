@@ -81,9 +81,16 @@ typedef enum ErikaPresenterOutputMode {
   ErikaPresenterOutputMode_AppleEdr = 1,
 } ErikaPresenterOutputMode;
 
+typedef enum ErikaLumaUpscalerMode {
+  ErikaLumaUpscalerMode_Off = 0,
+  ErikaLumaUpscalerMode_ArtCnnC4F16 = 1,
+  ErikaLumaUpscalerMode_ArtCnnC4F32 = 2,
+} ErikaLumaUpscalerMode;
+
 typedef struct ErikaPresenterConfig {
   int32_t output_mode;
   float edr_headroom;
+  int32_t luma_upscaler;
 } ErikaPresenterConfig;
 
 typedef struct ErikaDanmakuConfig {
@@ -243,6 +250,7 @@ ErikaStatus erika_presenter_close(ErikaPresenterHandle *handle);
 ErikaStatus erika_presenter_seek(ErikaPresenterHandle *handle, uint64_t position_micros);
 ErikaStatus erika_presenter_set_playback_rate(ErikaPresenterHandle *handle, double rate);
 ErikaStatus erika_presenter_set_volume(ErikaPresenterHandle *handle, double volume);
+ErikaStatus erika_presenter_set_upscaler(ErikaPresenterHandle *handle, int32_t mode);
 ErikaStatus erika_presenter_add_external_subtitle(
     ErikaPresenterHandle *handle,
     const char *uri,

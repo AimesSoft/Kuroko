@@ -11,9 +11,15 @@ use crate::overlay::OverlayFrame;
 use crate::renderer::pipeline::{
     ColorRange, HdrMetadata, MatrixCoefficients, SourceColorState, VideoRenderPipeline,
 };
+pub use crate::renderer::pipeline::LumaUpscalerMode;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod apple;
+// Public for integration tests (numeric verification against ONNX
+// references); not part of the stable API surface.
+#[doc(hidden)]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub mod upscaler;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClearColor {
@@ -42,17 +48,20 @@ pub struct MetalRenderer {
     current_frame: Option<ImportedVideoFrame>,
     current_media_time: Duration,
     current_generation: u64,
+    upload_counter: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MetalRendererConfig {
     pub output_mode: MetalOutputMode,
+    pub luma_upscaler: LumaUpscalerMode,
 }
 
 impl Default for MetalRendererConfig {
     fn default() -> Self {
         Self {
             output_mode: MetalOutputMode::default(),
+            luma_upscaler: LumaUpscalerMode::default(),
         }
     }
 }
@@ -155,6 +164,9 @@ pub struct MetalRendererStats {
     pub last_danmaku_encode_duration: Duration,
     pub last_danmaku_vertex_bytes: usize,
     pub last_danmaku_vertex_count: usize,
+    pub upscaled_frames: u64,
+    pub last_upscaler_encode_duration: Duration,
+    pub last_gpu_duration: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,6 +259,10 @@ impl ImportedVideoFrame {
 pub struct VideoRenderFrame<'a> {
     pub frame: &'a ImportedVideoFrame,
     pub pipeline: VideoRenderPipeline,
+    /// Identifies the decoded frame across render ticks. The same token means
+    /// the luma plane is unchanged, letting the upscaler reuse its cached
+    /// output when a frame is presented for several vsync ticks.
+    pub frame_token: Option<u64>,
 }
 
 impl<'a> VideoRenderFrame<'a> {
@@ -254,7 +270,13 @@ impl<'a> VideoRenderFrame<'a> {
         Self {
             frame,
             pipeline: VideoRenderPipeline::new(frame.source_color(), Default::default()),
+            frame_token: None,
         }
+    }
+
+    pub fn frame_token(mut self, token: u64) -> Self {
+        self.frame_token = Some(token);
+        self
     }
 
     pub fn full_range(mut self, full_range: bool) -> Self {
@@ -339,6 +361,7 @@ impl MetalRenderer {
                 current_frame: None,
                 current_media_time: Duration::ZERO,
                 current_generation: 1,
+                upload_counter: 0,
             })
         }
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
@@ -620,6 +643,7 @@ impl RendererBackend for MetalRenderer {
         self.current_frame = Some(imported);
         self.current_media_time = frame.pts.unwrap_or(frame.media_time);
         self.current_generation = frame.generation.max(1);
+        self.upload_counter = self.upload_counter.wrapping_add(1);
         Ok(())
     }
 
@@ -634,7 +658,7 @@ impl RendererBackend for MetalRenderer {
                 && (context.output_height == 0 || plan.viewport.height == context.output_height)
         });
         let result = self.render_video_frame_with_context(
-            VideoRenderFrame::new(&frame),
+            VideoRenderFrame::new(&frame).frame_token(self.upload_counter),
             context.overlay.map(OverlayRenderFrame::new),
             danmaku.map(DanmakuRenderFrame::new),
         );
@@ -661,7 +685,21 @@ impl RendererBackend for MetalRenderer {
             last_danmaku_encode_duration: stats.last_danmaku_encode_duration,
             last_danmaku_vertex_bytes: stats.last_danmaku_vertex_bytes,
             last_danmaku_vertex_count: stats.last_danmaku_vertex_count,
+            upscaled_frames: stats.upscaled_frames,
+            last_upscaler_encode_duration: stats.last_upscaler_encode_duration,
+            last_gpu_duration: stats.last_gpu_duration,
             attached: stats.drawable_width > 0 && stats.drawable_height > 0,
+        }
+    }
+
+    fn set_luma_upscaler(&mut self, mode: crate::renderer::pipeline::LumaUpscalerMode) {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            self.inner.set_luma_upscaler(mode);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            let _ = mode;
         }
     }
 }

@@ -417,6 +417,10 @@ pub trait RendererBackend {
     fn runtime_stats(&self) -> RendererRuntimeStats {
         RendererRuntimeStats::default()
     }
+
+    /// Switches the neural luma upscaler at runtime. Backends without an
+    /// upscaler implementation ignore the request.
+    fn set_luma_upscaler(&mut self, _mode: crate::renderer::pipeline::LumaUpscalerMode) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -437,6 +441,9 @@ pub struct RendererRuntimeStats {
     pub last_danmaku_encode_duration: Duration,
     pub last_danmaku_vertex_bytes: usize,
     pub last_danmaku_vertex_count: usize,
+    pub upscaled_frames: u64,
+    pub last_upscaler_encode_duration: Duration,
+    pub last_gpu_duration: Duration,
     pub attached: bool,
 }
 

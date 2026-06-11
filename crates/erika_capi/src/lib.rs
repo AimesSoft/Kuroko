@@ -10,6 +10,8 @@ use erika::danmaku::{
 use erika::presenter::{PresenterConfig, PresenterRuntime, PresenterStats};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use erika::renderer::metal::{MetalOutputMode, MetalRendererConfig};
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use erika::renderer::pipeline::LumaUpscalerMode;
 use erika::{
     FlutterTextureHandle, FlutterTextureKind, MediaRequest, MetalSurfaceHandle, PlatformSurface,
     Player, PlayerConfig, PlayerEvent, PlayerState, TrackInfo, TrackKind, TrackSelection,
@@ -148,10 +150,29 @@ impl ErikaPresenterOutputMode {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErikaLumaUpscalerMode {
+    Off = 0,
+    ArtCnnC4F16 = 1,
+    ArtCnnC4F32 = 2,
+}
+
+impl ErikaLumaUpscalerMode {
+    fn from_raw(value: i32) -> Self {
+        match value {
+            1 => Self::ArtCnnC4F16,
+            2 => Self::ArtCnnC4F32,
+            _ => Self::Off,
+        }
+    }
+}
+
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ErikaPresenterConfig {
     pub output_mode: i32,
     pub edr_headroom: f32,
+    pub luma_upscaler: i32,
 }
 
 impl Default for ErikaPresenterConfig {
@@ -159,6 +180,7 @@ impl Default for ErikaPresenterConfig {
         Self {
             output_mode: ErikaPresenterOutputMode::Sdr as i32,
             edr_headroom: 1.0,
+            luma_upscaler: ErikaLumaUpscalerMode::Off as i32,
         }
     }
 }
@@ -619,6 +641,7 @@ pub extern "C" fn erika_presenter_create_with_output_mode(
     create_presenter_handle(presenter_config_from_c(ErikaPresenterConfig {
         output_mode,
         edr_headroom,
+        ..ErikaPresenterConfig::default()
     }))
 }
 
@@ -665,8 +688,21 @@ fn presenter_config_from_c(config: ErikaPresenterConfig) -> PresenterConfig {
     };
 
     PresenterConfig {
-        renderer: MetalRendererConfig { output_mode },
+        renderer: MetalRendererConfig {
+            output_mode,
+            luma_upscaler: luma_upscaler_mode_from_c(config.luma_upscaler),
+            ..MetalRendererConfig::default()
+        },
         ..PresenterConfig::default()
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn luma_upscaler_mode_from_c(mode: i32) -> LumaUpscalerMode {
+    match ErikaLumaUpscalerMode::from_raw(mode) {
+        ErikaLumaUpscalerMode::Off => LumaUpscalerMode::Off,
+        ErikaLumaUpscalerMode::ArtCnnC4F16 => LumaUpscalerMode::ArtCnnC4F16,
+        ErikaLumaUpscalerMode::ArtCnnC4F32 => LumaUpscalerMode::ArtCnnC4F32,
     }
 }
 
@@ -837,6 +873,20 @@ pub unsafe extern "C" fn erika_presenter_set_volume(
 ) -> ErikaStatus {
     with_presenter_mut(handle, |handle| {
         handle.presenter.set_volume(volume);
+        ErikaStatus::Ok
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_set_upscaler(
+    handle: *mut ErikaPresenterHandle,
+    mode: i32,
+) -> ErikaStatus {
+    with_presenter_mut(handle, |handle| {
+        handle
+            .presenter
+            .set_luma_upscaler(luma_upscaler_mode_from_c(mode));
         ErikaStatus::Ok
     })
 }
@@ -1322,6 +1372,15 @@ pub unsafe extern "C" fn erika_presenter_set_playback_rate(
 pub unsafe extern "C" fn erika_presenter_set_volume(
     _handle: *mut std::ffi::c_void,
     _volume: f64,
+) -> ErikaStatus {
+    ErikaStatus::PlayerError
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_set_upscaler(
+    _handle: *mut std::ffi::c_void,
+    _mode: i32,
 ) -> ErikaStatus {
     ErikaStatus::PlayerError
 }
@@ -2102,10 +2161,43 @@ mod tests {
 
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[test]
+    fn c_presenter_set_upscaler_accepts_valid_handle() {
+        assert_eq!(
+            unsafe {
+                erika_presenter_set_upscaler(
+                    std::ptr::null_mut(),
+                    ErikaLumaUpscalerMode::ArtCnnC4F16 as i32,
+                )
+            },
+            ErikaStatus::NullPointer
+        );
+
+        let handle = erika_presenter_create();
+        assert!(!handle.is_null());
+        assert_eq!(
+            unsafe {
+                erika_presenter_set_upscaler(handle, ErikaLumaUpscalerMode::ArtCnnC4F16 as i32)
+            },
+            ErikaStatus::Ok
+        );
+        assert_eq!(
+            unsafe { erika_presenter_set_upscaler(handle, ErikaLumaUpscalerMode::Off as i32) },
+            ErikaStatus::Ok
+        );
+        assert_eq!(
+            unsafe { erika_presenter_set_upscaler(handle, 999) },
+            ErikaStatus::Ok
+        );
+        unsafe { erika_presenter_destroy(handle) };
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
     fn c_presenter_can_be_created_with_edr_config() {
         let handle = erika_presenter_create_with_config(ErikaPresenterConfig {
             output_mode: ErikaPresenterOutputMode::AppleEdr as i32,
             edr_headroom: 4.0,
+            ..ErikaPresenterConfig::default()
         });
         assert!(!handle.is_null());
         unsafe { erika_presenter_destroy(handle) };
@@ -2152,6 +2244,7 @@ mod tests {
             metal_output_mode_from_c(ErikaPresenterConfig {
                 output_mode: ErikaPresenterOutputMode::AppleEdr as i32,
                 edr_headroom: 4.0,
+                ..ErikaPresenterConfig::default()
             }),
             MetalOutputMode::apple_edr(4.0)
         );
@@ -2159,6 +2252,7 @@ mod tests {
             metal_output_mode_from_c(ErikaPresenterConfig {
                 output_mode: 999,
                 edr_headroom: 4.0,
+                ..ErikaPresenterConfig::default()
             }),
             MetalOutputMode::Sdr
         );
@@ -2166,8 +2260,47 @@ mod tests {
             metal_output_mode_from_c(ErikaPresenterConfig {
                 output_mode: ErikaPresenterOutputMode::AppleEdr as i32,
                 edr_headroom: f32::NAN,
+                ..ErikaPresenterConfig::default()
             }),
             MetalOutputMode::apple_edr(1.0)
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn c_presenter_config_maps_upscaler_modes() {
+        assert_eq!(
+            presenter_config_from_c(ErikaPresenterConfig::default())
+                .renderer
+                .luma_upscaler,
+            LumaUpscalerMode::Off
+        );
+        assert_eq!(
+            presenter_config_from_c(ErikaPresenterConfig {
+                luma_upscaler: ErikaLumaUpscalerMode::ArtCnnC4F16 as i32,
+                ..ErikaPresenterConfig::default()
+            })
+            .renderer
+            .luma_upscaler,
+            LumaUpscalerMode::ArtCnnC4F16
+        );
+        assert_eq!(
+            presenter_config_from_c(ErikaPresenterConfig {
+                luma_upscaler: ErikaLumaUpscalerMode::ArtCnnC4F32 as i32,
+                ..ErikaPresenterConfig::default()
+            })
+            .renderer
+            .luma_upscaler,
+            LumaUpscalerMode::ArtCnnC4F32
+        );
+        assert_eq!(
+            presenter_config_from_c(ErikaPresenterConfig {
+                luma_upscaler: 999,
+                ..ErikaPresenterConfig::default()
+            })
+            .renderer
+            .luma_upscaler,
+            LumaUpscalerMode::Off
         );
     }
 }

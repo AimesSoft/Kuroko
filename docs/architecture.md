@@ -19,7 +19,7 @@ Rust Player Core
   Metal renderer ─────── zero-copy NV12/P010, HDR/EDR, subtitle/danmaku pass
   wgpu renderer ──────── cross-platform video + danmaku rendering
   presenter runtime ──── ties player + renderer + audio + overlays
-  C ABI ──────────────── 61 exported functions, two handle families
+  C ABI ──────────────── 62 exported functions, two handle families
   Flutter plugin ─────── macOS + iOS native view embedding
 ```
 
@@ -120,6 +120,14 @@ The primary renderer for Apple platforms:
 - Tone mapping: Mobius, Reinhard, clip operators with absolute nits.
 - SDR output (`BGRA8Unorm`) and Apple EDR output (`RGBA16Float` with EDR
   headroom).
+- Neural luma upscaler (`LumaUpscalerMode`): ArtCNN C4F16/C4F32 2x doublers
+  as Metal compute passes on the decoded Y plane, encoded on the same command
+  buffer ahead of the render pass (`renderer/metal/upscaler.rs`). Chroma keeps
+  its source resolution. Engages only when the video is displayed above source
+  resolution; the network output is cached per decoded frame so repeated vsync
+  ticks of the same frame skip the compute. Weights are converted from the
+  upstream ONNX releases (`assets/artcnn/`) and verified against onnxruntime
+  references (`tests/artcnn_upscaler.rs`).
 - Subtitle overlay: RGBA plane upload and alpha blending.
 - Danmaku: Instanced glyph quad drawing from atlas (shadow → outline → fill passes).
 - Presentation layout preserves source aspect ratio.
@@ -161,7 +169,7 @@ DanmakuEngine, and audio output. The host supplies a native surface and drives
 
 ## C ABI
 
-`erika_capi` exports 61 functions through two handle families:
+`erika_capi` exports 62 functions through two handle families:
 
 - **`ErikaHandle`** — player control and event polling. The host owns rendering.
 - **`ErikaPresenterHandle`** — Erika owns the full stack. The host provides a
@@ -169,7 +177,8 @@ DanmakuEngine, and audio output. The host supplies a native surface and drives
 
 Covers: create/destroy, open/play/pause/stop/seek, track selection, subtitle
 track add/remove, danmaku track management (add/remove/enable/offset/config),
-surface attach/detach/resize, event polling, volume, playback rate.
+surface attach/detach/resize, event polling, volume, playback rate, neural
+luma upscaler switching.
 
 Header: `crates/erika_capi/include/erika.h`
 

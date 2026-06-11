@@ -1615,6 +1615,9 @@ impl RendererBackend for WgpuRenderer {
             last_danmaku_encode_duration: Default::default(),
             last_danmaku_vertex_bytes: 0,
             last_danmaku_vertex_count: 0,
+            upscaled_frames: 0,
+            last_upscaler_encode_duration: Default::default(),
+            last_gpu_duration: Default::default(),
             attached: stats.attached,
         }
     }
