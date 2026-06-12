@@ -23,9 +23,9 @@ use std::ffi::c_void;
 use std::mem;
 use std::ptr::NonNull;
 
+use objc2::Message;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::Message;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder,
@@ -33,7 +33,7 @@ use objc2_metal::{
     MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
 };
 
-use crate::core::{PlayerError, Result};
+use crate::core::{LumaUpscalerBackendStatus, PlayerError, Result};
 use crate::renderer::pipeline::LumaUpscalerMode;
 
 #[path = "upscaler_matmul.rs"]
@@ -177,6 +177,7 @@ pub struct LumaUpscaler {
     resources: Option<BackendResources>,
     pending: Option<PendingBuild>,
     auto_matmul_failed: bool,
+    auto_matmul_fallbacks: u64,
 }
 
 fn blob_for_mode(mode: LumaUpscalerMode) -> Option<(&'static [u8], u32)> {
@@ -282,6 +283,32 @@ impl LumaUpscaler {
         self.backend
     }
 
+    pub fn active_backend(&self) -> LumaUpscalerBackendStatus {
+        if self.mode == LumaUpscalerMode::Off {
+            return LumaUpscalerBackendStatus::Off;
+        }
+        match self.resources.as_ref() {
+            Some(BackendResources::Scalar(_)) => LumaUpscalerBackendStatus::Scalar,
+            Some(BackendResources::Matmul(_)) => LumaUpscalerBackendStatus::SimdgroupMatrix,
+            None if self.pending.is_some() => LumaUpscalerBackendStatus::Building,
+            None => LumaUpscalerBackendStatus::Inactive,
+        }
+    }
+
+    pub fn auto_matmul_fallbacks(&self) -> u64 {
+        self.auto_matmul_fallbacks
+    }
+
+    fn record_auto_matmul_failure(&mut self, error: &PlayerError) {
+        if !self.auto_matmul_failed {
+            self.auto_matmul_fallbacks = self.auto_matmul_fallbacks.saturating_add(1);
+            eprintln!(
+                "Erika luma upscaler falling back to scalar backend after matmul build failed: {error}"
+            );
+        }
+        self.auto_matmul_failed = true;
+    }
+
     fn backend_choice(&self, device: &ProtocolObject<dyn MTLDevice>) -> BackendChoice {
         match self.backend {
             UpscalerBackend::Scalar => BackendChoice {
@@ -375,8 +402,8 @@ impl LumaUpscaler {
             self.pending = None;
             self.resources = match build_backend(device, mode, choice.matmul) {
                 Ok(resources) => Some(resources),
-                Err(_error) if choice.matmul && choice.fallback_to_scalar => {
-                    self.auto_matmul_failed = true;
+                Err(error) if choice.matmul && choice.fallback_to_scalar => {
+                    self.record_auto_matmul_failure(&error);
                     Some(build_backend(device, mode, false)?)
                 }
                 Err(error) => return Err(error),
@@ -429,8 +456,8 @@ impl LumaUpscaler {
                     // frame without upscaling.
                     return Ok(None);
                 }
-                Err(_error) if choice.matmul && choice.fallback_to_scalar => {
-                    self.auto_matmul_failed = true;
+                Err(error) if choice.matmul && choice.fallback_to_scalar => {
+                    self.record_auto_matmul_failure(&error);
                     self.resources = None;
                     self.pending = None;
                     if !self.poll_pending_build(device, mode, false)? {

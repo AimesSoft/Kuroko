@@ -424,6 +424,16 @@ pub trait RendererBackend {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LumaUpscalerBackendStatus {
+    #[default]
+    Off,
+    Inactive,
+    Building,
+    Scalar,
+    SimdgroupMatrix,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RendererRuntimeStats {
     pub surface_width: u32,
     pub surface_height: u32,
@@ -441,6 +451,9 @@ pub struct RendererRuntimeStats {
     pub last_danmaku_encode_duration: Duration,
     pub last_danmaku_vertex_bytes: usize,
     pub last_danmaku_vertex_count: usize,
+    pub upscaler_mode: crate::renderer::pipeline::LumaUpscalerMode,
+    pub upscaler_backend: LumaUpscalerBackendStatus,
+    pub upscaler_fallbacks: u64,
     pub upscaled_frames: u64,
     pub last_upscaler_encode_duration: Duration,
     pub last_gpu_duration: Duration,

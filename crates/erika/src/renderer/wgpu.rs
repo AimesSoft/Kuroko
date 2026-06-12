@@ -2,9 +2,9 @@ use std::ffi::c_void;
 use wgpu::util::DeviceExt;
 
 use crate::core::{
-    ColorPrimaries, PlatformSurface, PlayerError, PlayerVideoFrame, RenderFrameContext,
-    RendererBackend, RendererRuntimeStats, Result, TransferFunction, WgpuSurfaceHandle,
-    WgpuSurfaceKind,
+    ColorPrimaries, LumaUpscalerBackendStatus, PlatformSurface, PlayerError, PlayerVideoFrame,
+    RenderFrameContext, RendererBackend, RendererRuntimeStats, Result, TransferFunction,
+    WgpuSurfaceHandle, WgpuSurfaceKind,
 };
 use crate::danmaku::{DanmakuGlyphAtlas, DanmakuGlyphInstance, DanmakuRenderPlan};
 use crate::ffmpeg::{PlanarFrame, PlanarPixelFormat};
@@ -1615,6 +1615,9 @@ impl RendererBackend for WgpuRenderer {
             last_danmaku_encode_duration: Default::default(),
             last_danmaku_vertex_bytes: 0,
             last_danmaku_vertex_count: 0,
+            upscaler_mode: Default::default(),
+            upscaler_backend: LumaUpscalerBackendStatus::Off,
+            upscaler_fallbacks: 0,
             upscaled_frames: 0,
             last_upscaler_encode_duration: Default::default(),
             last_gpu_duration: Default::default(),

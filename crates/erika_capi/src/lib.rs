@@ -3,6 +3,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Duration;
 
 use crossbeam_channel::Receiver;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use erika::LumaUpscalerBackendStatus;
 use erika::danmaku::{
     DanmakuLayoutConfig, DanmakuShadowStyle, DanmakuTimeline, DanmakuTrackInfo, DanmakuTrackSource,
 };
@@ -14,8 +16,8 @@ use erika::renderer::metal::{MetalOutputMode, MetalRendererConfig};
 use erika::renderer::pipeline::LumaUpscalerMode;
 use erika::{
     FlutterTextureHandle, FlutterTextureKind, MediaRequest, MetalSurfaceHandle, PlatformSurface,
-    Player, PlayerConfig, PlayerEvent, PlayerState, TrackInfo, TrackKind, TrackSelection,
-    TrackSource, TransferFunction, WgpuSurfaceHandle, WgpuSurfaceKind,
+    Player, PlayerConfig, PlayerEvent, PlayerState, RendererRuntimeStats, TrackInfo, TrackKind,
+    TrackSelection, TrackSource, TransferFunction, WgpuSurfaceHandle, WgpuSurfaceKind,
 };
 
 #[repr(C)]
@@ -168,11 +170,32 @@ impl ErikaLumaUpscalerMode {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErikaUpscalerBackendStatus {
+    Off = 0,
+    Inactive = 1,
+    Building = 2,
+    Scalar = 3,
+    SimdgroupMatrix = 4,
+}
+
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ErikaPresenterConfig {
     pub output_mode: i32,
     pub edr_headroom: f32,
     pub luma_upscaler: i32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ErikaUpscalerStatus {
+    pub requested_mode: i32,
+    pub active_backend: i32,
+    pub fallback_count: u64,
+    pub upscaled_frames: u64,
+    pub last_encode_micros: u64,
+    pub last_gpu_micros: u64,
 }
 
 impl Default for ErikaPresenterConfig {
@@ -706,6 +729,40 @@ fn luma_upscaler_mode_from_c(mode: i32) -> LumaUpscalerMode {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn luma_upscaler_mode_to_c(mode: LumaUpscalerMode) -> i32 {
+    match mode {
+        LumaUpscalerMode::Off => ErikaLumaUpscalerMode::Off as i32,
+        LumaUpscalerMode::ArtCnnC4F16 => ErikaLumaUpscalerMode::ArtCnnC4F16 as i32,
+        LumaUpscalerMode::ArtCnnC4F32 => ErikaLumaUpscalerMode::ArtCnnC4F32 as i32,
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn upscaler_backend_status_to_c(status: LumaUpscalerBackendStatus) -> i32 {
+    match status {
+        LumaUpscalerBackendStatus::Off => ErikaUpscalerBackendStatus::Off as i32,
+        LumaUpscalerBackendStatus::Inactive => ErikaUpscalerBackendStatus::Inactive as i32,
+        LumaUpscalerBackendStatus::Building => ErikaUpscalerBackendStatus::Building as i32,
+        LumaUpscalerBackendStatus::Scalar => ErikaUpscalerBackendStatus::Scalar as i32,
+        LumaUpscalerBackendStatus::SimdgroupMatrix => {
+            ErikaUpscalerBackendStatus::SimdgroupMatrix as i32
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn upscaler_status_to_c(stats: RendererRuntimeStats) -> ErikaUpscalerStatus {
+    ErikaUpscalerStatus {
+        requested_mode: luma_upscaler_mode_to_c(stats.upscaler_mode),
+        active_backend: upscaler_backend_status_to_c(stats.upscaler_backend),
+        fallback_count: stats.upscaler_fallbacks,
+        upscaled_frames: stats.upscaled_frames,
+        last_encode_micros: duration_micros_u64(stats.last_upscaler_encode_duration),
+        last_gpu_micros: duration_micros_u64(stats.last_gpu_duration),
+    }
+}
+
 fn danmaku_config_from_c(
     config: ErikaDanmakuConfig,
     base: &DanmakuLayoutConfig,
@@ -887,6 +944,22 @@ pub unsafe extern "C" fn erika_presenter_set_upscaler(
         handle
             .presenter
             .set_luma_upscaler(luma_upscaler_mode_from_c(mode));
+        ErikaStatus::Ok
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_get_upscaler_status(
+    handle: *mut ErikaPresenterHandle,
+    out_status: *mut ErikaUpscalerStatus,
+) -> ErikaStatus {
+    if out_status.is_null() {
+        return ErikaStatus::NullPointer;
+    }
+    with_presenter_mut(handle, |handle| {
+        let status = upscaler_status_to_c(handle.presenter.runtime_snapshot().renderer);
+        unsafe { *out_status = status };
         ErikaStatus::Ok
     })
 }
@@ -1382,6 +1455,18 @@ pub unsafe extern "C" fn erika_presenter_set_upscaler(
     _handle: *mut std::ffi::c_void,
     _mode: i32,
 ) -> ErikaStatus {
+    ErikaStatus::PlayerError
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn erika_presenter_get_upscaler_status(
+    _handle: *mut std::ffi::c_void,
+    out_status: *mut ErikaUpscalerStatus,
+) -> ErikaStatus {
+    if out_status.is_null() {
+        return ErikaStatus::NullPointer;
+    }
     ErikaStatus::PlayerError
 }
 
@@ -2188,6 +2273,51 @@ mod tests {
             unsafe { erika_presenter_set_upscaler(handle, 999) },
             ErikaStatus::Ok
         );
+        unsafe { erika_presenter_destroy(handle) };
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn c_presenter_reports_upscaler_status() {
+        assert_eq!(
+            unsafe {
+                erika_presenter_get_upscaler_status(std::ptr::null_mut(), std::ptr::null_mut())
+            },
+            ErikaStatus::NullPointer
+        );
+
+        let handle = erika_presenter_create();
+        assert!(!handle.is_null());
+        let mut status = ErikaUpscalerStatus::default();
+        assert_eq!(
+            unsafe { erika_presenter_get_upscaler_status(handle, &mut status) },
+            ErikaStatus::Ok
+        );
+        assert_eq!(status.requested_mode, ErikaLumaUpscalerMode::Off as i32);
+        assert_eq!(
+            status.active_backend,
+            ErikaUpscalerBackendStatus::Off as i32
+        );
+
+        assert_eq!(
+            unsafe {
+                erika_presenter_set_upscaler(handle, ErikaLumaUpscalerMode::ArtCnnC4F16 as i32)
+            },
+            ErikaStatus::Ok
+        );
+        assert_eq!(
+            unsafe { erika_presenter_get_upscaler_status(handle, &mut status) },
+            ErikaStatus::Ok
+        );
+        assert_eq!(
+            status.requested_mode,
+            ErikaLumaUpscalerMode::ArtCnnC4F16 as i32
+        );
+        assert_eq!(
+            status.active_backend,
+            ErikaUpscalerBackendStatus::Inactive as i32
+        );
+        assert_eq!(status.fallback_count, 0);
         unsafe { erika_presenter_destroy(handle) };
     }
 

@@ -19,7 +19,7 @@ Rust Player Core
   Metal renderer ─────── zero-copy NV12/P010, HDR/EDR, subtitle/danmaku pass
   wgpu renderer ──────── cross-platform video + danmaku rendering
   presenter runtime ──── ties player + renderer + audio + overlays
-  C ABI ──────────────── 62 exported functions, two handle families
+  C ABI ──────────────── 63 exported functions, two handle families
   Flutter plugin ─────── macOS + iOS native view embedding
 ```
 
@@ -172,7 +172,7 @@ DanmakuEngine, and audio output. The host supplies a native surface and drives
 
 ## C ABI
 
-`erika_capi` exports 62 functions through two handle families:
+`erika_capi` exports 63 functions through two handle families:
 
 - **`ErikaHandle`** — player control and event polling. The host owns rendering.
 - **`ErikaPresenterHandle`** — Erika owns the full stack. The host provides a
@@ -181,7 +181,7 @@ DanmakuEngine, and audio output. The host supplies a native surface and drives
 Covers: create/destroy, open/play/pause/stop/seek, track selection, subtitle
 track add/remove, danmaku track management (add/remove/enable/offset/config),
 surface attach/detach/resize, event polling, volume, playback rate, neural
-luma upscaler switching.
+luma upscaler switching, and upscaler backend status diagnostics.
 
 Header: `crates/erika_capi/include/erika.h`
 

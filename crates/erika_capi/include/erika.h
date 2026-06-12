@@ -87,11 +87,28 @@ typedef enum ErikaLumaUpscalerMode {
   ErikaLumaUpscalerMode_ArtCnnC4F32 = 2,
 } ErikaLumaUpscalerMode;
 
+typedef enum ErikaUpscalerBackendStatus {
+  ErikaUpscalerBackendStatus_Off = 0,
+  ErikaUpscalerBackendStatus_Inactive = 1,
+  ErikaUpscalerBackendStatus_Building = 2,
+  ErikaUpscalerBackendStatus_Scalar = 3,
+  ErikaUpscalerBackendStatus_SimdgroupMatrix = 4,
+} ErikaUpscalerBackendStatus;
+
 typedef struct ErikaPresenterConfig {
   int32_t output_mode;
   float edr_headroom;
   int32_t luma_upscaler;
 } ErikaPresenterConfig;
+
+typedef struct ErikaUpscalerStatus {
+  int32_t requested_mode;
+  int32_t active_backend;
+  uint64_t fallback_count;
+  uint64_t upscaled_frames;
+  uint64_t last_encode_micros;
+  uint64_t last_gpu_micros;
+} ErikaUpscalerStatus;
 
 typedef struct ErikaDanmakuConfig {
   bool enabled;
@@ -251,6 +268,9 @@ ErikaStatus erika_presenter_seek(ErikaPresenterHandle *handle, uint64_t position
 ErikaStatus erika_presenter_set_playback_rate(ErikaPresenterHandle *handle, double rate);
 ErikaStatus erika_presenter_set_volume(ErikaPresenterHandle *handle, double volume);
 ErikaStatus erika_presenter_set_upscaler(ErikaPresenterHandle *handle, int32_t mode);
+ErikaStatus erika_presenter_get_upscaler_status(
+    ErikaPresenterHandle *handle,
+    ErikaUpscalerStatus *out_status);
 ErikaStatus erika_presenter_add_external_subtitle(
     ErikaPresenterHandle *handle,
     const char *uri,

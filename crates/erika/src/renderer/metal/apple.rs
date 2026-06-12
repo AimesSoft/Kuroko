@@ -46,13 +46,13 @@ use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
 use crate::core::{ColorPrimaries, TransferFunction};
 use crate::danmaku::{DanmakuGlyphAtlas, DanmakuRenderPlan};
+use crate::renderer::metal::upscaler::LumaUpscaler;
 use crate::renderer::metal::{
     ClearColor, DanmakuRenderFrame, ImportedVideoFormat, ImportedVideoFrameInfo,
     ImportedVideoPlaneInfo, MetalDrawablePixelFormat, MetalOutputMode, MetalRendererConfig,
     MetalRendererStats, OverlayRenderFrame, PreparedOverlayFrameInfo, VideoFrameTextureSource,
     VideoRenderFrame, fourcc_string,
 };
-use crate::renderer::metal::upscaler::LumaUpscaler;
 use crate::renderer::pipeline::{ColorRange, LumaUpscalerMode, ToneMapOperator};
 use crate::subtitle::{AssColor, SubtitleAlphaBitmap};
 
@@ -208,7 +208,11 @@ impl MetalRendererImpl {
     }
 
     pub fn stats(&self) -> MetalRendererStats {
-        self.stats
+        let mut stats = self.stats;
+        stats.upscaler_mode = self.upscaler.mode();
+        stats.upscaler_backend = self.upscaler.active_backend();
+        stats.upscaler_fallbacks = self.upscaler.auto_matmul_fallbacks();
+        stats
     }
 
     fn configure_layer_output(&mut self, layer: &CAMetalLayer) {

@@ -2,16 +2,16 @@ use std::ffi::c_void;
 use std::time::Duration;
 
 use crate::core::{
-    ColorPrimaries, PlatformSurface, PlayerError, PlayerVideoFrame, RenderFrameContext,
-    RendererBackend, RendererRuntimeStats, Result, TransferFunction,
+    ColorPrimaries, LumaUpscalerBackendStatus, PlatformSurface, PlayerError, PlayerVideoFrame,
+    RenderFrameContext, RendererBackend, RendererRuntimeStats, Result, TransferFunction,
 };
 use crate::danmaku::DanmakuRenderPlan;
 use crate::ffmpeg::Frame;
 use crate::overlay::OverlayFrame;
+pub use crate::renderer::pipeline::LumaUpscalerMode;
 use crate::renderer::pipeline::{
     ColorRange, HdrMetadata, MatrixCoefficients, SourceColorState, VideoRenderPipeline,
 };
-pub use crate::renderer::pipeline::LumaUpscalerMode;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod apple;
@@ -164,6 +164,9 @@ pub struct MetalRendererStats {
     pub last_danmaku_encode_duration: Duration,
     pub last_danmaku_vertex_bytes: usize,
     pub last_danmaku_vertex_count: usize,
+    pub upscaler_mode: LumaUpscalerMode,
+    pub upscaler_backend: LumaUpscalerBackendStatus,
+    pub upscaler_fallbacks: u64,
     pub upscaled_frames: u64,
     pub last_upscaler_encode_duration: Duration,
     pub last_gpu_duration: Duration,
@@ -685,6 +688,9 @@ impl RendererBackend for MetalRenderer {
             last_danmaku_encode_duration: stats.last_danmaku_encode_duration,
             last_danmaku_vertex_bytes: stats.last_danmaku_vertex_bytes,
             last_danmaku_vertex_count: stats.last_danmaku_vertex_count,
+            upscaler_mode: stats.upscaler_mode,
+            upscaler_backend: stats.upscaler_backend,
+            upscaler_fallbacks: stats.upscaler_fallbacks,
             upscaled_frames: stats.upscaled_frames,
             last_upscaler_encode_duration: stats.last_upscaler_encode_duration,
             last_gpu_duration: stats.last_gpu_duration,

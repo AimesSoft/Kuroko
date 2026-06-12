@@ -67,7 +67,8 @@ for visual sanity checks.
 
 `--upscaler off|artcnn-c4f16|artcnn-c4f32` selects the Metal neural luma
 doubler. Run the same clip with each mode and compare the JSONL fields
-`upscaler_encode_ms`, `gpu_frame_ms`, `upscaled_frames`, and `fps`:
+`upscaler_backend`, `upscaler_fallbacks`, `upscaler_encode_ms`,
+`gpu_frame_ms`, `upscaled_frames`, and `fps`:
 
 ```sh
 cargo run --release -p danmaku_perf_lab -- \

@@ -15,8 +15,8 @@ use objc2_metal::{
     MTLResourceOptions, MTLSize, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
 
-use erika::renderer::metal::upscaler::{LumaUpscaler, UpscalerBackend};
 use erika::renderer::metal::LumaUpscalerMode;
+use erika::renderer::metal::upscaler::{LumaUpscaler, UpscalerBackend};
 
 const WIDTH: usize = 128;
 const HEIGHT: usize = 72;
