@@ -5,15 +5,25 @@
 //! clip to [0, 1]. Weights are converted from the upstream ONNX releases by
 //! `assets/artcnn/export_artcnn.py`; the blob layout is documented there.
 //!
-//! Feature maps live in `texture2d_array<half>` textures with 4 channels per
-//! slice. Every pass runs at source resolution on the same command buffer as
-//! the video render pass, so the upscaled luma is consumed zero-copy by the
+//! Two kernel backends share this front-end (selected by [`UpscalerBackend`],
+//! built asynchronously because runtime shader compilation can take seconds):
+//!
+//! - **Scalar** (this file): feature maps in `texture2d_array<half>` textures,
+//!   each thread accumulates a small output block with `half4x4` math.
+//!   Portable fallback for GPUs without `simdgroup_matrix` (Intel/AMD).
+//! - **SimdgroupMatrix** (`upscaler_matmul.rs`): convolutions evaluated as
+//!   per-tap `simdgroup_half8x8` matrix multiplies. Default on Apple Silicon;
+//!   measured 1.1x (C4F16) and 1.5x (C4F32) over the scalar backend on M2.
+//!
+//! Every pass runs at source resolution on the same command buffer as the
+//! video render pass, so the upscaled luma is consumed zero-copy by the
 //! existing YCbCr fragment shader while chroma keeps its original resolution.
 
 use std::ffi::c_void;
 use std::mem;
 use std::ptr::NonNull;
 
+use objc2::Message;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
@@ -25,6 +35,9 @@ use objc2_metal::{
 
 use crate::core::{PlayerError, Result};
 use crate::renderer::pipeline::LumaUpscalerMode;
+
+#[path = "upscaler_matmul.rs"]
+mod matmul;
 
 const BLOB_C4F16: &[u8] = include_bytes!("../../../assets/artcnn/artcnn_c4f16.bin");
 const BLOB_C4F32: &[u8] = include_bytes!("../../../assets/artcnn/artcnn_c4f32.bin");
@@ -115,10 +128,48 @@ struct UpscalerResources {
     pool: Option<TexturePool>,
 }
 
+/// Kernel implementation selection. `Auto` picks the `simdgroup_matrix`
+/// backend on Apple7+ GPUs (all Apple Silicon) and falls back to the scalar
+/// texture kernels elsewhere. `ERIKA_SR_BACKEND=scalar|matmul` overrides
+/// `Auto` for experiments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UpscalerBackend {
+    #[default]
+    Auto,
+    Scalar,
+    SimdgroupMatrix,
+}
+
+enum BackendResources {
+    Scalar(UpscalerResources),
+    Matmul(matmul::Resources),
+}
+
+/// Wrappers to move Metal objects into the background build thread.
+/// SAFETY: `MTLDevice`, `MTLLibrary`, `MTLComputePipelineState` and
+/// `MTLBuffer` are documented thread-safe; the texture/buffer pools inside
+/// `BackendResources` start out empty and are only created on the render
+/// thread after the hand-off.
+struct SendResources(BackendResources);
+unsafe impl Send for SendResources {}
+struct SendDevice(Retained<ProtocolObject<dyn MTLDevice>>);
+unsafe impl Send for SendDevice {}
+
+/// Runtime shader compilation of the unrolled kernels takes seconds (the
+/// matmul backend measured ~2.7 s on an M2), so resources are built on a
+/// background thread; frames render without upscaling until the build lands.
+struct PendingBuild {
+    mode: LumaUpscalerMode,
+    matmul: bool,
+    slot: std::sync::Arc<std::sync::Mutex<Option<Result<SendResources>>>>,
+}
+
 #[derive(Default)]
 pub struct LumaUpscaler {
     mode: LumaUpscalerMode,
-    resources: Option<UpscalerResources>,
+    backend: UpscalerBackend,
+    resources: Option<BackendResources>,
+    pending: Option<PendingBuild>,
 }
 
 fn blob_for_mode(mode: LumaUpscalerMode) -> Option<(&'static [u8], u32)> {
@@ -153,16 +204,153 @@ fn read_u32(blob: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(blob[offset..offset + 4].try_into().expect("4 bytes"))
 }
 
+fn build_backend(
+    device: &ProtocolObject<dyn MTLDevice>,
+    mode: LumaUpscalerMode,
+    matmul: bool,
+) -> Result<BackendResources> {
+    if matmul {
+        let (payload, channels) = blob_payload(mode)?;
+        Ok(BackendResources::Matmul(matmul::build_resources(
+            device, mode, payload, channels,
+        )?))
+    } else {
+        Ok(BackendResources::Scalar(build_resources(device, mode)?))
+    }
+}
+
+/// Validates the blob header and returns (payload, channel count).
+fn blob_payload(mode: LumaUpscalerMode) -> Result<(&'static [u8], usize)> {
+    let (blob, slices) = blob_for_mode(mode)
+        .ok_or_else(|| PlayerError::Renderer("upscaler mode has no weights".to_string()))?;
+    if blob.len() < BLOB_HEADER_BYTES
+        || read_u32(blob, 0) != BLOB_MAGIC
+        || read_u32(blob, 4) != BLOB_VERSION
+    {
+        return Err(PlayerError::Renderer(
+            "ArtCNN weights blob has an unexpected header".to_string(),
+        ));
+    }
+    let feats = read_u32(blob, 8);
+    if feats != slices * 4 {
+        return Err(PlayerError::Renderer(format!(
+            "ArtCNN weights blob feature count {feats} does not match mode {mode:?}"
+        )));
+    }
+    let payload = &blob[BLOB_HEADER_BYTES..];
+    let expected_bytes = LayerOffsets::total_half4(slices) * 8;
+    if payload.len() != expected_bytes {
+        return Err(PlayerError::Renderer(format!(
+            "ArtCNN weights blob payload is {} bytes, expected {expected_bytes}",
+            payload.len()
+        )));
+    }
+    Ok((payload, feats as usize))
+}
+
 impl LumaUpscaler {
     pub fn set_mode(&mut self, mode: LumaUpscalerMode) {
         if self.mode != mode {
             self.mode = mode;
             self.resources = None;
+            self.pending = None;
         }
     }
 
     pub fn mode(&self) -> LumaUpscalerMode {
         self.mode
+    }
+
+    pub fn set_backend(&mut self, backend: UpscalerBackend) {
+        if self.backend != backend {
+            self.backend = backend;
+            self.resources = None;
+            self.pending = None;
+        }
+    }
+
+    pub fn backend(&self) -> UpscalerBackend {
+        self.backend
+    }
+
+    fn wants_matmul(&self, device: &ProtocolObject<dyn MTLDevice>) -> bool {
+        match self.backend {
+            UpscalerBackend::Scalar => false,
+            UpscalerBackend::SimdgroupMatrix => true,
+            UpscalerBackend::Auto => match std::env::var("ERIKA_SR_BACKEND").as_deref() {
+                Ok("scalar") => false,
+                Ok("matmul") => true,
+                _ => device.supportsFamily(objc2_metal::MTLGPUFamily::Apple7),
+            },
+        }
+    }
+
+    /// Polls the background build, spawning one if necessary. Returns
+    /// `Ok(true)` once matching resources are installed.
+    fn poll_pending_build(
+        &mut self,
+        device: &ProtocolObject<dyn MTLDevice>,
+        mode: LumaUpscalerMode,
+        matmul: bool,
+    ) -> Result<bool> {
+        if let Some(pending) = self.pending.as_ref() {
+            if pending.mode != mode || pending.matmul != matmul {
+                // Stale build for a previous configuration; drop the handle
+                // and let the thread's result fall on the floor.
+                self.pending = None;
+            }
+        }
+        if let Some(pending) = self.pending.as_ref() {
+            let finished = pending.slot.lock().expect("build slot poisoned").take();
+            return match finished {
+                Some(Ok(resources)) => {
+                    self.pending = None;
+                    self.resources = Some(resources.0);
+                    Ok(true)
+                }
+                Some(Err(error)) => {
+                    self.pending = None;
+                    Err(error)
+                }
+                None => Ok(false),
+            };
+        }
+
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let thread_slot = std::sync::Arc::clone(&slot);
+        let thread_device = SendDevice(device.retain());
+        std::thread::Builder::new()
+            .name("erika-upscaler-build".to_string())
+            .spawn(move || {
+                let device = thread_device;
+                let result = build_backend(&device.0, mode, matmul).map(SendResources);
+                *thread_slot.lock().expect("build slot poisoned") = Some(result);
+            })
+            .map_err(|error| {
+                PlayerError::Renderer(format!("upscaler build thread spawn failed: {error}"))
+            })?;
+        self.pending = Some(PendingBuild { mode, matmul, slot });
+        Ok(false)
+    }
+
+    /// Builds the active configuration synchronously. Intended for tests and
+    /// benchmarks; playback uses the background build instead.
+    pub fn prepare_blocking(&mut self, device: &ProtocolObject<dyn MTLDevice>) -> Result<()> {
+        if self.mode == LumaUpscalerMode::Off {
+            return Ok(());
+        }
+        let mode = self.mode;
+        let matmul = self.wants_matmul(device);
+        let resources_match = match self.resources.as_ref() {
+            Some(BackendResources::Scalar(resources)) => !matmul && resources.mode == mode,
+            Some(BackendResources::Matmul(resources)) => matmul && resources.mode() == mode,
+            None => false,
+        };
+        if !resources_match {
+            self.pending = None;
+            self.resources = Some(build_backend(device, mode, matmul)?);
+        }
+        Ok(())
     }
 
     /// Encodes the 2x luma upscale onto `command_buffer` and returns the
@@ -194,15 +382,34 @@ impl LumaUpscaler {
             return Ok(None);
         }
         let mode = self.mode;
-        if self
-            .resources
-            .as_ref()
-            .map(|resources| resources.mode != mode)
-            .unwrap_or(true)
-        {
-            self.resources = Some(build_resources(device, mode)?);
+        let want_matmul = self.wants_matmul(device);
+        let resources_match = match self.resources.as_ref() {
+            Some(BackendResources::Scalar(resources)) => !want_matmul && resources.mode == mode,
+            Some(BackendResources::Matmul(resources)) => want_matmul && resources.mode() == mode,
+            None => false,
+        };
+        if !resources_match {
+            self.resources = None;
+            if !self.poll_pending_build(device, mode, want_matmul)? {
+                // Still compiling on the background thread; render this frame
+                // without upscaling.
+                return Ok(None);
+            }
         }
-        let resources = self.resources.as_mut().expect("resources built above");
+        let resources = match self.resources.as_mut().expect("resources built above") {
+            BackendResources::Matmul(resources) => {
+                return matmul::encode(
+                    resources,
+                    device,
+                    command_buffer,
+                    luma,
+                    output_format,
+                    frame_token,
+                )
+                .map(Some);
+            }
+            BackendResources::Scalar(resources) => resources,
+        };
 
         let width = luma.width();
         let height = luma.height();

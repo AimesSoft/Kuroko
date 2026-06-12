@@ -84,8 +84,12 @@ resolution, so the window (in physical pixels) must be larger than the source.
 `gpu_frame_ms` samples completed command buffers; ticks that reuse the cached
 upscale dominate those samples, so use
 `cargo test --release -p erika --test artcnn_upscaler -- --ignored --nocapture bench`
-for the isolated GPU cost of the network itself. `ERIKA_SR_BLOCK=WxH`
-overrides the per-thread output block size for tuning experiments.
+for the isolated GPU cost of the network itself.
+
+Tuning knobs for kernel experiments: `ERIKA_SR_BACKEND=scalar|matmul` forces a
+kernel backend (default: matmul on Apple Silicon), `ERIKA_SR_BLOCK=WxH` sets
+the scalar backend's per-thread output block, `ERIKA_SR_PXF=N` sets the matmul
+backend's pixel fragments per simdgroup.
 
 ## Atlas prewarm comparison
 

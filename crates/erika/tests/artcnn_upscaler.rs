@@ -16,7 +16,7 @@ use objc2_metal::{
 };
 
 use erika::renderer::metal::LumaUpscalerMode;
-use erika::renderer::metal::upscaler::LumaUpscaler;
+use erika::renderer::metal::upscaler::{LumaUpscaler, UpscalerBackend};
 
 const WIDTH: usize = 128;
 const HEIGHT: usize = 72;
@@ -28,11 +28,17 @@ fn load_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn run_upscaler(mode: LumaUpscalerMode, input: &[f32]) -> Vec<f32> {
-    run_upscaler_sized(mode, input, WIDTH, HEIGHT)
+fn run_upscaler(mode: LumaUpscalerMode, backend: UpscalerBackend, input: &[f32]) -> Vec<f32> {
+    run_upscaler_sized(mode, backend, input, WIDTH, HEIGHT)
 }
 
-fn run_upscaler_sized(mode: LumaUpscalerMode, input: &[f32], width: usize, height: usize) -> Vec<f32> {
+fn run_upscaler_sized(
+    mode: LumaUpscalerMode,
+    backend: UpscalerBackend,
+    input: &[f32],
+    width: usize,
+    height: usize,
+) -> Vec<f32> {
     let device = MTLCreateSystemDefaultDevice().expect("Metal device");
     let queue = device.newCommandQueue().expect("command queue");
 
@@ -74,6 +80,8 @@ fn run_upscaler_sized(mode: LumaUpscalerMode, input: &[f32], width: usize, heigh
 
     let mut upscaler = LumaUpscaler::default();
     upscaler.set_mode(mode);
+    upscaler.set_backend(backend);
+    upscaler.prepare_blocking(&device).expect("prepare upscaler");
     let command_buffer = queue.commandBuffer().expect("command buffer");
     // R16Float output isolates kernel error from output quantization.
     let output: Retained<ProtocolObject<dyn MTLTexture>> = upscaler
@@ -167,13 +175,18 @@ fn compare(actual: &[f32], expected: &[f32]) -> ErrorStats {
     }
 }
 
-fn check_against_reference(mode: LumaUpscalerMode, input: &[u8], expected: &[u8]) {
+fn check_against_reference(
+    mode: LumaUpscalerMode,
+    backend: UpscalerBackend,
+    input: &[u8],
+    expected: &[u8],
+) {
     let input = load_f32(input);
     let expected = load_f32(expected);
-    let actual = run_upscaler(mode, &input);
+    let actual = run_upscaler(mode, backend, &input);
     let stats = compare(&actual, &expected);
     eprintln!(
-        "{mode:?}: mae={:.6} max={:.6} psnr={:.2} dB",
+        "{mode:?}/{backend:?}: mae={:.6} max={:.6} psnr={:.2} dB",
         stats.mae, stats.max, stats.psnr
     );
     // fp16 accumulation against an fp32 onnxruntime reference: demand well
@@ -183,18 +196,40 @@ fn check_against_reference(mode: LumaUpscalerMode, input: &[u8], expected: &[u8]
 }
 
 #[test]
-fn artcnn_c4f16_matches_onnx_reference() {
+fn artcnn_c4f16_scalar_matches_onnx_reference() {
     check_against_reference(
         LumaUpscalerMode::ArtCnnC4F16,
+        UpscalerBackend::Scalar,
         include_bytes!("data/artcnn/c4f16/input_128x72.f32"),
         include_bytes!("data/artcnn/c4f16/output_256x144.f32"),
     );
 }
 
 #[test]
-fn artcnn_c4f32_matches_onnx_reference() {
+fn artcnn_c4f32_scalar_matches_onnx_reference() {
     check_against_reference(
         LumaUpscalerMode::ArtCnnC4F32,
+        UpscalerBackend::Scalar,
+        include_bytes!("data/artcnn/c4f32/input_128x72.f32"),
+        include_bytes!("data/artcnn/c4f32/output_256x144.f32"),
+    );
+}
+
+#[test]
+fn artcnn_c4f16_matmul_matches_onnx_reference() {
+    check_against_reference(
+        LumaUpscalerMode::ArtCnnC4F16,
+        UpscalerBackend::SimdgroupMatrix,
+        include_bytes!("data/artcnn/c4f16/input_128x72.f32"),
+        include_bytes!("data/artcnn/c4f16/output_256x144.f32"),
+    );
+}
+
+#[test]
+fn artcnn_c4f32_matmul_matches_onnx_reference() {
+    check_against_reference(
+        LumaUpscalerMode::ArtCnnC4F32,
+        UpscalerBackend::SimdgroupMatrix,
         include_bytes!("data/artcnn/c4f32/input_128x72.f32"),
         include_bytes!("data/artcnn/c4f32/output_256x144.f32"),
     );
@@ -205,13 +240,21 @@ fn artcnn_c4f32_matches_onnx_reference() {
 #[test]
 #[ignore]
 fn bench_1080p_gpu_time() {
-    for mode in [LumaUpscalerMode::ArtCnnC4F16, LumaUpscalerMode::ArtCnnC4F32] {
-        bench_mode(mode, 1920, 1080, 30);
-        bench_mode(mode, 960, 540, 30);
+    for backend in [UpscalerBackend::Scalar, UpscalerBackend::SimdgroupMatrix] {
+        for mode in [LumaUpscalerMode::ArtCnnC4F16, LumaUpscalerMode::ArtCnnC4F32] {
+            bench_mode(mode, backend, 1920, 1080, 30);
+            bench_mode(mode, backend, 960, 540, 30);
+        }
     }
 }
 
-fn bench_mode(mode: LumaUpscalerMode, width: usize, height: usize, frames: usize) {
+fn bench_mode(
+    mode: LumaUpscalerMode,
+    backend: UpscalerBackend,
+    width: usize,
+    height: usize,
+    frames: usize,
+) {
     let device = MTLCreateSystemDefaultDevice().expect("Metal device");
     let queue = device.newCommandQueue().expect("command queue");
     let descriptor = unsafe {
@@ -247,6 +290,8 @@ fn bench_mode(mode: LumaUpscalerMode, width: usize, height: usize, frames: usize
 
     let mut upscaler = LumaUpscaler::default();
     upscaler.set_mode(mode);
+    upscaler.set_backend(backend);
+    upscaler.prepare_blocking(&device).expect("prepare upscaler");
     let mut gpu_seconds = Vec::new();
     for frame in 0..frames {
         let command_buffer = queue.commandBuffer().expect("command buffer");
@@ -263,7 +308,7 @@ fn bench_mode(mode: LumaUpscalerMode, width: usize, height: usize, frames: usize
     let avg = gpu_seconds.iter().sum::<f64>() / gpu_seconds.len() as f64;
     let min = gpu_seconds.iter().cloned().fold(f64::MAX, f64::min);
     eprintln!(
-        "{mode:?} {width}x{height}: gpu avg={:.3} ms min={:.3} ms",
+        "{mode:?}/{backend:?} {width}x{height}: gpu avg={:.3} ms min={:.3} ms",
         avg * 1e3,
         min * 1e3
     );
@@ -284,9 +329,14 @@ fn dump_upscaled_from_env() {
         Ok("c4f32") => LumaUpscalerMode::ArtCnnC4F32,
         _ => LumaUpscalerMode::ArtCnnC4F16,
     };
+    let backend = match std::env::var("ERIKA_SR_TEST_BACKEND").as_deref() {
+        Ok("scalar") => UpscalerBackend::Scalar,
+        Ok("matmul") => UpscalerBackend::SimdgroupMatrix,
+        _ => UpscalerBackend::Auto,
+    };
     let input = load_f32(&std::fs::read(&input_path).expect("read input"));
     assert_eq!(input.len(), width * height, "input size mismatch");
-    let output = run_upscaler_sized(mode, &input, width, height);
+    let output = run_upscaler_sized(mode, backend, &input, width, height);
     let bytes: Vec<u8> = output.iter().flat_map(|v| v.to_le_bytes()).collect();
     std::fs::write(&output_path, bytes).expect("write output");
     eprintln!("wrote {}x{} -> {}", width * 2, height * 2, output_path);

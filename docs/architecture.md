@@ -127,7 +127,10 @@ The primary renderer for Apple platforms:
   resolution; the network output is cached per decoded frame so repeated vsync
   ticks of the same frame skip the compute. Weights are converted from the
   upstream ONNX releases (`assets/artcnn/`) and verified against onnxruntime
-  references (`tests/artcnn_upscaler.rs`).
+  references (`tests/artcnn_upscaler.rs`). Two kernel backends: a
+  `simdgroup_matrix` matmul implementation (default on Apple Silicon) and a
+  scalar texture fallback; both are compiled on a background thread, so
+  playback continues unscaled until the pipelines are ready.
 - Subtitle overlay: RGBA plane upload and alpha blending.
 - Danmaku: Instanced glyph quad drawing from atlas (shadow → outline → fill passes).
 - Presentation layout preserves source aspect ratio.
