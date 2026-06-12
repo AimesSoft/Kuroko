@@ -11,12 +11,12 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLOrigin, MTLPixelFormat, MTLRegion,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLOrigin, MTLPixelFormat, MTLRegion,
     MTLResourceOptions, MTLSize, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
 
-use erika::renderer::metal::LumaUpscalerMode;
 use erika::renderer::metal::upscaler::{LumaUpscaler, UpscalerBackend};
+use erika::renderer::metal::LumaUpscalerMode;
 
 const WIDTH: usize = 128;
 const HEIGHT: usize = 72;
@@ -30,6 +30,12 @@ fn load_f32(bytes: &[u8]) -> Vec<f32> {
 
 fn run_upscaler(mode: LumaUpscalerMode, backend: UpscalerBackend, input: &[f32]) -> Vec<f32> {
     run_upscaler_sized(mode, backend, input, WIDTH, HEIGHT)
+}
+
+fn system_supports_simdgroup_matrix() -> bool {
+    MTLCreateSystemDefaultDevice()
+        .expect("Metal device")
+        .supportsFamily(MTLGPUFamily::Apple7)
 }
 
 fn run_upscaler_sized(
@@ -81,7 +87,9 @@ fn run_upscaler_sized(
     let mut upscaler = LumaUpscaler::default();
     upscaler.set_mode(mode);
     upscaler.set_backend(backend);
-    upscaler.prepare_blocking(&device).expect("prepare upscaler");
+    upscaler
+        .prepare_blocking(&device)
+        .expect("prepare upscaler");
     let command_buffer = queue.commandBuffer().expect("command buffer");
     // R16Float output isolates kernel error from output quantization.
     let output: Retained<ProtocolObject<dyn MTLTexture>> = upscaler
@@ -181,6 +189,10 @@ fn check_against_reference(
     input: &[u8],
     expected: &[u8],
 ) {
+    if backend == UpscalerBackend::SimdgroupMatrix && !system_supports_simdgroup_matrix() {
+        eprintln!("skipping {mode:?}/SimdgroupMatrix: GPU family lacks simdgroup_matrix support");
+        return;
+    }
     let input = load_f32(input);
     let expected = load_f32(expected);
     let actual = run_upscaler(mode, backend, &input);
@@ -291,7 +303,9 @@ fn bench_mode(
     let mut upscaler = LumaUpscaler::default();
     upscaler.set_mode(mode);
     upscaler.set_backend(backend);
-    upscaler.prepare_blocking(&device).expect("prepare upscaler");
+    upscaler
+        .prepare_blocking(&device)
+        .expect("prepare upscaler");
     let mut gpu_seconds = Vec::new();
     for frame in 0..frames {
         let command_buffer = queue.commandBuffer().expect("command buffer");

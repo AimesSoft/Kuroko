@@ -23,9 +23,9 @@ use std::ffi::c_void;
 use std::mem;
 use std::ptr::NonNull;
 
-use objc2::Message;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
+use objc2::Message;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder,
@@ -164,12 +164,19 @@ struct PendingBuild {
     slot: std::sync::Arc<std::sync::Mutex<Option<Result<SendResources>>>>,
 }
 
+#[derive(Clone, Copy)]
+struct BackendChoice {
+    matmul: bool,
+    fallback_to_scalar: bool,
+}
+
 #[derive(Default)]
 pub struct LumaUpscaler {
     mode: LumaUpscalerMode,
     backend: UpscalerBackend,
     resources: Option<BackendResources>,
     pending: Option<PendingBuild>,
+    auto_matmul_failed: bool,
 }
 
 fn blob_for_mode(mode: LumaUpscalerMode) -> Option<(&'static [u8], u32)> {
@@ -254,6 +261,7 @@ impl LumaUpscaler {
             self.mode = mode;
             self.resources = None;
             self.pending = None;
+            self.auto_matmul_failed = false;
         }
     }
 
@@ -266,6 +274,7 @@ impl LumaUpscaler {
             self.backend = backend;
             self.resources = None;
             self.pending = None;
+            self.auto_matmul_failed = false;
         }
     }
 
@@ -273,14 +282,30 @@ impl LumaUpscaler {
         self.backend
     }
 
-    fn wants_matmul(&self, device: &ProtocolObject<dyn MTLDevice>) -> bool {
+    fn backend_choice(&self, device: &ProtocolObject<dyn MTLDevice>) -> BackendChoice {
         match self.backend {
-            UpscalerBackend::Scalar => false,
-            UpscalerBackend::SimdgroupMatrix => true,
+            UpscalerBackend::Scalar => BackendChoice {
+                matmul: false,
+                fallback_to_scalar: false,
+            },
+            UpscalerBackend::SimdgroupMatrix => BackendChoice {
+                matmul: true,
+                fallback_to_scalar: false,
+            },
             UpscalerBackend::Auto => match std::env::var("ERIKA_SR_BACKEND").as_deref() {
-                Ok("scalar") => false,
-                Ok("matmul") => true,
-                _ => device.supportsFamily(objc2_metal::MTLGPUFamily::Apple7),
+                Ok("scalar") => BackendChoice {
+                    matmul: false,
+                    fallback_to_scalar: false,
+                },
+                Ok("matmul") => BackendChoice {
+                    matmul: true,
+                    fallback_to_scalar: false,
+                },
+                _ => BackendChoice {
+                    matmul: !self.auto_matmul_failed
+                        && device.supportsFamily(objc2_metal::MTLGPUFamily::Apple7),
+                    fallback_to_scalar: true,
+                },
             },
         }
     }
@@ -340,15 +365,22 @@ impl LumaUpscaler {
             return Ok(());
         }
         let mode = self.mode;
-        let matmul = self.wants_matmul(device);
+        let choice = self.backend_choice(device);
         let resources_match = match self.resources.as_ref() {
-            Some(BackendResources::Scalar(resources)) => !matmul && resources.mode == mode,
-            Some(BackendResources::Matmul(resources)) => matmul && resources.mode() == mode,
+            Some(BackendResources::Scalar(resources)) => !choice.matmul && resources.mode == mode,
+            Some(BackendResources::Matmul(resources)) => choice.matmul && resources.mode() == mode,
             None => false,
         };
         if !resources_match {
             self.pending = None;
-            self.resources = Some(build_backend(device, mode, matmul)?);
+            self.resources = match build_backend(device, mode, choice.matmul) {
+                Ok(resources) => Some(resources),
+                Err(_error) if choice.matmul && choice.fallback_to_scalar => {
+                    self.auto_matmul_failed = true;
+                    Some(build_backend(device, mode, false)?)
+                }
+                Err(error) => return Err(error),
+            };
         }
         Ok(())
     }
@@ -382,18 +414,30 @@ impl LumaUpscaler {
             return Ok(None);
         }
         let mode = self.mode;
-        let want_matmul = self.wants_matmul(device);
+        let choice = self.backend_choice(device);
         let resources_match = match self.resources.as_ref() {
-            Some(BackendResources::Scalar(resources)) => !want_matmul && resources.mode == mode,
-            Some(BackendResources::Matmul(resources)) => want_matmul && resources.mode() == mode,
+            Some(BackendResources::Scalar(resources)) => !choice.matmul && resources.mode == mode,
+            Some(BackendResources::Matmul(resources)) => choice.matmul && resources.mode() == mode,
             None => false,
         };
         if !resources_match {
             self.resources = None;
-            if !self.poll_pending_build(device, mode, want_matmul)? {
-                // Still compiling on the background thread; render this frame
-                // without upscaling.
-                return Ok(None);
+            match self.poll_pending_build(device, mode, choice.matmul) {
+                Ok(true) => {}
+                Ok(false) => {
+                    // Still compiling on the background thread; render this
+                    // frame without upscaling.
+                    return Ok(None);
+                }
+                Err(_error) if choice.matmul && choice.fallback_to_scalar => {
+                    self.auto_matmul_failed = true;
+                    self.resources = None;
+                    self.pending = None;
+                    if !self.poll_pending_build(device, mode, false)? {
+                        return Ok(None);
+                    }
+                }
+                Err(error) => return Err(error),
             }
         }
         let resources = match self.resources.as_mut().expect("resources built above") {
@@ -615,12 +659,13 @@ fn ensure_pool(
     };
 
     let output_descriptor = unsafe {
-        let descriptor = MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
-            output_format,
-            width * 2,
-            height * 2,
-            false,
-        );
+        let descriptor =
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                output_format,
+                width * 2,
+                height * 2,
+                false,
+            );
         descriptor.setStorageMode(MTLStorageMode::Private);
         descriptor.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite);
         descriptor
