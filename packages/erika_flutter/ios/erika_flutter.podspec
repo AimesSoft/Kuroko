@@ -13,6 +13,7 @@ Pod::Spec.new do |s|
     erika_presenter_destroy
     erika_presenter_detach_surface
     erika_presenter_get_danmaku_config
+    erika_presenter_get_upscaler_status
     erika_presenter_load_danmaku_file
     erika_presenter_load_danmaku_json
     erika_presenter_open
@@ -34,6 +35,7 @@ Pod::Spec.new do |s|
     erika_presenter_set_danmaku_track_enabled
     erika_presenter_set_danmaku_track_offset
     erika_presenter_set_playback_rate
+    erika_presenter_set_upscaler
     erika_presenter_set_volume
     erika_presenter_stop
     erika_presenter_track_selection

@@ -199,6 +199,15 @@ private struct ErikaPresenterStatsC {
   var audioFailures: UInt64 = 0
 }
 
+private struct ErikaUpscalerStatusC {
+  var requestedMode: Int32 = 0
+  var activeBackend: Int32 = 0
+  var fallbackCount: UInt64 = 0
+  var upscaledFrames: UInt64 = 0
+  var lastEncodeMicros: UInt64 = 0
+  var lastGpuMicros: UInt64 = 0
+}
+
 private let erikaDefaultDisplayFps = 60
 
 private struct ErikaDanmakuConfigC {
@@ -279,6 +288,8 @@ private final class ErikaNativeLibrary {
   typealias SeekFn = @convention(c) (UnsafeMutableRawPointer?, UInt64) -> Int32
   typealias SetPlaybackRateFn = @convention(c) (UnsafeMutableRawPointer?, Double) -> Int32
   typealias SetVolumeFn = @convention(c) (UnsafeMutableRawPointer?, Double) -> Int32
+  typealias SetUpscalerFn = @convention(c) (UnsafeMutableRawPointer?, Int32) -> Int32
+  typealias GetUpscalerStatusFn = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Int32
   typealias SelectTrackFn = @convention(c) (UnsafeMutableRawPointer?, Int64) -> Int32
   typealias AddExternalSubtitleFn = @convention(c) (
     UnsafeMutableRawPointer?,
@@ -335,6 +346,8 @@ private final class ErikaNativeLibrary {
   let seek: SeekFn
   let setPlaybackRate: SetPlaybackRateFn?
   let setVolume: SetVolumeFn?
+  let setUpscaler: SetUpscalerFn?
+  let getUpscalerStatus: GetUpscalerStatusFn?
   let selectAudioTrack: SelectTrackFn
   let selectSubtitleTrack: SelectTrackFn
   let addExternalSubtitle: AddExternalSubtitleFn
@@ -387,6 +400,8 @@ private final class ErikaNativeLibrary {
     seek = try Self.load("erika_presenter_seek", from: libraryHandle, as: SeekFn.self)
     setPlaybackRate = Self.loadOptional("erika_presenter_set_playback_rate", from: libraryHandle, as: SetPlaybackRateFn.self)
     setVolume = Self.loadOptional("erika_presenter_set_volume", from: libraryHandle, as: SetVolumeFn.self)
+    setUpscaler = Self.loadOptional("erika_presenter_set_upscaler", from: libraryHandle, as: SetUpscalerFn.self)
+    getUpscalerStatus = Self.loadOptional("erika_presenter_get_upscaler_status", from: libraryHandle, as: GetUpscalerStatusFn.self)
     selectAudioTrack = try Self.load("erika_presenter_select_audio_track", from: libraryHandle, as: SelectTrackFn.self)
     selectSubtitleTrack = try Self.load("erika_presenter_select_subtitle_track", from: libraryHandle, as: SelectTrackFn.self)
     addExternalSubtitle = try Self.load("erika_presenter_add_external_subtitle", from: libraryHandle, as: AddExternalSubtitleFn.self)
@@ -546,6 +561,25 @@ private final class ErikaPlayerHost {
     }
     let clampedVolume = volume.isFinite ? min(max(volume, 0.0), 1.0) : 1.0
     try check(setVolume(handle, clampedVolume), operation: "set_volume")
+  }
+
+  func setUpscaler(mode: Int32) throws {
+    guard let setUpscaler = library.setUpscaler else {
+      throw ErikaPluginError.symbolMissing("erika_presenter_set_upscaler")
+    }
+    try check(setUpscaler(handle, mode), operation: "set_upscaler")
+  }
+
+  func upscalerStatus() throws -> [String: Any] {
+    guard let getStatus = library.getUpscalerStatus else {
+      throw ErikaPluginError.symbolMissing("erika_presenter_get_upscaler_status")
+    }
+    var status = ErikaUpscalerStatusC()
+    let result = withUnsafeMutablePointer(to: &status) { pointer in
+      getStatus(handle, UnsafeMutableRawPointer(pointer))
+    }
+    try check(result, operation: "get_upscaler_status")
+    return status.toFlutterMap()
   }
 
   func addExternalSubtitle(uri: String) throws -> Int64 {
@@ -1115,6 +1149,16 @@ public final class ErikaFlutterPlugin: NSObject, FlutterPlugin, FlutterStreamHan
         }
         try playerHost(from: args).setVolume(volume)
         result(nil)
+      case "setUpscaler":
+        let args = try dictionaryArgs(call.arguments)
+        guard let mode = int32Value(args["mode"]) else {
+          throw ErikaPluginError.invalidArguments("mode is required.")
+        }
+        try playerHost(from: args).setUpscaler(mode: mode)
+        result(nil)
+      case "getUpscalerStatus":
+        let args = try dictionaryArgs(call.arguments)
+        result(try playerHost(from: args).upscalerStatus())
       case "addExternalSubtitle":
         let args = try dictionaryArgs(call.arguments)
         guard let uri = args["uri"] as? String, !uri.isEmpty else {
@@ -1556,6 +1600,19 @@ private extension ErikaEventC {
 private extension ErikaTrackSelectionC {
   func toFlutterMap() -> [String: Any] {
     ["video": Int(video), "audio": Int(audio), "subtitle": Int(subtitle)]
+  }
+}
+
+private extension ErikaUpscalerStatusC {
+  func toFlutterMap() -> [String: Any] {
+    [
+      "requestedMode": Int(requestedMode),
+      "activeBackend": Int(activeBackend),
+      "fallbackCount": Int64(clamping: fallbackCount),
+      "upscaledFrames": Int64(clamping: upscaledFrames),
+      "lastEncodeMicros": Int64(clamping: lastEncodeMicros),
+      "lastGpuMicros": Int64(clamping: lastGpuMicros),
+    ]
   }
 }
 

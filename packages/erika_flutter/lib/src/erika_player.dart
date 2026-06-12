@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -14,6 +13,83 @@ enum ErikaOutputMode {
   const ErikaOutputMode(this.nativeValue);
 
   final int nativeValue;
+}
+
+enum ErikaUpscalerMode {
+  off(0),
+  artCnnC4F16(1),
+  artCnnC4F32(2);
+
+  const ErikaUpscalerMode(this.nativeValue);
+
+  final int nativeValue;
+
+  static ErikaUpscalerMode fromNativeValue(int value) {
+    return switch (value) {
+      1 => ErikaUpscalerMode.artCnnC4F16,
+      2 => ErikaUpscalerMode.artCnnC4F32,
+      _ => ErikaUpscalerMode.off,
+    };
+  }
+}
+
+enum ErikaUpscalerBackendStatus {
+  off(0),
+  inactive(1),
+  building(2),
+  scalar(3),
+  simdgroupMatrix(4);
+
+  const ErikaUpscalerBackendStatus(this.nativeValue);
+
+  final int nativeValue;
+
+  static ErikaUpscalerBackendStatus fromNativeValue(int value) {
+    return switch (value) {
+      1 => ErikaUpscalerBackendStatus.inactive,
+      2 => ErikaUpscalerBackendStatus.building,
+      3 => ErikaUpscalerBackendStatus.scalar,
+      4 => ErikaUpscalerBackendStatus.simdgroupMatrix,
+      _ => ErikaUpscalerBackendStatus.off,
+    };
+  }
+}
+
+class ErikaUpscalerStatus {
+  const ErikaUpscalerStatus({
+    required this.requestedMode,
+    required this.activeBackend,
+    required this.fallbackCount,
+    required this.upscaledFrames,
+    required this.lastEncodeDuration,
+    required this.lastGpuDuration,
+  });
+
+  final ErikaUpscalerMode requestedMode;
+  final ErikaUpscalerBackendStatus activeBackend;
+  final int fallbackCount;
+  final int upscaledFrames;
+  final Duration lastEncodeDuration;
+  final Duration lastGpuDuration;
+
+  factory ErikaUpscalerStatus.fromMap(Map<dynamic, dynamic> map) {
+    return ErikaUpscalerStatus(
+      requestedMode: ErikaUpscalerMode.fromNativeValue(
+        (map['requestedMode'] as num?)?.toInt() ?? 0,
+      ),
+      activeBackend: ErikaUpscalerBackendStatus.fromNativeValue(
+        (map['activeBackend'] as num?)?.toInt() ?? 0,
+      ),
+      fallbackCount: (map['fallbackCount'] as num?)?.toInt() ?? 0,
+      upscaledFrames: (map['upscaledFrames'] as num?)?.toInt() ?? 0,
+      lastEncodeDuration: Duration(
+        microseconds: (map['lastEncodeMicros'] as num?)?.toInt() ?? 0,
+      ),
+      lastGpuDuration: Duration(
+        microseconds: (map['lastGpuMicros'] as num?)?.toInt() ?? 0,
+      ),
+    );
+  }
 }
 
 class ErikaDanmakuTrackInfo {
@@ -351,6 +427,26 @@ class ErikaPlayer {
       'playerId': playerId,
       'volume': volume.clamp(0.0, 1.0),
     });
+  }
+
+  Future<void> setUpscaler(ErikaUpscalerMode mode) async {
+    final playerId = await ensureCreated();
+    await _invoke('setUpscaler', <String, Object?>{
+      'playerId': playerId,
+      'mode': mode.nativeValue,
+    });
+  }
+
+  Future<ErikaUpscalerStatus> getUpscalerStatus() async {
+    final playerId = await ensureCreated();
+    final status = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+      'getUpscalerStatus',
+      <String, Object?>{'playerId': playerId},
+    );
+    if (status == null) {
+      throw StateError('Erika upscaler status returned null.');
+    }
+    return ErikaUpscalerStatus.fromMap(status);
   }
 
   Future<Uint8List?> screenshot({int? viewId}) async {

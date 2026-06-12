@@ -164,6 +164,61 @@ void main() {
     await player.dispose();
   });
 
+  test('upscaler mode is forwarded to native presenter', () async {
+    final player = ErikaPlayer();
+
+    await player.setUpscaler(ErikaUpscalerMode.artCnnC4F16);
+
+    final call = playerCalls.singleWhere(
+      (MethodCall call) => call.method == 'setUpscaler',
+    );
+    expect(call.arguments, <String, Object?>{
+      'playerId': 7,
+      'mode': ErikaUpscalerMode.artCnnC4F16.nativeValue,
+    });
+
+    await player.dispose();
+  });
+
+  test('upscaler status is decoded from native presenter', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(playerChannel, (MethodCall call) async {
+      playerCalls.add(call);
+      return switch (call.method) {
+        'create' => 7,
+        'getUpscalerStatus' => <String, Object?>{
+            'requestedMode': ErikaUpscalerMode.artCnnC4F32.nativeValue,
+            'activeBackend':
+                ErikaUpscalerBackendStatus.simdgroupMatrix.nativeValue,
+            'fallbackCount': 1,
+            'upscaledFrames': 42,
+            'lastEncodeMicros': 1200,
+            'lastGpuMicros': 3400,
+          },
+        'dispose' => null,
+        _ => null,
+      };
+    });
+
+    final player = ErikaPlayer();
+
+    final status = await player.getUpscalerStatus();
+
+    expect(status.requestedMode, ErikaUpscalerMode.artCnnC4F32);
+    expect(status.activeBackend, ErikaUpscalerBackendStatus.simdgroupMatrix);
+    expect(status.fallbackCount, 1);
+    expect(status.upscaledFrames, 42);
+    expect(status.lastEncodeDuration, const Duration(microseconds: 1200));
+    expect(status.lastGpuDuration, const Duration(microseconds: 3400));
+
+    final call = playerCalls.singleWhere(
+      (MethodCall call) => call.method == 'getUpscalerStatus',
+    );
+    expect(call.arguments, <String, Object?>{'playerId': 7});
+
+    await player.dispose();
+  });
+
   test('danmaku config forwards block words as json', () async {
     final player = ErikaPlayer();
 

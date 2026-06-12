@@ -46,3 +46,15 @@ final player = ErikaPlayer(
 ```
 
 Use `ErikaOutputMode.sdr` to force SDR output.
+
+## Upscaler
+
+Enable ArtCNN upscaling from Dart after creating a player:
+
+```dart
+await player.setUpscaler(ErikaUpscalerMode.artCnnC4F16);
+```
+
+Use `ErikaUpscalerMode.off` to disable it. Call
+`player.getUpscalerStatus()` to inspect the requested mode, active backend,
+fallback count, upscaled frame count, and recent GPU timings.
