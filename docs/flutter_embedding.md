@@ -113,6 +113,13 @@ await player.seek(Duration(seconds: 30));
 await player.setVolume(0.8);
 await player.setPlaybackRate(1.5);
 
+// Neural upscaler (anime luma 2x; macOS/iOS only)
+await player.setUpscaler(ErikaUpscalerMode.artCnnC4F16); // off / artCnnC4F16 / artCnnC4F32
+final status = await player.getUpscalerStatus();
+// status.requestedMode  -- what was requested
+// status.activeBackend  -- off / inactive / building / scalar / simdgroupMatrix
+// status.upscaledFrames -- frames produced by the network so far
+
 // Track management
 final tracks = await player.tracks();
 await player.selectAudioTrack(trackId);
@@ -131,6 +138,25 @@ player.events.listen((event) {
 
 await player.dispose();
 ```
+
+## Neural Upscaler Status
+
+`setUpscaler` requests a mode; the kernels are compiled on a background thread,
+so the host should poll `getUpscalerStatus` to drive its UI:
+
+| `activeBackend` | Meaning |
+|-----------------|---------|
+| `off` | No mode requested. |
+| `building` | Kernels compiling (first use of a mode); frames render unscaled until ready. |
+| `inactive` | Mode requested but not applied this frame — e.g. the video is not displayed above its source resolution, or the source is HDR (upscaler runs on SDR luma only). |
+| `scalar` | Running on the portable scalar backend (non-Apple-Silicon GPUs). |
+| `simdgroupMatrix` | Running on the `simdgroup_matrix` backend (Apple Silicon default). |
+
+The upscaler only engages when the drawable shows the video larger than its
+source resolution, so a 1080p source in a 1080p (or smaller) view stays
+`inactive`. C4F16 is the real-time recommendation; C4F32 is higher quality but
+needs an M-Pro/Max-class GPU at 1080p input. See `docs/architecture.md` for the
+renderer-side design.
 
 ## Ownership Rule
 

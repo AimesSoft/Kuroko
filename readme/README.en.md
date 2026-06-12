@@ -12,11 +12,12 @@ Erika is a standalone media playback engine that gives applications full playbac
 - **Zero-copy rendering** -- CVPixelBuffer to MTLTexture passthrough, video frames never round-trip through CPU memory
 - **HDR/EDR output** -- native Apple EDR support, PQ (BT.2020) metadata preservation and tone mapping
 - **Native Metal renderer** -- YCbCr sampling, color space conversion, tone mapping, subtitle/danmaku compositing in a single render pass
+- **Neural upscaling** -- ArtCNN anime luma 2x super-resolution, Metal compute kernels, simdgroup-matrix and scalar backends, luma-plane-only and zero-copy into the render pipeline
 - **Audio output** -- CoreAudio (macOS) / AudioQueue (iOS), f32 PCM ring buffer, audio clock synchronization
 - **Subtitles** -- SRT / WebVTT / ASS parsing, libass rendering (statically linked), embedded and external subtitle tracks
 - **Danmaku** -- Bilibili XML / JSON parsing, DFM+ collision-aware lane layout engine, glyph atlas native GPU rendering
 - **Playback engine** -- play / pause / stop / seek / rate control, audio-master clock discipline, vsync-quantized frame scheduling
-- **C ABI** -- 61 exported functions, opaque handle design, callable from C / C++ / Swift / Dart FFI / any FFI-capable language
+- **C ABI** -- 63 exported functions, opaque handle design, callable from C / C++ / Swift / Dart FFI / any FFI-capable language
 - **Flutter plugin** -- macOS + iOS native view embedding, HDR native layer path support
 - **wgpu backend** -- cross-platform rendering foundation in place (Windows / Linux / Android direction)
 
