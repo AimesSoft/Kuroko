@@ -830,7 +830,39 @@ fn apply_meson_apple_target(
         return Ok(());
     };
     command.arg("--cross-file").arg(cross_file);
+    // Cross builds (e.g. iOS) compile native generator tools such as FriBidi's
+    // gen.tab on the build machine. Provide an explicit build-machine compiler
+    // pinned to the macOS SDK so the iOS SDKROOT we export below does not make
+    // those native tools target iOS and fail to run.
+    let native_file = meson_native_file(layout, name)?;
+    command.arg("--native-file").arg(native_file);
     apply_apple_target_env(command, target)
+}
+
+fn meson_native_file(layout: &WorkspaceLayout, name: &str) -> Result<PathBuf> {
+    let sdk_root = xcrun("macosx", &["--show-sdk-path"])?;
+    let clang = xcrun("macosx", &["-f", "clang"])?;
+    let clangxx = xcrun("macosx", &["-f", "clang++"])?;
+    // The iOS SDKROOT we export for the cross build otherwise makes clang target
+    // iOS even with a macOS -isysroot, producing native tools that cannot run on
+    // the build machine. Pin the target triple to macOS to override it.
+    let arch = match env::consts::ARCH {
+        "aarch64" => "arm64",
+        other => other,
+    };
+    let target = format!("{arch}-apple-macos");
+    let path = layout.build_dir.join(format!("{name}-meson-native.ini"));
+    let content = format!(
+        "[binaries]\nc = [{}, '-target', {}, '-isysroot', {}]\ncpp = [{}, '-target', {}, '-isysroot', {}]\n",
+        meson_string(&clang),
+        meson_string(&target),
+        meson_string(&sdk_root),
+        meson_string(&clangxx),
+        meson_string(&target),
+        meson_string(&sdk_root),
+    );
+    fs::write(&path, content).with_context(|| format!("write {}", path.display()))?;
+    Ok(path)
 }
 
 fn meson_cross_file(
@@ -845,7 +877,7 @@ fn meson_cross_file(
     let arch_flags = apple_arch_flags(&config);
     let path = layout.build_dir.join(format!("{name}-meson-cross.ini"));
     let content = format!(
-        "[binaries]\nc = {}\ncpp = {}\nar = {}\nstrip = {}\npkg-config = {}\n\n[built-in options]\nc_args = {}\ncpp_args = {}\nc_link_args = {}\ncpp_link_args = {}\n\n[host_machine]\nsystem = 'darwin'\ncpu_family = {}\ncpu = {}\nendian = 'little'\n\n[build_machine]\nsystem = 'darwin'\ncpu_family = 'aarch64'\ncpu = 'aarch64'\nendian = 'little'\n\n[binaries.build_machine]\nc = '/usr/bin/cc'\ncpp = '/usr/bin/c++'\n",
+        "[binaries]\nc = {}\ncpp = {}\nar = {}\nstrip = {}\npkg-config = {}\n\n[built-in options]\nc_args = {}\ncpp_args = {}\nc_link_args = {}\ncpp_link_args = {}\n\n[host_machine]\nsystem = 'darwin'\ncpu_family = {}\ncpu = {}\nendian = 'little'\n",
         meson_string(&config.clang.display().to_string()),
         meson_string(&config.clangxx.display().to_string()),
         meson_string(&config.ar.display().to_string()),
