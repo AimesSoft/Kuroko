@@ -845,7 +845,7 @@ fn meson_cross_file(
     let arch_flags = apple_arch_flags(&config);
     let path = layout.build_dir.join(format!("{name}-meson-cross.ini"));
     let content = format!(
-        "[binaries]\nc = {}\ncpp = {}\nar = {}\nstrip = {}\npkg-config = {}\n\n[built-in options]\nc_args = {}\ncpp_args = {}\nc_link_args = {}\ncpp_link_args = {}\n\n[host_machine]\nsystem = 'darwin'\ncpu_family = {}\ncpu = {}\nendian = 'little'\n",
+        "[binaries]\nc = {}\ncpp = {}\nar = {}\nstrip = {}\npkg-config = {}\n\n[built-in options]\nc_args = {}\ncpp_args = {}\nc_link_args = {}\ncpp_link_args = {}\n\n[host_machine]\nsystem = 'darwin'\ncpu_family = {}\ncpu = {}\nendian = 'little'\n\n[build_machine]\nsystem = 'darwin'\ncpu_family = 'aarch64'\ncpu = 'aarch64'\nendian = 'little'\n",
         meson_string(&config.clang.display().to_string()),
         meson_string(&config.clangxx.display().to_string()),
         meson_string(&config.ar.display().to_string()),
